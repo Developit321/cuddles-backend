@@ -5,7 +5,7 @@ const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 const cors = require("cors");
 const User = require("./models/User");
-const Chat = require("./models/message");
+const Message = require("./models/message");
 const jwt = require("jsonwebtoken");
 const cloudinary = require("cloudinary");
 const app = express();
@@ -13,7 +13,7 @@ const port = 3000;
 const multer = require("multer");
 const { resolve } = require("path");
 const http = require("http").createServer(app);
-const io = require("socket.io")(http);
+const io = require("socket.io")(http); // Pass the HTTP server instance
 
 app.use(cors());
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -23,12 +23,14 @@ app.use(bodyParser.json());
 const storage = multer.memoryStorage(); // Store files in memory
 const upload = multer({ storage });
 
+// Cloudinary configuration
 cloudinary.config({
   cloud_name: "dmqt8wnrd",
   api_key: "362393959313675",
   api_secret: "sL1aM1tebd3pkvXD51c37_0EERg",
 });
 
+// MongoDB connection
 mongoose
   .connect(
     "mongodb+srv://cuddles:LNum9ZwrrcNDyl5c@cluster0.bdtblda.mongodb.net/"
@@ -40,8 +42,43 @@ mongoose
     console.log("Error connecting to the Database", error);
   });
 
-app.listen(port, () => {
+http.listen(port, () => {
   console.log(`Server is running on port ${port}`);
+});
+
+// Socket.io connection
+io.on("connection", (socket) => {
+  console.log("A user connected: " + socket.id);
+
+  // Listen for the join event and make the user join a specific room
+  socket.on("join", ({ userId }) => {
+    socket.join(userId); // User joins a room with their own userId
+    console.log("User joined room:", userId);
+  });
+
+  // Listen for incoming messages
+  socket.on("sendMessage", async ({ senderId, receiverId, message }) => {
+    try {
+      console.log("Message received from client:", {
+        senderId,
+        receiverId,
+        message,
+      });
+
+      const newMessage = new Message({ senderId, receiverId, message });
+      await newMessage.save();
+
+      // Emit the message to the receiver's room
+      io.to(receiverId).emit("receiveMessage", newMessage); // Emit to the room based on receiverId
+    } catch (error) {
+      console.error("Error saving message:", error);
+    }
+  });
+
+  // Handle user disconnect
+  socket.on("disconnect", () => {
+    console.log("A user disconnected: " + socket.id);
+  });
 });
 
 // Register endpoint
@@ -505,52 +542,6 @@ app.get("/matches/:userId/info", async (req, res) => {
   }
 });
 
-// socket io api
-
-io.on("connection", (socket) => {
-  console.log("A user is connected");
-
-  // Handle sendMessage event
-  socket.on("sendMessage", async (data) => {
-    try {
-      const { senderId, receiverId, message } = data;
-      console.log("data", data);
-
-      // Save the new message in the database
-      const newMessage = new Chat({ senderId, receiverId, message });
-      await newMessage.save();
-
-      // Emit the message to the receiver
-      io.to(receiverId).emit("receiveMessage", newMessage);
-    } catch (error) {
-      console.log("Error handling the message:", error);
-    }
-  });
-
-  // Handle disconnect event
-  socket.on("disconnect", () => {
-    console.log("User disconnected");
-  });
-});
-
-app.get("/messages", async (req, res) => {
-  try {
-    const { senderId, receiverId } = req.query;
-
-    console.log(senderId);
-    console.log(receiverId);
-
-    const messages = await Chat.find({
-      $or: [
-        { senderId: senderId, receiverId: receiverId },
-        { senderId: receiverId, receiverId: senderId },
-      ],
-    }).populate("senderId", "_id name");
-
-    res.status(200).json(messages);
-  } catch (error) {}
-});
-
 app.delete("/users/:userId/images", async (req, res) => {
   const { userId } = req.params;
   const { imageUrl } = req.body;
@@ -578,7 +569,14 @@ app.delete("/users/:userId/images", async (req, res) => {
     return res.status(500).json({ error: "Failed to delete image" });
   }
 });
-
-http.listen(8000, () => {
-  console.log("socket.io server running on port 8000");
+app.get("/messages/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const messages = await Message.find({
+      $or: [{ sender: userId }, { receiver: userId }],
+    }).populate("sender receiver"); // Assuming you want to populate user data
+    res.status(200).json(messages);
+  } catch (error) {
+    res.status(500).json({ message: "Failed to retrieve messages", error });
+  }
 });
