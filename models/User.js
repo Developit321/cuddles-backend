@@ -58,6 +58,9 @@ const userSchema = mongoose.Schema({
   description: {
     type: String,
   },
+  location: {
+    type: String,
+  },
 
   interests: {
     type: [String], // Array of strings

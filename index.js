@@ -84,7 +84,7 @@ io.on("connection", (socket) => {
 // Register endpoint
 app.post("/register", async (req, res) => {
   try {
-    const { name, email, password } = req.body;
+    const { name, email, password, age, location } = req.body;
     const existingUser = await User.findOne({ email });
     if (existingUser) {
       return res.status(400).json({ message: "User already exists" });
@@ -95,6 +95,7 @@ app.post("/register", async (req, res) => {
       email,
       password,
       age,
+      location,
     });
 
     // Verification
