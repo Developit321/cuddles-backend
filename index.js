@@ -107,7 +107,7 @@ app.post("/register", async (req, res) => {
     // Send verification email
     sendVerificationEmail(newUser.email, newUser.VerificationToken);
 
-    const token = jwt.sign({ userId: user._id }, secretKey);
+    const token = jwt.sign({ userId: newUser._id }, secretKey);
 
     res.status(200).json({ token });
   } catch (error) {
