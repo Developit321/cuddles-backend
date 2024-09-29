@@ -61,9 +61,12 @@ const userSchema = mongoose.Schema({
   location: {
     type: String,
   },
+  pushToken: {
+    type: String,
+  },
 
   interests: {
-    type: [String], // Array of strings
+    type: [String],
     default: [],
   },
 
