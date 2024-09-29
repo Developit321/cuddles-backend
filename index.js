@@ -577,9 +577,33 @@ app.get("/messages/:userId", async (req, res) => {
     const { userId } = req.params;
     const messages = await Message.find({
       $or: [{ sender: userId }, { receiver: userId }],
-    }).populate("sender receiver"); // Assuming you want to populate user data
+    }).populate("sender receiver");
     res.status(200).json(messages);
   } catch (error) {
     res.status(500).json({ message: "Failed to retrieve messages", error });
+  }
+});
+
+app.put("/push-notification-token/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { pushToken } = req.body;
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { pushToken: pushToken },
+      { new: true }
+    );
+
+    if (!user) {
+      return res.status(404).json({ message: "user not found" });
+    }
+    return res
+      .status(200)
+      .json({ message: "user pushToken updated successfully" });
+  } catch (error) {
+    res
+      .status(500)
+      .json({ message: "Error updating users push token ", error });
   }
 });
