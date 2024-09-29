@@ -177,18 +177,20 @@ app.post("/login", async (req, res) => {
 
     const user = await User.findOne({ email });
     if (!user) {
-      return res.status(401).json({ message: "invalid email or password" });
+      return res.status(401).json({ message: "Invalid email or password" });
     }
 
     if (user.password !== password) {
-      return res.status(401).json({ message: "invalid password" });
+      return res.status(401).json({ message: "Invalid password" });
     }
 
+    // Generate JWT token
     const token = jwt.sign({ userId: user._id }, secretKey);
 
-    res.status(200).json({ token });
+    // Send back both the token and user ID
+    res.status(200).json({ token, userId: user._id });
   } catch (error) {
-    res.status(500).json({ message: "login fialed" });
+    res.status(500).json({ message: "Login failed" });
   }
 });
 
