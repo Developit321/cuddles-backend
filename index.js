@@ -70,32 +70,36 @@ io.on("connection", (socket) => {
   });
 
   // Listen for incoming messages
-  socket.on("sendMessage", async ({ senderId, receiverId, message }) => {
-    try {
-      console.log("Message received from client:", {
-        senderId,
-        receiverId,
-        message,
-      });
+  socket.on(
+    "sendMessage",
+    async ({ senderId, receiverId, message, identify }) => {
+      try {
+        console.log("Message received from client:", {
+          senderId,
+          receiverId,
+          message,
+        });
 
-      // Save the new message to MongoDB
-      const newMessage = new Message({
-        senderId,
-        receiverId,
-        message,
-        timestamp: Date.now(), // Ensure the timestamp is set when saving
-      });
-      await newMessage.save();
+        // Save the new message to MongoDB
+        const newMessage = new Message({
+          senderId,
+          receiverId,
+          message,
+          identify,
+          timestamp: Date.now(), // Ensure the timestamp is set when saving
+        });
+        await newMessage.save();
 
-      // Emit the message to the receiver's room
-      io.to(receiverId).emit("receiveMessage", newMessage); // Send to receiver's room
+        // Emit the message to the receiver's room
+        io.to(receiverId).emit("receiveMessage", newMessage); // Send to receiver's room
 
-      // Optionally: Echo the message back to the sender as well
-      socket.emit("receiveMessage", newMessage);
-    } catch (error) {
-      console.error("Error saving message:", error);
+        // Optionally: Echo the message back to the sender as well
+        socket.emit("receiveMessage", newMessage);
+      } catch (error) {
+        console.error("Error saving message:", error);
+      }
     }
-  });
+  );
 
   // Handle user disconnecting
   socket.on("disconnect", () => {
