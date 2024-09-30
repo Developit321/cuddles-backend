@@ -12,6 +12,7 @@ const app = express();
 const port = 3000;
 const multer = require("multer");
 const { resolve } = require("path");
+const Chat = require("./models/message");
 const http = require("http").createServer(app);
 const io = require("socket.io")(http); // Pass the HTTP server instance
 
@@ -47,61 +48,35 @@ http.listen(port, () => {
 });
 
 // Socket.io connection
-
 io.on("connection", (socket) => {
   console.log("A user connected: " + socket.id);
 
-  // Handle user joining a room
-  socket.on("join", async ({ userId }) => {
-    socket.join(userId); // User joins a room identified by their userId
+  // Listen for the join event and make the user join a specific room
+  socket.on("join", ({ userId }) => {
+    socket.join(userId); // User joins a room with their own userId
     console.log("User joined room:", userId);
-
-    // Fetch previous messages for the user
-    try {
-      const messages = await Message.find({
-        $or: [{ senderId: userId }, { receiverId: userId }],
-      }).sort({ timestamp: 1 }); // Sort messages by timestamp
-
-      // Send previous messages to the user
-      socket.emit("previousMessages", messages);
-    } catch (error) {
-      console.error("Error retrieving previous messages:", error);
-    }
   });
 
   // Listen for incoming messages
-  socket.on(
-    "sendMessage",
-    async ({ senderId, receiverId, message, identify }) => {
-      try {
-        console.log("Message received from client:", {
-          senderId,
-          receiverId,
-          message,
-        });
+  socket.on("sendMessage", async ({ senderId, receiverId, message }) => {
+    try {
+      console.log("Message received from client:", {
+        senderId,
+        receiverId,
+        message,
+      });
 
-        // Save the new message to MongoDB
-        const newMessage = new Message({
-          senderId,
-          receiverId,
-          message,
-          identify,
-          timestamp: Date.now(), // Ensure the timestamp is set when saving
-        });
-        await newMessage.save();
+      const newMessage = new Message({ senderId, receiverId, message });
+      await newMessage.save();
 
-        // Emit the message to the receiver's room
-        io.to(receiverId).emit("receiveMessage", newMessage); // Send to receiver's room
-
-        // Optionally: Echo the message back to the sender as well
-        socket.emit("receiveMessage", newMessage);
-      } catch (error) {
-        console.error("Error saving message:", error);
-      }
+      // Emit the message to the receiver's room
+      io.to(receiverId).emit("receiveMessage", newMessage); // Emit to the room based on receiverId
+    } catch (error) {
+      console.error("Error saving message:", error);
     }
-  );
+  });
 
-  // Handle user disconnecting
+  // Handle user disconnect
   socket.on("disconnect", () => {
     console.log("A user disconnected: " + socket.id);
   });
@@ -440,6 +415,8 @@ app.get("/profiles", async (req, res) => {
   try {
     const { userId, gender } = req.query;
 
+    console.log(gender);
+
     if (!userId || !gender) {
       return res
         .status(400)
@@ -599,19 +576,49 @@ app.delete("/users/:userId/images", async (req, res) => {
   }
 });
 app.get("/messages/:senderId/:receiverId", async (req, res) => {
+  const { senderId, receiverId } = req.params;
   try {
-    const { senderId, receiverId } = req.params;
+    // Fetch messages based on senderId and receiverId
     const messages = await Message.find({
       $or: [
         { senderId, receiverId },
         { senderId: receiverId, receiverId: senderId },
       ],
-    })
-      .populate("sender receiver")
-      .sort({ timestamp: 1 });
-    res.status(200).json(messages);
+    }).sort({ timestamp: 1 }); // Sort messages by timestamp
+    res.json(messages);
   } catch (error) {
-    res.status(500).json({ message: "Failed to retrieve messages", error });
+    res.status(500).json({ message: "Error fetching messages" });
+  }
+});
+
+// API endpoint to save multiple messages
+app.post("/messages/save", async (req, res) => {
+  try {
+    const messages = req.body;
+
+    // Create an array of Chat message instances
+    const chatMessages = messages.map((msg) => ({
+      senderId: msg.senderId,
+      receiverId: msg.receiverId,
+      message: msg.message,
+      timestamp: new Date(msg.timestamp),
+    }));
+
+    // Save all messages to the database
+    const savedMessages = await Chat.insertMany(chatMessages);
+
+    res.status(201).json({
+      success: true,
+      message: "Messages saved successfully",
+      data: savedMessages,
+    });
+  } catch (error) {
+    console.error("Error saving messages:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error saving messages",
+      error: error.message,
+    });
   }
 });
 
