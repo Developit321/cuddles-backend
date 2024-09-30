@@ -48,8 +48,6 @@ http.listen(port, () => {
 
 // Socket.io connection
 
-const Message = require("./models/Chat"); // Assuming you saved the schema in Chat.js
-
 io.on("connection", (socket) => {
   console.log("A user connected: " + socket.id);
 
@@ -596,12 +594,17 @@ app.delete("/users/:userId/images", async (req, res) => {
     return res.status(500).json({ error: "Failed to delete image" });
   }
 });
-app.get("/messages/:userId", async (req, res) => {
+app.get("/messages/:senderId/:receiverId", async (req, res) => {
   try {
-    const { userId } = req.params;
+    const { senderId, receiverId } = req.params;
     const messages = await Message.find({
-      $or: [{ sender: userId }, { receiver: userId }],
-    }).populate("sender receiver");
+      $or: [
+        { senderId, receiverId },
+        { senderId: receiverId, receiverId: senderId },
+      ],
+    })
+      .populate("sender receiver")
+      .sort({ timestamp: 1 });
     res.status(200).json(messages);
   } catch (error) {
     res.status(500).json({ message: "Failed to retrieve messages", error });
