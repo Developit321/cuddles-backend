@@ -47,13 +47,28 @@ http.listen(port, () => {
 });
 
 // Socket.io connection
+
+const Message = require("./models/Chat"); // Assuming you saved the schema in Chat.js
+
 io.on("connection", (socket) => {
   console.log("A user connected: " + socket.id);
 
-  // Listen for the join event and make the user join a specific room
-  socket.on("join", ({ userId }) => {
-    socket.join(userId); // User joins a room with their own userId
+  // Handle user joining a room
+  socket.on("join", async ({ userId }) => {
+    socket.join(userId); // User joins a room identified by their userId
     console.log("User joined room:", userId);
+
+    // Fetch previous messages for the user
+    try {
+      const messages = await Message.find({
+        $or: [{ senderId: userId }, { receiverId: userId }],
+      }).sort({ timestamp: 1 }); // Sort messages by timestamp
+
+      // Send previous messages to the user
+      socket.emit("previousMessages", messages);
+    } catch (error) {
+      console.error("Error retrieving previous messages:", error);
+    }
   });
 
   // Listen for incoming messages
@@ -65,17 +80,26 @@ io.on("connection", (socket) => {
         message,
       });
 
-      const newMessage = new Message({ senderId, receiverId, message });
+      // Save the new message to MongoDB
+      const newMessage = new Message({
+        senderId,
+        receiverId,
+        message,
+        timestamp: Date.now(), // Ensure the timestamp is set when saving
+      });
       await newMessage.save();
 
       // Emit the message to the receiver's room
-      io.to(receiverId).emit("receiveMessage", newMessage); // Emit to the room based on receiverId
+      io.to(receiverId).emit("receiveMessage", newMessage); // Send to receiver's room
+
+      // Optionally: Echo the message back to the sender as well
+      socket.emit("receiveMessage", newMessage);
     } catch (error) {
       console.error("Error saving message:", error);
     }
   });
 
-  // Handle user disconnect
+  // Handle user disconnecting
   socket.on("disconnect", () => {
     console.log("A user disconnected: " + socket.id);
   });
@@ -413,8 +437,6 @@ app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
 app.get("/profiles", async (req, res) => {
   try {
     const { userId, gender } = req.query;
-
-    console.log(gender);
 
     if (!userId || !gender) {
       return res
