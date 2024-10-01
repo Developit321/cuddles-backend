@@ -5,6 +5,7 @@ const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 const cors = require("cors");
 const User = require("./models/User");
+
 const Message = require("./models/message");
 const jwt = require("jsonwebtoken");
 const cloudinary = require("cloudinary");
@@ -266,25 +267,29 @@ app.put("/users/:userId/interests/add", async (req, res) => {
 
 //remove interests
 
-app.put("/users/:userId/interests/remove", async (req, res) => {
+app.delete("/users/:userId/interests/remove", async (req, res) => {
   try {
     const { userId } = req.params;
-    const { interests } = req.body;
+    const { interest } = req.body;
 
     const user = await User.findByIdAndUpdate(
       userId,
-      { $pull: { interests: { $each: interests } } },
+      { $pull: { interests: interest } }, // Remove a single interest
       { new: true }
     );
 
     if (!user) {
-      return res.status(404).json({ message: "user not found" });
+      return res.status(404).json({ message: "User not found" });
     }
+
     return res
       .status(200)
-      .json({ message: "user interestts removed Succesfully" });
+      .json({ message: "User interest removed successfully" });
   } catch (error) {
-    res.status(500).json({ message: "error removing the users interests" });
+    res.status(500).json({
+      message: "Error removing the user's interest",
+      error: error.message,
+    });
   }
 });
 
@@ -295,11 +300,16 @@ app.put("/users/:userId/lookingfor/add", async (req, res) => {
     const { userId } = req.params;
     const { lookingFor } = req.body;
 
+    const validOptions = ["Friendship", "Goodtime", "Long term relationship"];
+
     if (
       !Array.isArray(lookingFor) ||
-      lookingFor.some((item) => typeof item !== "string")
+      lookingFor.some((item) => !validOptions.includes(item))
     ) {
-      return res.status(400).json({ message: "Invalid lookingFor data" });
+      return res.status(400).json({
+        message:
+          "Invalid lookingFor data. Please choose from 'friendship', 'goodtime', or 'long term relationship'.",
+      });
     }
 
     const user = await User.findByIdAndUpdate(
@@ -314,12 +324,12 @@ app.put("/users/:userId/lookingfor/add", async (req, res) => {
 
     return res
       .status(200)
-      .json({ message: "User looking for updated successfully" });
+      .json({ message: "User's 'looking for' updated successfully", user });
   } catch (error) {
-    console.error("Error updating looking for:", error);
+    console.error("Error updating 'looking for':", error);
     return res
       .status(500)
-      .json({ message: "Error updating the user's looking for" });
+      .json({ message: "Error updating the user's 'looking for'" });
   }
 });
 

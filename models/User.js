@@ -72,6 +72,7 @@ const userSchema = mongoose.Schema({
 
   lookingFor: {
     type: [String],
+    enum: ["Friendship", "Goodtime", "Long term relationship"],
     default: [],
   },
   VerificationToken: {
