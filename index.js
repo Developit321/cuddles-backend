@@ -16,6 +16,7 @@ const { resolve } = require("path");
 const Chat = require("./models/message");
 const http = require("http").createServer(app);
 const io = require("socket.io")(http); // Pass the HTTP server instance
+const bcrypt = require("bcryptjs");
 
 app.use(cors());
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -92,21 +93,21 @@ app.post("/register", async (req, res) => {
       return res.status(400).json({ message: "User already exists" });
     }
 
+    // Hash the password
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
     const newUser = new User({
       name,
       email,
-      password,
-      age,
+      password: hashedPassword,
       location,
     });
 
     // Verification
     newUser.VerificationToken = crypto.randomBytes(20).toString("hex");
-
-    // Save the user
     await newUser.save();
 
-    // Send verification email
     sendVerificationEmail(newUser.email, newUser.VerificationToken);
 
     const token = jwt.sign({ userId: newUser._id }, secretKey);
@@ -177,13 +178,16 @@ app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
+    // Find the user by email
     const user = await User.findOne({ email });
     if (!user) {
       return res.status(401).json({ message: "Invalid email or password" });
     }
 
-    if (user.password !== password) {
-      return res.status(401).json({ message: "Invalid password" });
+    // Compare the hashed password
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: "Invalid email or password" });
     }
 
     // Generate JWT token
@@ -192,10 +196,10 @@ app.post("/login", async (req, res) => {
     // Send back both the token and user ID
     res.status(200).json({ token, userId: user._id });
   } catch (error) {
+    console.log("Error logging in the user", error);
     res.status(500).json({ message: "Login failed" });
   }
 });
-
 //gender change endpoint
 
 app.put("/users/:userId/gender", async (req, res) => {
@@ -333,30 +337,41 @@ app.put("/users/:userId/lookingfor/add", async (req, res) => {
   }
 });
 
-// remove looking for
-app.put("/users/:userId/lookingFor/remove", async (req, res) => {
+// DELETE route to remove an item from the lookingFor array
+app.delete("/users/:userId/lookingfor/remove", async (req, res) => {
   try {
     const { userId } = req.params;
-    const { lookingFor } = req.body;
+    const { lookingForItem } = req.body;
+
+    // Validate the lookingForItem is a string
+    if (typeof lookingForItem !== "string") {
+      return res
+        .status(400)
+        .json({ message: "Invalid 'lookingForItem'. Must be a string." });
+    }
 
     const user = await User.findByIdAndUpdate(
       userId,
-      { $pull: { interests: lookingFor } },
+      { $pull: { lookingFor: lookingForItem } },
       { new: true }
     );
 
     if (!user) {
-      return res.status(404).json({ message: "user not found" });
+      return res.status(404).json({ message: "User not found" });
     }
-    return res
-      .status(200)
-      .json({ message: "user LookingFor removed Succesfully" });
+
+    return res.status(200).json({
+      message: "User 'looking for' item removed successfully",
+      updatedLookingFor: user.lookingFor,
+    });
   } catch (error) {
-    res.status(500).json({ message: "error removing the users LookingFor" });
+    console.error("Error removing 'looking for' item:", error);
+    return res.status(500).json({
+      message: "Error removing the user's 'looking for' item",
+      error: error.message,
+    });
   }
 });
-
-//get users data
 
 app.get("/users/:userId", async (req, res) => {
   try {
