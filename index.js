@@ -671,3 +671,65 @@ app.put("/push-notification-token/:userId", async (req, res) => {
       .json({ message: "Error updating users push token ", error });
   }
 });
+
+// add users location
+
+app.post("user/:userId/update-location", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { longitude, latitude } = req.body;
+
+    const user = User.findByIdAndUpdate(
+      userId,
+      {
+        $set: {
+          location: {
+            type: "Point",
+            coordinates: [longitude, latitude],
+          },
+        },
+      },
+      { new: true }
+    );
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    console.log("User coordinates updated successfully");
+  } catch (error) {
+    res.status(500).json({ message: "Error updating users Location ", error });
+  }
+});
+
+// fetch users that are close to each other due to location
+
+app.get("users/nearby-users", async (req, res) => {
+  try {
+    const { longitude, latitude, maxDistance } = req.body;
+    if (!longitude || !latitude || !maxDistance) {
+      return res
+        .status(400)
+        .json({ error: "Longitude, latitude, and maxDistance are required" });
+    }
+
+    const nearbyUsers = await User.find({
+      location: {
+        $near: {
+          $geometry: {
+            type: "Point",
+            coordinates: [longitude, latitude], // [longitude, latitude]
+          },
+          $maxDistance: maxDistance, // Max distance in meters
+        },
+      },
+    }).select("name email location");
+
+    if (nearbyUsers.length === 0) {
+      return res.status(404).json({ message: "No users found nearby" });
+    }
+    res.json({ message: "Nearby users found", users: nearbyUsers });
+  } catch (error) {
+    console.error("Error finding nearby users:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
