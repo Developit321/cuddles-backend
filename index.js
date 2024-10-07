@@ -674,7 +674,7 @@ app.put("/push-notification-token/:userId", async (req, res) => {
 
 // add users location
 
-app.post("user/:userId/update-location", async (req, res) => {
+app.post("/user/:userId/update-location", async (req, res) => {
   try {
     const { userId } = req.params;
     const { longitude, latitude } = req.body;
@@ -703,7 +703,7 @@ app.post("user/:userId/update-location", async (req, res) => {
 
 // fetch users that are close to each other due to location
 
-app.get("users/nearby-users", async (req, res) => {
+app.get("/users/nearby-users", async (req, res) => {
   try {
     const { longitude, latitude, maxDistance } = req.body;
     if (!longitude || !latitude || !maxDistance) {
