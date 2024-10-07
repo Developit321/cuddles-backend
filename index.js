@@ -676,36 +676,46 @@ app.put("/push-notification-token/:userId", async (req, res) => {
 
 app.post("/user/:userId/update-location", async (req, res) => {
   try {
-    const { userId } = req.params;
-    const { longitude, latitude } = req.body;
+    const { userId } = req.params; // Get userId from the URL
+    const { longitude, latitude } = req.body; // Get longitude and latitude from the request body
 
-    const user = User.findByIdAndUpdate(
+    // Update the user's location in the database
+    const user = await User.findByIdAndUpdate(
       userId,
       {
         $set: {
           location: {
             type: "Point",
-            coordinates: [longitude, latitude],
+            coordinates: [longitude, latitude], // Correct coordinate order
           },
         },
       },
-      { new: true }
+      { new: true } // Return the updated user document
     );
 
+    // Check if the user was found
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
+
+    // Log success and respond
     console.log("User coordinates updated successfully");
+    return res
+      .status(200)
+      .json({ message: "Location updated successfully", user });
   } catch (error) {
-    res.status(500).json({ message: "Error updating users Location ", error });
+    console.error("Error updating user's location:", error); // Log any errors
+    return res
+      .status(500)
+      .json({ message: "Error updating user's location", error });
   }
 });
 
 // fetch users that are close to each other due to location
 
-app.get("/users/nearby-users", async (req, res) => {
+app.get("/nearby-users", async (req, res) => {
   try {
-    const { longitude, latitude, maxDistance } = req.body;
+    const { longitude, latitude, maxDistance } = req.query;
     if (!longitude || !latitude || !maxDistance) {
       return res
         .status(400)
@@ -717,19 +727,19 @@ app.get("/users/nearby-users", async (req, res) => {
         $near: {
           $geometry: {
             type: "Point",
-            coordinates: [longitude, latitude], // [longitude, latitude]
+            coordinates: [parseFloat(longitude), parseFloat(latitude)], // Parse to float
           },
-          $maxDistance: maxDistance, // Max distance in meters
+          $maxDistance: parseFloat(maxDistance), // Parse to float for max distance
         },
       },
-    }).select("name email location");
+    }).select("name  location profileImages");
 
     if (nearbyUsers.length === 0) {
       return res.status(404).json({ message: "No users found nearby" });
     }
     res.json({ message: "Nearby users found", users: nearbyUsers });
   } catch (error) {
-    console.error("Error finding nearby users:", err);
+    console.error("Error finding nearby users:", error); // Fix variable name from err to error
     res.status(500).json({ error: "Internal server error" });
   }
 });
