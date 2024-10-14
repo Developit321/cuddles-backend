@@ -428,7 +428,7 @@ app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
 
-    return res.status(200).json({ message: "upload was a success" });
+    return res.status(200).json({ message: "Upload was a success", imageUrl });
   } catch (error) {
     console.error("File upload failed: ", error);
     res.status(500).json({ error: "File upload failed" });
