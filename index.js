@@ -438,37 +438,58 @@ app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
 
 app.get("/profiles", async (req, res) => {
   try {
-    const { userId, gender } = req.query;
+    // Destructure userId, gender, and lookingFor from the query parameters
+    const { userId, gender, lookingFor } = req.query;
 
-    console.log(gender);
-
+    // Check if userId, gender, and lookingFor are provided
     if (!userId || !gender) {
       return res
         .status(400)
         .json({ message: "userId and gender are required" });
     }
 
-    let filter = { gender: gender === "male" ? "female" : "male" };
+    // Set the filter to find profiles of the opposite gender
+    let genderFilter = { gender: gender === "male" ? "female" : "male" };
 
+    // Parse the lookingFor parameter into an array
+    let lookingForArray = [];
+    if (lookingFor) {
+      lookingForArray = Array.isArray(lookingFor) ? lookingFor : [lookingFor];
+    }
+
+    // Retrieve the current user with their matches and crushes populated
     const currentUser = await User.findById(userId)
       .populate("Matches", "_id")
       .populate("crushes", "_id");
 
+    // Check if the current user exists
     if (!currentUser) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Ensure `matches` and `crushes` are arrays
+    // Extract the IDs of the current user's matches and crushes
     const friendsIds = (currentUser.Matches || []).map((friend) => friend._id);
     const crushesId = (currentUser.crushes || []).map((crush) => crush._id);
 
+    // Construct the final filter object
+    const filter = {
+      ...genderFilter,
+      ...(lookingForArray.length
+        ? { lookingFor: { $in: lookingForArray } }
+        : {}),
+    };
+
+    // Find profiles matching the filter and excluding the current user, matches, and crushes
     const profiles = await User.find(filter)
       .where("_id")
-      .nin([userId, ...friendsIds, ...crushesId]);
+      .nin([userId, ...friendsIds, ...crushesId]); // Exclude current user, friends, and crushes
 
+    // Return the found profiles
     return res.status(200).json({ profiles });
   } catch (error) {
+    // Log the error for debugging purposes
     console.error("Error fetching user profiles:", error);
+    // Return an internal server error status
     res.status(500).json({ message: "Error fetching user profiles" });
   }
 });
