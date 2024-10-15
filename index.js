@@ -133,7 +133,7 @@ const sendVerificationEmail = async (email, VerificationToken) => {
     from: "cuddles.com",
     to: email,
     subject: "Email verification",
-    text: `Click on this link to verify your email: http://192.168.0.112:3000/verify/${VerificationToken}`,
+    text: `Click on this link to verify your email: https://cuddles-batcat.onrender.com/verify/${VerificationToken}`,
   };
 
   try {
