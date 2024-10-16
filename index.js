@@ -763,3 +763,73 @@ app.get("/nearby-users", async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+app.delete("/users/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    // Find the user by ID and delete
+    const deletedUser = await User.findByIdAndDelete(userId);
+
+    if (!deletedUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    return res.status(200).json({ message: "User deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting user:", error);
+    return res
+      .status(500)
+      .json({ message: "Error deleting user", error: error.message });
+  }
+});
+
+// Endpoint to update profile image
+app.put(
+  "/update-profile-image/:userId",
+  upload.single("file"),
+  async (req, res) => {
+    const { userId } = req.params;
+
+    try {
+      // Check if file is uploaded
+      if (!req.file) {
+        console.log("image file not uploaded");
+        return res.status(400).json({ message: "No image file uploaded" });
+      }
+
+      // Upload image to Cloudinary
+      const imageUrl = await new Promise((resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+          { folder: "profile_images" }, // Optional: specify folder in Cloudinary
+          (error, result) => {
+            if (error) {
+              return reject(error);
+            }
+            resolve(result.secure_url);
+          }
+        );
+        uploadStream.end(req.file.buffer);
+      });
+
+      // Update user profile image in the database
+      const updatedUser = await User.findOneAndUpdate(
+        { _id: userId },
+        { $set: { "profileImages.0": imageUrl } }, // Replace the first image
+        { new: true }
+      );
+
+      if (!updatedUser) {
+        return res.status(404).json({ message: "User not found" });
+      }
+
+      res.json({
+        message: "Profile image updated successfully",
+        profileImages: updatedUser.profileImages,
+      });
+    } catch (error) {
+      console.error("Error updating profile image:", error);
+      res.status(500).json({ message: "Server error", error });
+    }
+  }
+);
