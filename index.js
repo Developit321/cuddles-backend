@@ -799,18 +799,23 @@ app.put(
       }
 
       // Upload image to Cloudinary
-      const imageUrl = await new Promise((resolve, reject) => {
+      let imageUrl;
+      const result = await new Promise((resolve, reject) => {
         const uploadStream = cloudinary.uploader.upload_stream(
-          { folder: "profile_images" }, // Optional: specify folder in Cloudinary
-          (error, result) => {
+          (uploadResult, error) => {
             if (error) {
+              console.log("some errors", error);
               return reject(error);
             }
-            resolve(result.secure_url);
+
+            imageUrl = uploadResult.secure_url;
+            resolve(uploadResult); // Resolve the promise with the upload result
           }
         );
         uploadStream.end(req.file.buffer);
       });
+
+      console.log(userId, imageUrl);
 
       // Update user profile image in the database
       const updatedUser = await User.findOneAndUpdate(
@@ -823,7 +828,7 @@ app.put(
         return res.status(404).json({ message: "User not found" });
       }
 
-      res.json({
+      res.status(200).json({
         message: "Profile image updated successfully",
         profileImages: updatedUser.profileImages,
       });
