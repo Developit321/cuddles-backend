@@ -161,7 +161,7 @@ app.post("/change-password/:userId", async (req, res) => {
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
-    user: "developit231@gmail.com",
+    user: "makofanethulane53@gmail.com", // Use environment variables
     pass: "qlrm olky tyzb usur",
   },
 });
@@ -909,8 +909,10 @@ app.put("/change-username/:userId", async (req, res) => {
   }
 });
 
-app.post("/request-otp", async (req, res) => {
+app.post("/cuddles/request-otp", async (req, res) => {
   const { email } = req.body;
+
+  console.log(email);
 
   try {
     const user = await User.findOne({ email });
