@@ -942,7 +942,7 @@ app.post("/cuddles/request-otp", async (req, res) => {
   }
 });
 
-app.post("/reset-password", async (req, res) => {
+app.post("/cuddles/reset-password", async (req, res) => {
   const { email, otp, newPassword } = req.body;
 
   try {
