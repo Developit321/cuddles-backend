@@ -119,16 +119,54 @@ app.post("/register", async (req, res) => {
   }
 });
 
+// Change Password API
+app.post("/change-password/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { currentPassword, newPassword } = req.body;
+
+    // Check if both current and new password are provided
+    if (!currentPassword || !newPassword) {
+      return res
+        .status(400)
+        .json({ message: "Please provide both current and new password." });
+    }
+
+    // Find the user by their ID
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    // Compare the current password with the user's hashed password
+    const isMatch = await bcrypt.compare(currentPassword, user.password);
+    if (!isMatch) {
+      return res.status(400).json({ message: "Incorrect current password." });
+    }
+
+    // Hash the new password
+    const saltRounds = 10;
+    const hashedNewPassword = await bcrypt.hash(newPassword, saltRounds);
+
+    // Update the user's password in the database
+    user.password = hashedNewPassword;
+    await user.save();
+
+    res.status(200).json({ message: "Password changed successfully." });
+  } catch (error) {
+    console.error("Error changing password:", error);
+    res.status(500).json({ message: "Internal server error." });
+  }
+});
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: "developit231@gmail.com",
+    pass: "qlrm olky tyzb usur",
+  },
+});
 // Send verification email
 const sendVerificationEmail = async (email, VerificationToken) => {
-  const transporter = nodemailer.createTransport({
-    service: "gmail",
-    auth: {
-      user: "makofanethulane53@gmail.com", // Use environment variables
-      pass: "qlrm olky tyzb usur",
-    },
-  });
-
   const mailOptions = {
     from: "cuddles.com",
     to: email,
@@ -764,12 +802,23 @@ app.get("/nearby-users", async (req, res) => {
   }
 });
 
+// Your delete endpoint
+
 app.delete("/users/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
+    console.log("User ID received for deletion:", userId); // Log the userId
+
+    // Validate the userId format
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Invalid user ID format." });
+    }
+
+    // Convert userId to ObjectId
+    const objectId = new mongoose.Types.ObjectId(userId);
 
     // Find the user by ID and delete
-    const deletedUser = await User.findByIdAndDelete(userId);
+    const deletedUser = await User.findByIdAndDelete(objectId);
 
     if (!deletedUser) {
       return res.status(404).json({ message: "User not found" });
@@ -838,3 +887,88 @@ app.put(
     }
   }
 );
+
+app.put("/change-username/:userId", async (req, res) => {
+  const { userId } = req.params;
+  const { newUsername } = req.body;
+  try {
+    // Find the user by ID and update the username
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Update the username
+    user.name = newUsername;
+    await user.save();
+
+    return res.status(200).json({ message: "Username changed successfully" });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.post("/request-otp", async (req, res) => {
+  const { email } = req.body;
+
+  try {
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Generate OTP
+    const otp = crypto.randomInt(100000, 999999).toString(); // 6-digit OTP
+    const otpExpires = Date.now() + 60000; // expires in 1 minute
+
+    // Save OTP and expiration in the user's document
+    user.otp = { code: otp, expires: otpExpires };
+    await user.save();
+
+    // Send OTP to email
+    await transporter.sendMail({
+      to: email,
+      subject: "Your OTP Code",
+      text: `Your OTP code is ${otp}. It is valid for 1 minute.`,
+    });
+
+    res.status(200).json({ message: "OTP sent to your email." });
+  } catch (error) {
+    console.error("Error in requesting OTP:", error);
+    res.status(500).json({ message: "An error occurred." });
+  }
+});
+
+app.post("/reset-password", async (req, res) => {
+  const { email, otp, newPassword } = req.body;
+
+  try {
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    // Verify OTP
+    if (!user.otp || user.otp.code !== otp) {
+      return res.status(400).json({ message: "Invalid OTP." });
+    }
+
+    if (Date.now() > user.otp.expires) {
+      return res.status(400).json({ message: "OTP has expired." });
+    }
+
+    // Hash the new password
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Update the user's password and clear the OTP
+    user.password = hashedPassword;
+    user.otp = undefined; // Clear OTP
+    await user.save();
+
+    res.status(200).json({ message: "Password changed successfully." });
+  } catch (error) {
+    console.error("Error in changing password:", error);
+    res.status(500).json({ message: "An error occurred." });
+  }
+});

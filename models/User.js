@@ -78,11 +78,15 @@ const userSchema = mongoose.Schema({
   VerificationToken: {
     type: String,
   },
-  profilePicture: {
-    filename: String,
-    path: String,
-    mimetype: String,
-    size: Number,
+  otp: {
+    code: {
+      type: String,
+      required: false,
+    },
+    expires: {
+      type: Date,
+      required: false,
+    },
   },
   location: {
     type: {
