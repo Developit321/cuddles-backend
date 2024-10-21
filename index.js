@@ -111,8 +111,7 @@ app.post("/register", async (req, res) => {
     sendVerificationEmail(newUser.email, newUser.VerificationToken);
 
     const token = jwt.sign({ userId: newUser._id }, secretKey);
-
-    res.status(200).json({ token });
+    res.status(200).json({ token, userId: newUser._id });
   } catch (error) {
     console.log("Error registering the user", error);
     res.status(500).json({ message: "Registration failed" });
@@ -734,24 +733,21 @@ app.put("/push-notification-token/:userId", async (req, res) => {
 
 app.post("/user/:userId/update-location", async (req, res) => {
   try {
-    const { userId } = req.params; // Get userId from the URL
-    const { longitude, latitude } = req.body; // Get longitude and latitude from the request body
-
-    // Update the user's location in the database
+    const { userId } = req.params;
+    const { longitude, latitude } = req.body;
     const user = await User.findByIdAndUpdate(
       userId,
       {
         $set: {
           location: {
             type: "Point",
-            coordinates: [longitude, latitude], // Correct coordinate order
+            coordinates: [longitude, latitude],
           },
         },
       },
       { new: true } // Return the updated user document
     );
 
-    // Check if the user was found
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
@@ -911,8 +907,6 @@ app.put("/change-username/:userId", async (req, res) => {
 
 app.post("/cuddles/request-otp", async (req, res) => {
   const { email } = req.body;
-
-  console.log(email);
 
   try {
     const user = await User.findOne({ email });
