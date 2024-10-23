@@ -44,6 +44,13 @@ const userSchema = mongoose.Schema({
     },
   ],
 
+  profileDislikes: [
+    {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+    },
+  ],
+
   Matches: [
     {
       type: mongoose.Schema.Types.ObjectId,

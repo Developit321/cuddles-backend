@@ -497,7 +497,8 @@ app.get("/profiles", async (req, res) => {
     // Retrieve the current user with their matches and crushes populated
     const currentUser = await User.findById(userId)
       .populate("Matches", "_id")
-      .populate("crushes", "_id");
+      .populate("crushes", "_id")
+      .populate("profileDislikes", "_id");
 
     // Check if the current user exists
     if (!currentUser) {
@@ -507,6 +508,10 @@ app.get("/profiles", async (req, res) => {
     // Extract the IDs of the current user's matches and crushes
     const friendsIds = (currentUser.Matches || []).map((friend) => friend._id);
     const crushesId = (currentUser.crushes || []).map((crush) => crush._id);
+
+    const profileDislikes = (currentUser.profileDislikes || []).map(
+      (dislike) => dislike._id
+    );
 
     // Construct the final filter object
     const filter = {
@@ -519,7 +524,7 @@ app.get("/profiles", async (req, res) => {
     // Find profiles matching the filter and excluding the current user, matches, and crushes
     const profiles = await User.find(filter)
       .where("_id")
-      .nin([userId, ...friendsIds, ...crushesId]); // Exclude current user, friends, and crushes
+      .nin([userId, ...friendsIds, ...crushesId, ...profileDislikes]);
 
     // Return the found profiles
     return res.status(200).json({ profiles });
@@ -543,12 +548,31 @@ app.post("/likeprofile", async (req, res) => {
         .json({ message: "currentUserId and selectedUserId are required." });
     }
 
-    // Update the recipient's likes
+    // Find the current user and selected user
+    const currentUser = await User.findById(currentUserId);
+    const selectedUser = await User.findById(selectedUserId);
+
+    if (!currentUser || !selectedUser) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    // Check if the current user has already liked the selected user
+    const alreadyLiked = selectedUser.recievedLikes.includes(currentUserId);
+    const alreadyCrush = currentUser.crushes.includes(selectedUserId);
+
+    if (alreadyLiked || alreadyCrush) {
+      console.log("you already liked this user ");
+      return res
+        .status(400)
+        .json({ message: "You have already liked this user." });
+    }
+
+    // Update the recipient's likes if not already liked
     await User.findByIdAndUpdate(selectedUserId, {
       $push: { recievedLikes: currentUserId },
     });
 
-    // Update the current user's crushes
+    // Update the current user's crushes if not already added
     await User.findByIdAndUpdate(currentUserId, {
       $push: { crushes: selectedUserId },
     });
@@ -566,25 +590,32 @@ app.post("/likeprofile", async (req, res) => {
 
 app.get("/recievedLikes/:userId/info", async (req, res) => {
   try {
-    const recievedLikesArray = [];
     const { userId } = req.params;
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ message: "user not found" });
+
+    // Retrieve the current user along with their crushes
+    const currentUser = await User.findById(userId).populate("crushes", "_id");
+
+    if (!currentUser) {
+      return res.status(404).json({ message: "User not found" });
     }
 
-    for (const likedUserId of user.recievedLikes) {
-      const likedUser = await User.findById(likedUserId);
+    // Extract the IDs of the current user's crushes
+    const deslikedProfileId = (currentUser.profileDislikes || []).map(
+      (profileDeslike) => profileDeslike._id
+    );
 
-      if (likedUser) {
-        recievedLikesArray.push(likedUser);
-      }
-    }
-    res.status(200).json(recievedLikesArray);
+    // Find users in the recievedLikes array but exclude users that are in crushes
+    const recievedLikesArray = await User.find({
+      _id: { $in: currentUser.recievedLikes, $nin: deslikedProfileId }, // Filter out crushes
+    });
+
+    console.log(recievedLikesArray);
+
+    // Return the filtered received likes
+    return res.status(200).json(recievedLikesArray);
   } catch (error) {
-    res
-      .status(500)
-      .json({ message: "failed to retrieve the recieved likes userId" });
+    console.error("Error fetching received likes:", error);
+    res.status(500).json({ message: "Failed to retrieve the received likes" });
   }
 });
 
@@ -786,7 +817,7 @@ app.get("/nearby-users", async (req, res) => {
           $maxDistance: parseFloat(maxDistance), // Parse to float for max distance
         },
       },
-    }).select("name  location profileImages");
+    }).select("name  location profileImages pushToken");
 
     if (nearbyUsers.length === 0) {
       return res.status(404).json({ message: "No users found nearby" });
@@ -966,5 +997,98 @@ app.post("/cuddles/reset-password", async (req, res) => {
   } catch (error) {
     console.error("Error in changing password:", error);
     res.status(500).json({ message: "An error occurred." });
+  }
+});
+
+app.post("/addToCrushes", async (req, res) => {
+  try {
+    const { currentUserId, selectedUserId } = req.body;
+
+    // Ensure both IDs are provided
+    if (!currentUserId || !selectedUserId) {
+      return res
+        .status(400)
+        .json({ message: "currentUserId and selectedUserId are required." });
+    }
+
+    // Find the current user and the selected user
+    const currentUser = await User.findById(currentUserId);
+    const selectedUser = await User.findById(selectedUserId);
+
+    if (!currentUser || !selectedUser) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    // Check if the current user already has the selected user in their crushes
+    const alreadyCrush = currentUser.crushes.some((crush) =>
+      crush.equals(selectedUser._id)
+    );
+
+    if (alreadyCrush) {
+      return res
+        .status(400)
+        .json({ message: "You have already added this user to your crushes." });
+    }
+
+    // Add the selected user's ObjectId to the current user's crushes
+    await User.findByIdAndUpdate(currentUserId, {
+      $push: { crushes: selectedUser._id }, // Adding the ObjectId of the selected user
+    });
+
+    return res
+      .status(200)
+      .json({ message: "User added to crushes successfully." });
+  } catch (error) {
+    console.error("Error adding user to crushes:", error); // Log the error for debugging
+    return res
+      .status(500)
+      .json({ message: "Failed to add user to crushes", error: error.message });
+  }
+});
+
+app.post("/addToDislikes", async (req, res) => {
+  try {
+    const { currentUserId, selectedUserId } = req.body;
+
+    // Ensure both IDs are provided
+    if (!currentUserId || !selectedUserId) {
+      return res
+        .status(400)
+        .json({ message: "currentUserId and selectedUserId are required." });
+    }
+
+    // Find the current user and the selected user
+    const currentUser = await User.findById(currentUserId);
+    const selectedUser = await User.findById(selectedUserId);
+
+    if (!currentUser || !selectedUser) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    // Check if the current user already has the selected user in their dislikes
+    const alreadyDisliked = currentUser.profileDislikes.some(
+      (profileDislikes) => profileDislikes.equals(selectedUser._id)
+    );
+
+    if (alreadyDisliked) {
+      return res.status(400).json({
+        message: "You have already added this user to your dislikes.",
+      });
+    }
+
+    // Add the selected user's ObjectId to the current user's dislikes
+    await User.findByIdAndUpdate(currentUserId, {
+      $push: { profileDislikes: selectedUser._id },
+    });
+
+    return res
+      .status(200)
+      .json({ message: "User added to dislikes successfully." });
+  } catch (error) {
+    console.error("Error adding user to dislikes:", error);
+    return res.status(500).json({
+      message: "Failed to add user to dislikes",
+      error: error.message,
+    });
   }
 });
