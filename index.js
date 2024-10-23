@@ -609,8 +609,6 @@ app.get("/recievedLikes/:userId/info", async (req, res) => {
       _id: { $in: currentUser.recievedLikes, $nin: deslikedProfileId }, // Filter out crushes
     });
 
-    console.log(recievedLikesArray);
-
     // Return the filtered received likes
     return res.status(200).json(recievedLikesArray);
   } catch (error) {
