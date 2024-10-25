@@ -5,6 +5,7 @@ const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 const cors = require("cors");
 const User = require("./models/User");
+const Report = require("./models/Report");
 
 const Message = require("./models/message");
 const jwt = require("jsonwebtoken");
@@ -475,10 +476,8 @@ app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
 
 app.get("/profiles", async (req, res) => {
   try {
-    // Destructure userId, gender, and lookingFor from the query parameters
-    const { userId, gender, lookingFor } = req.query;
+    const { userId, gender, lookingFor, age } = req.query;
 
-    // Check if userId, gender, and lookingFor are provided
     if (!userId || !gender) {
       return res
         .status(400)
@@ -488,7 +487,6 @@ app.get("/profiles", async (req, res) => {
     // Set the filter to find profiles of the opposite gender
     let genderFilter = { gender: gender === "male" ? "female" : "male" };
 
-    // Parse the lookingFor parameter into an array
     let lookingForArray = [];
     if (lookingFor) {
       lookingForArray = Array.isArray(lookingFor) ? lookingFor : [lookingFor];
@@ -520,6 +518,10 @@ app.get("/profiles", async (req, res) => {
         ? { lookingFor: { $in: lookingForArray } }
         : {}),
     };
+
+    // Use default age of 21 if not provided
+    const ageLimit = age ? parseInt(age, 10) : 21; // Default to 21 if age is not provided
+    filter.age = { $gte: ageLimit }; // Filter profiles with age greater than or equal to ageLimit
 
     // Find profiles matching the filter and excluding the current user, matches, and crushes
     const profiles = await User.find(filter)
@@ -644,19 +646,30 @@ app.post("/create-match", async (req, res) => {
 app.get("/matches/:userId/info", async (req, res) => {
   try {
     const { userId } = req.params;
+
+    // Find the user by userId
     const user = await User.findById(userId);
     if (!user) {
-      return res.status(404).json({ message: "user not found" });
+      return res.status(404).json({ message: "User not found." });
     }
 
+    // Get the user's match IDs
     const matchIds = user.Matches;
+
+    // Fetch matches based on match IDs
     const matches = await User.find({ _id: { $in: matchIds } });
 
-    res.status(200).json(matches);
+    // Filter out matches that have the current user in their blockedBy array
+    const filteredMatches = matches.filter(
+      (match) => !match.blockedBy.includes(userId) // Check if the current userId is in the match's blockedBy array
+    );
+
+    // Return the filtered matches
+    res.status(200).json(filteredMatches);
   } catch (error) {
     res
       .status(500)
-      .json({ message: "failed to retrieve the recieved likes userId" });
+      .json({ message: "Failed to retrieve the received likes userId." });
   }
 });
 
@@ -1088,5 +1101,75 @@ app.post("/addToDislikes", async (req, res) => {
       message: "Failed to add user to dislikes",
       error: error.message,
     });
+  }
+});
+
+app.post("/blockUser", async (req, res) => {
+  try {
+    const { currentUserId, selectedUserId } = req.body;
+    // Ensure both IDs are provided
+    if (!currentUserId || !selectedUserId) {
+      return res
+        .status(400)
+        .json({ message: "currentUserId and selectedUserId are required." });
+    }
+
+    // Find the current user and the selected user
+    const currentUser = await User.findById(currentUserId);
+    const selectedUser = await User.findById(selectedUserId);
+
+    if (!currentUser || !selectedUser) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    // Check if the current user already has the selected user in their dislikes
+    const alreadyBlocked = selectedUser.blockedBy.some((blockedBy) =>
+      blockedBy.equals(currentUser)
+    );
+
+    // Add the selected user's ObjectId to the current user's dislikes
+    await User.findByIdAndUpdate(selectedUser, {
+      $push: { blockedBy: currentUser._id },
+    });
+
+    return res
+      .status(200)
+      .json({ message: "User added to blocked successfully." });
+  } catch (error) {}
+});
+
+app.post("/report", async (req, res) => {
+  const { reporterId, reportedUserId, message } = req.body;
+
+  if (!reporterId || !reportedUserId || !message) {
+    return res.status(400).json({ error: "All fields are required." });
+  }
+
+  try {
+    // Check if users exist
+    const reporter = await User.findById(reporterId);
+    const reportedUser = await User.findById(reportedUserId);
+    if (!reporter || !reportedUser) {
+      return res.status(404).json({ error: "User not found." });
+    }
+
+    // Save report to database
+    const report = new Report({ reporterId, reportedUserId, message });
+    await report.save();
+
+    // Send report email
+    await transporter.sendMail({
+      from: "developit231@gmail.com",
+      to: "developit231@gmail.com",
+      subject: "New User Report",
+      text: `User with ID ${reporterId} reported user with ID ${reportedUserId}.\n\nMessage: ${message}`,
+    });
+
+    res.status(201).json({ message: "Report submitted successfully." });
+  } catch (error) {
+    console.error(error);
+    res
+      .status(500)
+      .json({ error: "An error occurred while submitting the report." });
   }
 });

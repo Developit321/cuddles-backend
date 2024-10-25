@@ -50,6 +50,12 @@ const userSchema = mongoose.Schema({
       ref: "User",
     },
   ],
+  blockedBy: [
+    {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+    },
+  ],
 
   Matches: [
     {
