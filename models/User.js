@@ -113,6 +113,12 @@ const userSchema = mongoose.Schema({
       index: "2dsphere",
     },
   },
+  conversations: [
+    {
+      receiverId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+      unreadMessagesCount: { type: Number, default: 0 },
+    },
+  ],
 });
 userSchema.index({ location: "2dsphere" });
 const User = mongoose.model("User", userSchema);

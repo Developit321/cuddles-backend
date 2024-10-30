@@ -23,6 +23,9 @@ app.use(cors());
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
+// controllers
+const { getUnreadCounts } = require("./Controllers/conversationController");
+
 // Configure multer for file handling
 const storage = multer.memoryStorage(); // Store files in memory
 const upload = multer({ storage });
@@ -58,6 +61,40 @@ io.on("connection", (socket) => {
   socket.on("join", ({ userId }) => {
     socket.join(userId); // User joins a room with their own userId
     console.log("User joined room:", userId);
+
+    // Emit a success message back to the client
+    socket.emit("joinSuccess", {
+      status: 200,
+      message: "Joined room successfully",
+    });
+  });
+
+  // Join a user to a specific group chat room
+  socket.on("joinGroup", ({ userId, groupId }) => {
+    socket.join(groupId);
+    console.log(`User ${userId} joined group room: ${groupId}`);
+    socket.emit("joinGroupSuccess", {
+      status: 200,
+      message: `Joined group ${groupId} successfully`,
+    });
+  });
+
+  /// send group message
+  socket.on("sendGroupMessage", async ({ senderId, groupId, message }) => {
+    try {
+      const newGroupMessage = new GroupMessage({
+        groupId,
+        senderId,
+        message,
+        timestamp: new Date(),
+      });
+
+      await newGroupMessage.save();
+      io.to(groupId).emit("receiveGroupMessage", newGroupMessage);
+      console.log(`Message sent to group ${groupId}:`, message);
+    } catch (error) {
+      console.error("Error sending group message:", error);
+    }
   });
 
   // Listen for incoming messages
@@ -70,12 +107,112 @@ io.on("connection", (socket) => {
       });
 
       const newMessage = new Message({ senderId, receiverId, message });
+      const updatedUser = await User.findOneAndUpdate(
+        { _id: receiverId, "conversations.receiverId": senderId },
+        { $inc: { "conversations.$.unreadMessagesCount": 1 } },
+        { new: true }
+      );
+
+      // If the conversation was not found, add a new one
+      if (!updatedUser) {
+        await User.findOneAndUpdate(
+          { _id: receiverId },
+          {
+            $push: {
+              conversations: {
+                receiverId: senderId,
+                unreadMessagesCount: 1,
+              },
+            },
+          }
+        );
+      }
       await newMessage.save();
 
       // Emit the message to the receiver's room
       io.to(receiverId).emit("receiveMessage", newMessage); // Emit to the room based on receiverId
     } catch (error) {
       console.error("Error saving message:", error);
+    }
+  });
+  // Listen for marking messages as read
+  socket.on("markAsRead", async ({ userId, senderId }) => {
+    try {
+      // Reset the unread messages count to zero
+      const updatedUser = await User.findOneAndUpdate(
+        { _id: senderId, "conversations.receiverId": userId },
+        { $set: { "conversations.$.unreadMessagesCount": 0 } },
+        { new: true }
+      );
+
+      // Optionally, you can emit an update event to the sender or other relevant clients
+      if (updatedUser) {
+        // Emit an event to notify about the updated unread count
+        io.to(senderId).emit("updateUnreadCount", { senderId, unreadCount: 0 });
+      }
+
+      console.log("Messages marked as read for:", { userId, senderId });
+    } catch (error) {
+      console.error("Error marking messages as read:", error);
+    }
+  });
+
+  app.get("/group/messages/:groupName", async (req, res) => {
+    const { groupName } = req.params;
+
+    try {
+      // Validate the groupName
+      if (!["Good Times", "Vibes", "Friendships"].includes(groupName)) {
+        return res.status(400).json({ message: "Invalid group name" });
+      }
+
+      const messages = await GroupMessage.find({ groupName })
+        .sort({ createdAt: 1 }) // Sort by createdAt in ascending order
+        .select("senderId message createdAt"); // Select only necessary fields
+
+      res.status(200).json(messages);
+    } catch (error) {
+      console.error("Error fetching group messages:", error);
+      res.status(500).json({ message: "Server error" });
+    }
+  });
+
+  // set read messages to true
+  app.post("/messages/read", async (req, res) => {
+    const { userId, senderId } = req.body;
+
+    try {
+      // Find and update the unread messages for the specified conversation
+      const updatedMessages = await Chat.updateMany(
+        {
+          $or: [
+            { senderId: senderId, receiverId: userId, read: false }, // Messages sent by the sender
+            { senderId: userId, receiverId: senderId, read: false }, // Messages sent by the receiver
+          ],
+        },
+        { $set: { read: true } },
+        { multi: true } // Update multiple documents
+      );
+
+      if (updatedMessages.nModified === 0) {
+        return res.status(404).json({ message: "No unread messages found" });
+      }
+
+      // Update the user's conversation to reset unread count
+      const user = await User.findOneAndUpdate(
+        { _id: userId, "conversations.receiverId": senderId },
+        { $set: { "conversations.$.unreadMessagesCount": 0 } },
+        { new: true }
+      );
+
+      if (!user) {
+        return res.status(404).json({ message: "Conversation not found" });
+      }
+
+      return res.status(200).json({ message: "Messages marked as read", user });
+    } catch (error) {
+      console.error("Error marking messages as read:", error);
+      return res.status(500).json({ message: "Internal server error" });
     }
   });
 
@@ -517,6 +654,7 @@ app.get("/profiles", async (req, res) => {
       ...(lookingForArray.length
         ? { lookingFor: { $in: lookingForArray } }
         : {}),
+      profileImages: { $exists: true, $ne: [] },
     };
 
     // Use default age of 21 if not provided
@@ -661,17 +799,61 @@ app.get("/matches/:userId/info", async (req, res) => {
 
     // Filter out matches that have the current user in their blockedBy array
     const filteredMatches = matches.filter(
-      (match) => !match.blockedBy.includes(userId) // Check if the current userId is in the match's blockedBy array
+      (match) => !match.blockedBy.includes(userId)
     );
 
-    // Return the filtered matches
-    res.status(200).json(filteredMatches);
+    // Populate each match with the latest message details and unread count
+    const updatedMatches = await Promise.all(
+      filteredMatches.map(async (match) => {
+        const latestMessage = await fetchLatestMessage(userId, match._id);
+
+        console.log();
+
+        // Find the conversation for the current match
+        const conversation = user.conversations.find(
+          (conv) => conv.receiverId.toString() === match._id.toString()
+        );
+
+        return {
+          ...match.toObject(),
+          lastMessage: latestMessage?.message || "No messages",
+          timestamp: latestMessage?.timestamp || null,
+          typing: latestMessage?.typing || false,
+          unreadCount: conversation ? conversation.unreadMessagesCount : 0, // Get unread count from conversations
+        };
+      })
+    );
+
+    // Sort matches by the timestamp of the latest message
+    const sortedMatches = updatedMatches.sort((a, b) => {
+      const aTime = a.timestamp ? new Date(a.timestamp) : 0; // Convert to date object
+      const bTime = b.timestamp ? new Date(b.timestamp) : 0; // Convert to date object
+      return bTime - aTime; // Sort in descending order
+    });
+
+    // Return the filtered and updated matches with latest messages
+    res.status(200).json(sortedMatches);
   } catch (error) {
     res
       .status(500)
-      .json({ message: "Failed to retrieve the received likes userId." });
+      .json({ message: "Failed to retrieve matches and latest messages." });
   }
 });
+
+// Helper function to fetch the latest message between two users
+const fetchLatestMessage = async (userId, matchId) => {
+  // Find the latest message between the users
+  const latestMessage = await Message.findOne({
+    $or: [
+      { senderId: userId, receiverId: matchId },
+      { senderId: matchId, receiverId: userId },
+    ],
+  })
+    .sort({ timestamp: -1 }) // Sort by timestamp, assuming it's the field you're using
+    .lean();
+
+  return latestMessage || {};
+};
 
 app.delete("/users/:userId/images", async (req, res) => {
   const { userId } = req.params;
@@ -702,14 +884,19 @@ app.delete("/users/:userId/images", async (req, res) => {
 });
 app.get("/messages/:senderId/:receiverId", async (req, res) => {
   const { senderId, receiverId } = req.params;
+  const { skip = 0, limit = 20 } = req.query;
   try {
-    // Fetch messages based on senderId and receiverId
+    // Fetch messages based on senderId and receiverId with pagination
     const messages = await Message.find({
       $or: [
         { senderId, receiverId },
         { senderId: receiverId, receiverId: senderId },
       ],
-    }).sort({ timestamp: 1 }); // Sort messages by timestamp
+    })
+      .sort({ timestamp: -1 }) // Sort messages by timestamp in descending order
+      .skip(Number(skip)) // Skip the first `skip` messages
+      .limit(Number(limit)); // Limit to `limit` messages
+
     res.json(messages);
   } catch (error) {
     res.status(500).json({ message: "Error fetching messages" });
@@ -1173,3 +1360,5 @@ app.post("/report", async (req, res) => {
       .json({ error: "An error occurred while submitting the report." });
   }
 });
+
+app.get("/unread-counts/:userId", getUnreadCounts);
