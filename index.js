@@ -664,7 +664,8 @@ app.get("/profiles", async (req, res) => {
     // Find profiles matching the filter and excluding the current user, matches, and crushes
     const profiles = await User.find(filter)
       .where("_id")
-      .nin([userId, ...friendsIds, ...crushesId, ...profileDislikes]);
+      .nin([userId, ...friendsIds, ...crushesId, ...profileDislikes])
+      .sort({ _id: -1 });
 
     // Return the found profiles
     return res.status(200).json({ profiles });
