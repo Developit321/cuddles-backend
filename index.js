@@ -298,8 +298,8 @@ app.post("/change-password/:userId", async (req, res) => {
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
-    user: "makofanethulane53@gmail.com", // Use environment variables
-    pass: "qlrm olky tyzb usur",
+    user: "cuddlesquery@gmail.com",
+    pass: "nlvj jxji vkni ftxv",
   },
 });
 // Send verification email
@@ -1347,8 +1347,8 @@ app.post("/report", async (req, res) => {
 
     // Send report email
     await transporter.sendMail({
-      from: "developit231@gmail.com",
-      to: "developit231@gmail.com",
+      from: "cuddlesquery@gmail.com",
+      to: "cuddlesquery@gmail.com",
       subject: "New User Report",
       text: `User with ID ${reporterId} reported user with ID ${reportedUserId}.\n\nMessage: ${message}`,
     });
