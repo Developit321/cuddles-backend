@@ -621,11 +621,13 @@ app.get("/profiles", async (req, res) => {
         .json({ message: "userId and gender are required" });
     }
 
-    // Set the filter to find profiles based on the current user's gender
-    let genderFilter = {
-      gender:
-        gender === "male" ? "male" : gender === "female" ? "female" : "others",
-    };
+    // Set the filter to find profiles of the opposite gender
+    let genderFilter =
+      gender === "male"
+        ? { gender: "male" }
+        : gender === "female"
+        ? { gender: "female" }
+        : {};
 
     let lookingForArray = [];
     if (lookingFor) {
