@@ -55,13 +55,9 @@ http.listen(port, () => {
 
 // Socket.io connection
 io.on("connection", (socket) => {
-  console.log("A user connected: " + socket.id);
-
   // Listen for the join event and make the user join a specific room
   socket.on("join", ({ userId }) => {
     socket.join(userId); // User joins a room with their own userId
-    console.log("User joined room:", userId);
-
     // Emit a success message back to the client
     socket.emit("joinSuccess", {
       status: 200,
@@ -72,7 +68,6 @@ io.on("connection", (socket) => {
   // Join a user to a specific group chat room
   socket.on("joinGroup", ({ userId, groupId }) => {
     socket.join(groupId);
-    console.log(`User ${userId} joined group room: ${groupId}`);
     socket.emit("joinGroupSuccess", {
       status: 200,
       message: `Joined group ${groupId} successfully`,
@@ -226,33 +221,81 @@ io.on("connection", (socket) => {
 app.post("/register", async (req, res) => {
   try {
     const { name, email, password, age } = req.body;
-    const existingUser = await User.findOne({ email });
+
+    // Validate request fields
+    if (!name || !email || !password || !age) {
+      return res.status(400).json({ message: "All fields are required" });
+    }
+
+    // Ensure email is a valid format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ message: "Invalid email format" });
+    }
+
+    // Convert email to lowercase for consistency
+    const normalizedEmail = email.toLowerCase();
+
+    // Check if the user already exists
+    const existingUser = await User.findOne({ email: normalizedEmail });
     if (existingUser) {
       return res.status(400).json({ message: "User already exists" });
+    }
+
+    // Validate password strength (e.g., at least 8 characters)
+    if (password.length < 8) {
+      return res.status(400).json({
+        message: "Password must be at least 8 characters long",
+      });
     }
 
     // Hash the password
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
+    // Create a new user
     const newUser = new User({
       name,
-      email,
+      email: normalizedEmail,
       password: hashedPassword,
       age,
     });
 
-    // Verification
+    // Generate a verification token
     newUser.VerificationToken = crypto.randomBytes(20).toString("hex");
+
+    // Save the new user to the database
     await newUser.save();
 
+    // Send a verification email
     sendVerificationEmail(newUser.email, newUser.VerificationToken);
 
+    // Generate a JWT token
     const token = jwt.sign({ userId: newUser._id }, secretKey);
+
+    // Respond with success
     res.status(200).json({ token, userId: newUser._id });
   } catch (error) {
-    console.log("Error registering the user", error);
-    res.status(500).json({ message: "Registration failed" });
+    console.error("Error during registration:", error);
+
+    // MongoDB validation errors
+    if (error.name === "ValidationError") {
+      return res.status(400).json({
+        message: "Validation error",
+        details: error.errors,
+      });
+    }
+
+    // Handle duplicate key errors (e.g., email already exists)
+    if (error.code === 11000) {
+      return res.status(400).json({ message: "Email already exists" });
+    }
+
+    // Generic error handling
+    res.status(500).json({
+      message: "An unexpected error occurred during registration",
+      error: error.message,
+    });
   }
 });
 
@@ -352,10 +395,11 @@ const secretKey = generateSecreteKey();
 app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-
+    console.log(email);
     // Find the user by email
     const user = await User.findOne({ email });
     if (!user) {
+      console.log("no user ");
       return res.status(401).json({ message: "Invalid email or password" });
     }
 
@@ -1038,7 +1082,6 @@ app.get("/nearby-users", async (req, res) => {
 app.delete("/users/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
-    console.log("User ID received for deletion:", userId); // Log the userId
 
     // Validate the userId format
     if (!mongoose.Types.ObjectId.isValid(userId)) {
