@@ -6,7 +6,8 @@ const crypto = require("crypto");
 const cors = require("cors");
 const User = require("./models/User");
 const Report = require("./models/Report");
-
+const SharedQuestion = require("./models/SharedQuestion");
+const Question = require("./models/ Question");
 const Message = require("./models/message");
 const jwt = require("jsonwebtoken");
 const cloudinary = require("cloudinary");
@@ -18,10 +19,17 @@ const Chat = require("./models/message");
 const http = require("http").createServer(app);
 const io = require("socket.io")(http); // Pass the HTTP server instance
 const bcrypt = require("bcryptjs");
+const { sendDailyReminders } = require("./cron/dailyReminder");
+const { sendNotification } = require("./notifications/pushNotifications");
+require("./cron/dailyReminder");
+
+const userRoutes = require("./routes/userRoutes");
 
 app.use(cors());
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
+// Routes
+app.use("/api/users", userRoutes);
 
 // controllers
 const { getUnreadCounts } = require("./Controllers/conversationController");
@@ -52,6 +60,8 @@ mongoose
 http.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });
+
+module.exports = mongoose;
 
 // Socket.io connection
 io.on("connection", (socket) => {
@@ -726,7 +736,6 @@ app.get("/profiles", async (req, res) => {
   }
 });
 
-//send a like
 app.post("/likeprofile", async (req, res) => {
   try {
     const { currentUserId, selectedUserId } = req.body;
@@ -740,7 +749,9 @@ app.post("/likeprofile", async (req, res) => {
 
     // Find the current user and selected user
     const currentUser = await User.findById(currentUserId);
-    const selectedUser = await User.findById(selectedUserId);
+    const selectedUser = await User.findById(selectedUserId).select(
+      "pushToken recievedLikes"
+    );
 
     if (!currentUser || !selectedUser) {
       return res.status(404).json({ message: "User not found." });
@@ -751,7 +762,7 @@ app.post("/likeprofile", async (req, res) => {
     const alreadyCrush = currentUser.crushes.includes(selectedUserId);
 
     if (alreadyLiked || alreadyCrush) {
-      console.log("you already liked this user ");
+      console.log("You already liked this user.");
       return res
         .status(400)
         .json({ message: "You have already liked this user." });
@@ -766,6 +777,13 @@ app.post("/likeprofile", async (req, res) => {
     await User.findByIdAndUpdate(currentUserId, {
       $push: { crushes: selectedUserId },
     });
+
+    // Send notification to the selected user if they have a push token
+    if (selectedUser.pushToken) {
+      const title = "Someone likes your profile!";
+      const body = `${currentUser.name || "A user"} has liked your profile.`;
+      await sendNotification(selectedUser.pushToken, title, body);
+    }
 
     return res.status(200).json({ message: "Profile liked successfully." });
   } catch (error) {
@@ -823,6 +841,17 @@ app.post("/create-match", async (req, res) => {
       $pull: { recievedLikes: selectedUserId },
     });
 
+    // Fetch the selected user's expo push token
+    const selectedUser = await User.findById(selectedUserId).select(
+      "pushToken"
+    );
+
+    // Only send notification if the expoPushToken is available
+    if (selectedUser && selectedUser.pushToken) {
+      const title = "You have a new match!";
+      const body = "You and someone else have matched! Check it out.";
+      await sendNotification(selectedUser.pushToken, title, body);
+    }
     res.sendStatus(200);
   } catch (error) {
     res.status(500).json({ message: "failed to match the users", error });
@@ -1411,3 +1440,114 @@ app.post("/report", async (req, res) => {
 });
 
 app.get("/unread-counts/:userId", getUnreadCounts);
+
+app.get("/api/question", async (req, res) => {
+  try {
+    // Get today's date at midnight
+    const today = new Date();
+    today.setHours(0, 0, 0, 0); // Start of the day
+
+    // Check if a question has already been shared today
+    let sharedQuestion = await SharedQuestion.findOne({
+      date: { $gte: today },
+    });
+
+    if (sharedQuestion) {
+      // If a question has already been shared today, fetch it
+      const question = await Question.findById(sharedQuestion.questionId);
+      if (question) {
+        return res.json({
+          message: "Here is your question for today!",
+          question: question.question,
+          options: question.options,
+        });
+      }
+    }
+
+    // If no question shared today, delete outdated shared questions
+    await SharedQuestion.deleteMany({ date: { $lt: today } });
+
+    // Fetch a random question
+    const question = await Question.aggregate([{ $sample: { size: 1 } }]);
+
+    if (!question.length) {
+      return res.status(404).json({ message: "No questions available." });
+    }
+
+    // Save the new question and set the date to today
+    const newSharedQuestion = new SharedQuestion({
+      date: today, // Use today's date
+      questionId: question[0]._id,
+    });
+    await newSharedQuestion.save();
+
+    // Respond with the random question
+    res.json({
+      message: "Here is your question for today!",
+      question: question[0].question,
+      options: question[0].options,
+    });
+  } catch (error) {
+    console.error("Error fetching question:", error);
+    res.status(500).json({ message: "Internal server error." });
+  }
+});
+
+app.post("/api/questions/:userId/update-daily-question", async (req, res) => {
+  try {
+    const { question, answer } = req.body;
+    const { userId } = req.params;
+
+    console.log(userId, question, answer);
+
+    if (!question || !answer) {
+      console.log("Question and answer are required.");
+      return res
+        .status(400)
+        .json({ message: "Question and answer are required." });
+    }
+
+    // Find the user by ID
+    const user = await User.findById(userId);
+
+    if (!user) {
+      console.log("User not found");
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0); // Reset to the start of today
+
+    // Check if the user's daily question is from today
+    if (user.dailyQuestion?.answeredAt) {
+      const answeredDate = new Date(user.dailyQuestion.answeredAt);
+      answeredDate.setHours(0, 0, 0, 0); // Reset answeredAt to the start of that day
+
+      // If the question is from today, do not allow a new update
+      if (answeredDate.getTime() === today.getTime()) {
+        return res
+          .status(400)
+          .json({ message: "Question has already been answered today." });
+      }
+
+      // If the question is from a previous day, delete it
+      user.dailyQuestion = null;
+    }
+
+    // Update the user's daily question with the new one
+    user.dailyQuestion = {
+      question,
+      answer,
+      answeredAt: new Date(),
+    };
+
+    await user.save();
+
+    res.status(200).json({ message: "Daily question updated successfully." });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Server error." });
+  }
+});
+
+app.use("/notify", userRoutes);
