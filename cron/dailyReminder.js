@@ -1,0 +1,29 @@
+const cron = require("node-cron"); // Use require for node-cron
+const { sendNotification } = require("../notifications/pushNotifications"); // Use require to import sendNotification function
+const User = require("../models/User"); // Use require to import User model
+const { checkIfAnsweredToday } = require("../Controllers/userController"); // Use require for checkIfAnsweredToday
+
+// Function to send daily reminders to users who haven't answered today's question
+const sendDailyReminders = async () => {
+  try {
+    const users = await User.find({ pushToken: { $exists: true } });
+
+    for (const user of users) {
+      const answeredToday = await checkIfAnsweredToday(user._id);
+      if (!answeredToday) {
+        await sendNotification(
+          user.pushToken,
+          "Reminder: Answer Today's Question!",
+          "You haven't answered today's question yet. Please answer it now!"
+        );
+      }
+    }
+  } catch (error) {
+    console.error("Error sending daily reminders:", error);
+  }
+};
+
+// Schedule reminders every day at 8 AM
+cron.schedule("0 8 * * *", sendDailyReminders);
+
+module.exports = { sendDailyReminders };
