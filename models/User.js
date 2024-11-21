@@ -113,6 +113,11 @@ const userSchema = mongoose.Schema(
         unreadMessagesCount: { type: Number, default: 0 },
       },
     ],
+    dailyQuestion: {
+      question: { type: String },
+      answer: { type: String },
+      answeredAt: { type: Date },
+    },
   },
   { timestamps: true }
 ); // Add timestamps option here
