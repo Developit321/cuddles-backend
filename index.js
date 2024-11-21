@@ -1493,7 +1493,7 @@ app.get("/api/question", async (req, res) => {
   }
 });
 
-app.post("/api/questions/:userId/update-daily-question", async (req, res) => {
+app.post("/:userId/update-daily-question", async (req, res) => {
   try {
     const { question, answer } = req.body;
     const { userId } = req.params;
