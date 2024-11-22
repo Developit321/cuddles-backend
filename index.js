@@ -675,7 +675,6 @@ app.get("/profiles", async (req, res) => {
         .json({ message: "userId and gender are required" });
     }
 
-    // Set the filter to find profiles of the opposite gender
     let genderFilter =
       gender === "male"
         ? { gender: "male" }
@@ -688,50 +687,47 @@ app.get("/profiles", async (req, res) => {
       lookingForArray = Array.isArray(lookingFor) ? lookingFor : [lookingFor];
     }
 
-    // Retrieve the current user with their matches and crushes populated
     const currentUser = await User.findById(userId)
       .populate("Matches", "_id")
       .populate("crushes", "_id")
       .populate("profileDislikes", "_id");
 
-    // Check if the current user exists
     if (!currentUser) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Extract the IDs of the current user's matches and crushes
-    const friendsIds = (currentUser.Matches || []).map((friend) => friend._id);
-    const crushesId = (currentUser.crushes || []).map((crush) => crush._id);
-
-    const profileDislikes = (currentUser.profileDislikes || []).map(
-      (dislike) => dislike._id
+    const friendsIds = (currentUser.Matches || []).map((friend) =>
+      friend._id.toString()
+    );
+    const crushesId = (currentUser.crushes || []).map((crush) =>
+      crush._id.toString()
+    );
+    const profileDislikes = (currentUser.profileDislikes || []).map((dislike) =>
+      dislike._id.toString()
     );
 
-    // Construct the final filter object
     const filter = {
       ...genderFilter,
       ...(lookingForArray.length
         ? { lookingFor: { $in: lookingForArray } }
         : {}),
       profileImages: { $exists: true, $ne: [] },
+      _id: { $nin: [userId, ...friendsIds, ...crushesId, ...profileDislikes] },
     };
 
-    // Use default age of 21 if not provided
-    const ageLimit = age ? parseInt(age, 10) : 21; // Default to 21 if age is not provided
-    filter.age = { $gte: ageLimit }; // Filter profiles with age greater than or equal to ageLimit
+    const ageLimit = age ? parseInt(age, 10) : 21;
+    filter.age = { $gte: ageLimit };
 
-    // Find profiles matching the filter and excluding the current user, matches, and crushes
-    const profiles = await User.find(filter)
-      .where("_id")
-      .nin([userId, ...friendsIds, ...crushesId, ...profileDislikes])
-      .sort({ _id: -1 });
+    // Fetch profiles with the filter
+    const profiles = await User.find(filter);
 
-    // Return the found profiles
-    return res.status(200).json({ profiles });
+    // Shuffle the results
+    const shuffledProfiles = profiles.sort(() => 0.5 - Math.random());
+
+    // Return the first 20 profiles
+    return res.status(200).json({ profiles: shuffledProfiles.slice(0, 20) });
   } catch (error) {
-    // Log the error for debugging purposes
     console.error("Error fetching user profiles:", error);
-    // Return an internal server error status
     res.status(500).json({ message: "Error fetching user profiles" });
   }
 });
