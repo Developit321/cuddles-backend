@@ -155,8 +155,6 @@ io.on("connection", (socket) => {
         // Emit an event to notify about the updated unread count
         io.to(senderId).emit("updateUnreadCount", { senderId, unreadCount: 0 });
       }
-
-      console.log("Messages marked as read for:", { userId, senderId });
     } catch (error) {
       console.error("Error marking messages as read:", error);
     }
@@ -223,7 +221,7 @@ io.on("connection", (socket) => {
 
   // Handle user disconnect
   socket.on("disconnect", () => {
-    console.log("A user disconnected: " + socket.id);
+    // console.log("A user disconnected: " + socket.id);
   });
 });
 
@@ -849,6 +847,7 @@ app.post("/create-match", async (req, res) => {
       await sendNotification(selectedUser.pushToken, title, body);
     }
     res.sendStatus(200);
+    console.log("new match ");
   } catch (error) {
     res.status(500).json({ message: "failed to match the users", error });
   }
