@@ -665,7 +665,15 @@ app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
 
 app.get("/profiles", async (req, res) => {
   try {
-    const { userId, gender, lookingFor, age } = req.query;
+    const {
+      userId,
+      gender,
+      lookingFor,
+      minAge,
+      maxAge,
+      page = 1,
+      limit = 20,
+    } = req.query;
 
     if (!userId || !gender) {
       return res
@@ -713,18 +721,30 @@ app.get("/profiles", async (req, res) => {
       _id: { $nin: [userId, ...friendsIds, ...crushesId, ...profileDislikes] },
     };
 
-    const ageLimit = age ? parseInt(age, 10) : 21;
-    filter.age = { $gte: ageLimit };
+    // Set default values for minAge and maxAge if not provided
+    const ageMin = minAge ? parseInt(minAge, 10) : 21;
+    const ageMax = maxAge ? parseInt(maxAge, 10) : 100;
+
+    // Apply the age range filter
+    filter.age = { $gte: ageMin, $lte: ageMax };
+
+    // Pagination: calculate skip and limit
+    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
 
     // Fetch profiles with the filter
-    const profiles = await User.find(filter);
+    const profiles = await User.find(filter)
+      .skip(skip)
+      .limit(parseInt(limit, 10));
 
     // Shuffle the results
     const shuffledProfiles = profiles.sort(() => 0.5 - Math.random());
 
-    // Return the first 20 profiles
-    return res.status(200).json({ profiles: shuffledProfiles.slice(0, 20) });
+    return res.status(200).json({
+      profiles: shuffledProfiles,
+      pagination: { page: parseInt(page, 10), limit: parseInt(limit, 10) },
+    });
   } catch (error) {
+    console.log(error);
     console.error("Error fetching user profiles:", error);
     res.status(500).json({ message: "Error fetching user profiles" });
   }
