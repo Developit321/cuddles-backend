@@ -681,18 +681,6 @@ app.get("/profiles", async (req, res) => {
         .json({ message: "userId and gender are required" });
     }
 
-    let genderFilter =
-      gender === "male"
-        ? { gender: "male" }
-        : gender === "female"
-        ? { gender: "female" }
-        : {};
-
-    let lookingForArray = [];
-    if (lookingFor) {
-      lookingForArray = Array.isArray(lookingFor) ? lookingFor : [lookingFor];
-    }
-
     const currentUser = await User.findById(userId)
       .populate("Matches", "_id")
       .populate("crushes", "_id")
@@ -700,6 +688,25 @@ app.get("/profiles", async (req, res) => {
 
     if (!currentUser) {
       return res.status(404).json({ message: "User not found" });
+    }
+
+    // Determine gender filter based on current user's gender
+    let genderFilter = {};
+    if (gender === "male") {
+      genderFilter = { gender: "male" };
+    } else if (gender === "female") {
+      genderFilter = { gender: "female" };
+    } else if (gender === "both") {
+      // If gender is "both", invert the filter based on the current user's gender
+      genderFilter =
+        currentUser.gender === "male"
+          ? { gender: "female" }
+          : { gender: "male" };
+    }
+
+    let lookingForArray = [];
+    if (lookingFor) {
+      lookingForArray = Array.isArray(lookingFor) ? lookingFor : [lookingFor];
     }
 
     const friendsIds = (currentUser.Matches || []).map((friend) =>
