@@ -738,8 +738,9 @@ app.get("/profiles", async (req, res) => {
     // Pagination: calculate skip and limit
     const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
 
-    // Fetch profiles with the filter
+    // Fetch profiles sorted by recent updates, then shuffle
     const profiles = await User.find(filter)
+      .sort({ updatedAt: -1 }) // Sort by most recently updated profiles
       .skip(skip)
       .limit(parseInt(limit, 10));
 
