@@ -14,7 +14,7 @@ const sendDailyReminders = async () => {
         await sendNotification(
           user.pushToken,
           "Reminder: Answer Today's Question!",
-          "You haven't answered today's question yet. Please answer it now!"
+          "You haven't gotten to it yet—take a moment to share your thoughts!"
         );
       }
     }
