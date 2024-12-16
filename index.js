@@ -643,7 +643,7 @@ app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
 
     if (imageUrl) {
       // Update user profile with Cloudinary URL
-      console.log(imageUrl);
+      console.log(userId, imageUrl);
       const user = await User.findByIdAndUpdate(
         userId,
         { $addToSet: { profileImages: imageUrl } },
