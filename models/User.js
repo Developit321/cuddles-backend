@@ -118,6 +118,7 @@ const userSchema = mongoose.Schema(
       answer: { type: String },
       answeredAt: { type: Date },
     },
+    priority: { type: Number, default: 0 },
   },
   { timestamps: true }
 ); // Add timestamps option here
