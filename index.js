@@ -699,7 +699,6 @@ app.get("/profiles", async (req, res) => {
     } else if (gender === "female") {
       genderFilter = { gender: "female" };
     } else if (gender === "both") {
-      // If gender is "both", invert the filter based on the current user's gender
       genderFilter =
         currentUser.gender === "male"
           ? { gender: "female" }
@@ -737,24 +736,42 @@ app.get("/profiles", async (req, res) => {
     // Apply the age range filter
     filter.age = { $gte: ageMin, $lte: ageMax };
 
+    // Fetch profiles with priority 1
+    const priorityProfiles = await User.find({
+      ...filter,
+      priority: 1,
+    })
+      .sort({ updatedAt: -1 })
+      .limit(20);
+
+    const remainingCount = 20 - priorityProfiles.length;
+
+    // Fetch additional profiles by updatedAt if needed
+    let additionalProfiles = [];
+    if (remainingCount > 0) {
+      additionalProfiles = await User.find({
+        ...filter,
+        priority: { $ne: 1 }, // Exclude already fetched priority profiles
+      })
+        .sort({ updatedAt: -1 })
+        .limit(remainingCount);
+    }
+
+    // Combine the results
+    const combinedProfiles = [...priorityProfiles, ...additionalProfiles];
+
     // Pagination: calculate skip and limit
     const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
-
-    // Fetch profiles sorted by recent updates, then shuffle
-    const profiles = await User.find(filter)
-      .sort({ priority: -1, updatedAt: -1 }) // Sort by most recently updated profiles
-      .skip(skip)
-      .limit(parseInt(limit, 10));
-
-    // Shuffle the results
-    const shuffledProfiles = profiles.sort(() => 0.5 - Math.random());
+    const paginatedProfiles = combinedProfiles.slice(
+      skip,
+      skip + parseInt(limit, 10)
+    );
 
     return res.status(200).json({
-      profiles: shuffledProfiles,
+      profiles: paginatedProfiles,
       pagination: { page: parseInt(page, 10), limit: parseInt(limit, 10) },
     });
   } catch (error) {
-    console.log(error);
     console.error("Error fetching user profiles:", error);
     res.status(500).json({ message: "Error fetching user profiles" });
   }
