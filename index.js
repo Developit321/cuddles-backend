@@ -113,6 +113,8 @@ io.on("connection", (socket) => {
         message,
       });
 
+      const recieverInfo = await User.findById(receiverId).select("pushToken");
+
       const newMessage = new Message({ senderId, receiverId, message });
       const updatedUser = await User.findOneAndUpdate(
         { _id: receiverId, "conversations.receiverId": senderId },
@@ -138,6 +140,10 @@ io.on("connection", (socket) => {
 
       // Emit the message to the receiver's room
       io.to(receiverId).emit("receiveMessage", newMessage); // Emit to the room based on receiverId
+
+      if (recieverInfo.pushToken) {
+        await sendNotification(recieverInfo.pushToken, "Message", message);
+      }
     } catch (error) {
       console.error("Error saving message:", error);
     }
