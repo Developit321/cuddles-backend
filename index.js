@@ -673,15 +673,7 @@ app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
 
 app.get("/profiles", async (req, res) => {
   try {
-    const {
-      userId,
-      gender,
-      lookingFor,
-      minAge,
-      maxAge,
-      page = 1,
-      limit = 20,
-    } = req.query;
+    const { userId, gender, lookingFor, minAge, maxAge } = req.query;
 
     if (!userId || !gender) {
       return res
@@ -763,19 +755,14 @@ app.get("/profiles", async (req, res) => {
         .limit(remainingCount);
     }
 
-    // Combine the results
-    const combinedProfiles = [...priorityProfiles, ...additionalProfiles];
-
-    // Pagination: calculate skip and limit
-    const skip = (parseInt(page, 10) - 1) * parseInt(limit, 10);
-    const paginatedProfiles = combinedProfiles.slice(
-      skip,
-      skip + parseInt(limit, 10)
+    // Combine and shuffle the results
+    const combinedProfiles = [...priorityProfiles, ...additionalProfiles].sort(
+      () => Math.random() - 0.5
     );
 
+    // Return all profiles
     return res.status(200).json({
-      profiles: paginatedProfiles,
-      pagination: { page: parseInt(page, 10), limit: parseInt(limit, 10) },
+      profiles: combinedProfiles,
     });
   } catch (error) {
     console.error("Error fetching user profiles:", error);
