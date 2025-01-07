@@ -22,8 +22,8 @@ const bcrypt = require("bcryptjs");
 const { sendDailyReminders } = require("./cron/dailyReminder");
 const { sendNotification } = require("./notifications/pushNotifications");
 require("./cron/dailyReminder");
-const faceapi = require("face-api.js");
-const fs = require("fs");
+
+const { loadModels, detectFaces } = require("./helper/faceDetection");
 
 const userRoutes = require("./routes/userRoutes");
 
@@ -52,8 +52,10 @@ mongoose
   .connect(
     "mongodb+srv://cuddles:LNum9ZwrrcNDyl5c@cluster0.bdtblda.mongodb.net/"
   )
-  .then(() => {
+  .then(async () => {
     console.log("Connected to the Database");
+
+    await loadModels();
   })
   .catch((error) => {
     console.log("Error connecting to the Database", error);
@@ -284,7 +286,7 @@ app.post("/register", async (req, res) => {
     await newUser.save();
 
     // Send a verification email
-    sendVerificationEmail(newUser.email, newUser.VerificationToken);
+    // sendVerificationEmail(newUser.email, newUser.VerificationToken);
 
     // Generate a JWT token
     const token = jwt.sign({ userId: newUser._id }, secretKey);
@@ -317,6 +319,7 @@ app.post("/register", async (req, res) => {
 
 // Change Password API
 app.post("/change-password/:userId", async (req, res) => {
+  "";
   try {
     const { userId } = req.params;
     const { currentPassword, newPassword } = req.body;
@@ -633,12 +636,22 @@ app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
   }
 
   try {
+    // Step 1: Detect faces in the uploaded image
+    const faceDetected = await detectFaces(req.file.buffer);
+    if (!faceDetected) {
+      console.log("no face detected");
+      return res
+        .status(400)
+        .json({ error: "No faces detected in the uploaded image" });
+    }
+
+    // Step 2: Upload the image to Cloudinary
     let imageUrl;
     const result = await new Promise((resolve, reject) => {
       const uploadStream = cloudinary.uploader.upload_stream(
         (uploadResult, error) => {
           if (error) {
-            console.log("some errors", error);
+            console.log("Cloudinary upload error:", error);
             return reject(error);
           }
 
@@ -649,23 +662,23 @@ app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
       uploadStream.end(req.file.buffer);
     });
 
+    // Step 3: Update the user's profile with the uploaded image URL
     if (imageUrl) {
-      // Update user profile with Cloudinary URL
       console.log(userId, imageUrl);
       const user = await User.findByIdAndUpdate(
         userId,
         { $addToSet: { profileImages: imageUrl } },
         { new: true }
       );
-    }
 
-    if (!userId) {
-      return res.status(404).json({ error: "User not found" });
+      if (!user) {
+        return res.status(404).json({ error: "User not found" });
+      }
     }
 
     return res.status(200).json({ message: "Upload was a success", imageUrl });
   } catch (error) {
-    console.error("File upload failed: ", error);
+    console.error("File upload failed:", error);
     res.status(500).json({ error: "File upload failed" });
   }
 });
@@ -920,8 +933,6 @@ app.get("/matches/:userId/info", async (req, res) => {
     const updatedMatches = await Promise.all(
       filteredMatches.map(async (match) => {
         const latestMessage = await fetchLatestMessage(userId, match._id);
-
-        console.log();
 
         // Find the conversation for the current match
         const conversation = user.conversations.find(

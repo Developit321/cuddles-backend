@@ -14,8 +14,6 @@ const checkIfAnsweredToday = async (userId) => {
     const answeredToday =
       user.dailyQuestion.answeredAt >= startOfDay &&
       user.dailyQuestion.answeredAt <= endOfDay;
-
-    console.log(answeredToday);
     return answeredToday;
   } catch (error) {
     console.error("Error checking if user answered today:", error);
