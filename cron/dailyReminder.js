@@ -18,6 +18,8 @@ const sendDailyReminders = async () => {
         );
       }
     }
+
+    console.log("Daily Riminder Sent");
   } catch (error) {
     console.error("Error sending daily reminders:", error);
   }
