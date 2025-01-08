@@ -40,7 +40,7 @@ const detectFaces = async (imageBuffer) => {
       return false; // No faces detected
     }
 
-    console.log("Faces detected:", detections);
+    console.log("Faces detected:");
     return true; // Faces detected successfully
   } catch (error) {
     console.error("Error during face detection:", error);
