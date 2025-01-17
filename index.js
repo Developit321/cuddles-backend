@@ -240,12 +240,16 @@ app.post("/register", async (req, res) => {
   try {
     const { name, email, password, age } = req.body;
 
-    // Validate request fields
-    if (!name || !email || !password || !age) {
-      return res.status(400).json({ message: "All fields are required" });
+    console.log(name, email, age);
+
+    // Validate required fields for all users
+    if (!name || !email || !age) {
+      return res
+        .status(400)
+        .json({ message: "Name, email, and age are required" });
     }
 
-    // Ensure email is a valid format
+    // Ensure email is in a valid format
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) {
       return res.status(400).json({ message: "Invalid email format" });
@@ -257,25 +261,35 @@ app.post("/register", async (req, res) => {
     // Check if the user already exists
     const existingUser = await User.findOne({ email: normalizedEmail });
     if (existingUser) {
-      return res.status(400).json({ message: "User already exists" });
-    }
+      // Generate a JWT token for the existing user
+      const token = jwt.sign({ userId: existingUser._id }, secretKey);
 
-    // Validate password strength (e.g., at least 8 characters)
-    if (password.length < 8) {
-      return res.status(400).json({
-        message: "Password must be at least 8 characters long",
+      // Respond with the token and a message indicating the user already exists
+      return res.status(200).json({
+        message: "User already exists. Here's your token.",
+        token,
+        userId: existingUser._id,
       });
     }
 
-    // Hash the password
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
+    let hashedPassword = null;
+
+    // If a password is provided, validate and hash it
+    if (password) {
+      if (password.length < 8) {
+        return res.status(400).json({
+          message: "Password must be at least 8 characters long",
+        });
+      }
+      const salt = await bcrypt.genSalt(10);
+      hashedPassword = await bcrypt.hash(password, salt);
+    }
 
     // Create a new user
     const newUser = new User({
       name,
       email: normalizedEmail,
-      password: hashedPassword,
+      password: hashedPassword, // Will be null if no password is provided
       age,
     });
 
@@ -285,14 +299,11 @@ app.post("/register", async (req, res) => {
     // Save the new user to the database
     await newUser.save();
 
-    // Send a verification email
-    // sendVerificationEmail(newUser.email, newUser.VerificationToken);
-
     // Generate a JWT token
     const token = jwt.sign({ userId: newUser._id }, secretKey);
 
     // Respond with success
-    res.status(200).json({ token, userId: newUser._id });
+    res.status(201).json({ token, userId: newUser._id });
   } catch (error) {
     console.error("Error during registration:", error);
 
@@ -703,7 +714,7 @@ app.get("/profiles", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Determine gender filter based on current user's gender
+    // Gender filter logic
     let genderFilter = {};
     if (gender === "male") {
       genderFilter = { gender: "male" };
@@ -747,31 +758,52 @@ app.get("/profiles", async (req, res) => {
     // Apply the age range filter
     filter.age = { $gte: ageMin, $lte: ageMax };
 
-    // Fetch profiles with priority 1
+    // Step 1: Fetch profiles with priority = 1
     const priorityProfiles = await User.find({
       ...filter,
       priority: 1,
     })
       .sort({ updatedAt: -1 })
-      .limit(20);
+      .limit(10);
 
-    const remainingCount = 20 - priorityProfiles.length;
+    const priorityIds = priorityProfiles.map((profile) =>
+      profile._id.toString()
+    );
+    let remainingCount = 20 - priorityProfiles.length;
 
-    // Fetch additional profiles by updatedAt if needed
-    let additionalProfiles = [];
+    // Step 2: Fetch 5 profiles sorted by createdAt (excluding already fetched)
+    let createdAtProfiles = [];
     if (remainingCount > 0) {
-      additionalProfiles = await User.find({
+      createdAtProfiles = await User.find({
         ...filter,
-        priority: { $ne: 1 }, // Exclude already fetched priority profiles
+        _id: { $nin: priorityIds },
       })
-        .sort({ updatedAt: -1 })
-        .limit(remainingCount);
+        .sort({ createdAt: -1 })
+        .limit(5);
+      remainingCount -= createdAtProfiles.length;
     }
 
-    // Combine and shuffle the results
-    const combinedProfiles = [...priorityProfiles, ...additionalProfiles].sort(
-      () => Math.random() - 0.5
+    const createdAtIds = createdAtProfiles.map((profile) =>
+      profile._id.toString()
     );
+
+    // Step 3: Fetch 5 profiles sorted by updatedAt (excluding already fetched)
+    let updatedAtProfiles = [];
+    if (remainingCount > 0) {
+      updatedAtProfiles = await User.find({
+        ...filter,
+        _id: { $nin: [...priorityIds, ...createdAtIds] },
+      })
+        .sort({ updatedAt: -1 })
+        .limit(5);
+    }
+
+    // Combine all profiles
+    const combinedProfiles = [
+      ...priorityProfiles,
+      ...createdAtProfiles,
+      ...updatedAtProfiles,
+    ];
 
     // Return all profiles
     return res.status(200).json({
@@ -1597,3 +1629,103 @@ app.post("/:userId/update-daily-question", async (req, res) => {
 });
 
 app.use("/notify", userRoutes);
+
+const fetchUsersWithPriorityAndLikes = async () => {
+  try {
+    const users = await User.aggregate([
+      {
+        $match: {
+          priority: 1,
+        },
+      },
+      {
+        $addFields: {
+          totalLikesAndDislikes: {
+            $add: [{ $size: "$profileDislikes" }, { $size: "$recievedLikes" }],
+          },
+        },
+      },
+      {
+        $match: {
+          totalLikesAndDislikes: { $lt: 15 },
+        },
+      },
+      {
+        $project: {
+          _id: 1, // Only include the user ID in the result
+        },
+      },
+    ]);
+
+    console.log(users);
+    return users;
+  } catch (error) {
+    console.error("Error fetching users:", error);
+  }
+};
+
+app.put("/user/:userId/name", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { name } = req.body;
+
+    if (!name) {
+      return res.status(400).json({ message: "Name is required." });
+    }
+
+    // Update the user's name
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      { name },
+      { new: true } // Return the updated document
+    );
+
+    if (!updatedUser) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    res.status(200).json({
+      message: "Name updated successfully.",
+      user: updatedUser,
+    });
+  } catch (error) {
+    console.error("Error updating name:", error);
+    res.status(500).json({
+      message: "An unexpected error occurred while updating the name.",
+      error: error.message,
+    });
+  }
+});
+
+app.put("/user/:userId/age", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { age } = req.body;
+
+    if (!age || typeof age !== "number") {
+      return res.status(400).json({ message: "Valid age is required." });
+    }
+
+    // Update the user's age
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      { age },
+      { new: true } // Return the updated document
+    );
+
+    if (!updatedUser) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    res.status(200).json({
+      message: "Age updated successfully.",
+      user: updatedUser,
+    });
+  } catch (error) {
+    console.error("Error updating age:", error);
+    res.status(500).json({
+      message: "An unexpected error occurred while updating the age.",
+      error: error.message,
+    });
+  }
+});
