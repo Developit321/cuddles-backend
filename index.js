@@ -758,56 +758,27 @@ app.get("/profiles", async (req, res) => {
     // Apply the age range filter
     filter.age = { $gte: ageMin, $lte: ageMax };
 
-    // Step 1: Fetch profiles with priority = 1
-    const priorityProfiles = await User.find({
-      ...filter,
-      priority: 1,
-    })
+    // Fetch profiles with different priorities
+    const priorityProfiles = await User.find({ ...filter, priority: 1 })
       .sort({ updatedAt: -1 })
       .limit(10);
 
     const priorityIds = priorityProfiles.map((profile) =>
       profile._id.toString()
     );
-    let remainingCount = 20 - priorityProfiles.length;
+    const remainingProfiles = await User.find({
+      ...filter,
+      _id: { $nin: priorityIds },
+    })
+      .sort({ createdAt: -1 })
+      .limit(20 - priorityProfiles.length);
 
-    // Step 2: Fetch 5 profiles sorted by createdAt (excluding already fetched)
-    let createdAtProfiles = [];
-    if (remainingCount > 0) {
-      createdAtProfiles = await User.find({
-        ...filter,
-        _id: { $nin: priorityIds },
-      })
-        .sort({ createdAt: -1 })
-        .limit(5);
-      remainingCount -= createdAtProfiles.length;
-    }
+    // Combine and shuffle profiles
+    const combinedProfiles = [...priorityProfiles, ...remainingProfiles];
+    const shuffledProfiles = combinedProfiles.sort(() => Math.random() - 0.5);
 
-    const createdAtIds = createdAtProfiles.map((profile) =>
-      profile._id.toString()
-    );
-
-    // Step 3: Fetch 5 profiles sorted by updatedAt (excluding already fetched)
-    let updatedAtProfiles = [];
-    if (remainingCount > 0) {
-      updatedAtProfiles = await User.find({
-        ...filter,
-        _id: { $nin: [...priorityIds, ...createdAtIds] },
-      })
-        .sort({ updatedAt: -1 })
-        .limit(5);
-    }
-
-    // Combine all profiles
-    const combinedProfiles = [
-      ...priorityProfiles,
-      ...createdAtProfiles,
-      ...updatedAtProfiles,
-    ];
-
-    // Return all profiles
     return res.status(200).json({
-      profiles: combinedProfiles,
+      profiles: shuffledProfiles,
     });
   } catch (error) {
     console.error("Error fetching user profiles:", error);
