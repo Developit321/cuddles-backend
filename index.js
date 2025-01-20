@@ -647,15 +647,6 @@ app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
   }
 
   try {
-    // Step 1: Detect faces in the uploaded image
-    const faceDetected = await detectFaces(req.file.buffer);
-    if (!faceDetected) {
-      console.log("no face detected");
-      return res
-        .status(400)
-        .json({ error: "No faces detected in the uploaded image" });
-    }
-
     // Step 2: Upload the image to Cloudinary
     let imageUrl;
     const result = await new Promise((resolve, reject) => {
