@@ -23,8 +23,6 @@ const { sendDailyReminders } = require("./cron/dailyReminder");
 const { sendNotification } = require("./notifications/pushNotifications");
 require("./cron/dailyReminder");
 
-const { loadModels, detectFaces } = require("./helper/faceDetection");
-
 const userRoutes = require("./routes/userRoutes");
 
 app.use(cors());
@@ -54,8 +52,6 @@ mongoose
   )
   .then(async () => {
     console.log("Connected to the Database");
-
-    await loadModels();
   })
   .catch((error) => {
     console.log("Error connecting to the Database", error);
