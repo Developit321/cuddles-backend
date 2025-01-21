@@ -48,10 +48,26 @@ cloudinary.config({
 // MongoDB connection
 mongoose
   .connect(
-    "mongodb+srv://cuddles:LNum9ZwrrcNDyl5c@cluster0.bdtblda.mongodb.net/"
+    "mongodb+srv://cuddles:LNum9ZwrrcNDyl5c@cluster0.bdtblda.mongodb.net/",
+    {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      maxPoolSize: 10,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+    }
   )
   .then(async () => {
     console.log("Connected to the Database");
+
+    // Create indexes for better query performance
+    await Promise.all([
+      mongoose.connection.db.collection("users").createIndex({ priority: 1 }),
+      mongoose.connection.db.collection("users").createIndex({ gender: 1 }),
+      mongoose.connection.db.collection("users").createIndex({ age: 1 }),
+      mongoose.connection.db.collection("users").createIndex({ updatedAt: -1 }),
+      mongoose.connection.db.collection("users").createIndex({ createdAt: -1 }),
+    ]);
   })
   .catch((error) => {
     console.log("Error connecting to the Database", error);
@@ -684,85 +700,101 @@ app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
 
 app.get("/profiles", async (req, res) => {
   try {
-    const { userId, gender, lookingFor, minAge, maxAge } = req.query;
+    const {
+      userId,
+      gender,
+      lookingFor,
+      minAge = "21",
+      maxAge = "100",
+    } = req.query;
 
-    if (!userId || !gender) {
+    // Input validation
+    if (!mongoose.Types.ObjectId.isValid(userId) || !gender) {
       return res
         .status(400)
-        .json({ message: "userId and gender are required" });
+        .json({ message: "Invalid userId or missing gender" });
     }
 
+    // Fetch only needed fields from current user
     const currentUser = await User.findById(userId)
-      .populate("Matches", "_id")
-      .populate("crushes", "_id")
-      .populate("profileDislikes", "_id");
+      .select("gender Matches crushes profileDislikes")
+      .lean();
 
     if (!currentUser) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Gender filter logic
-    let genderFilter = {};
-    if (gender === "male") {
-      genderFilter = { gender: "male" };
-    } else if (gender === "female") {
-      genderFilter = { gender: "female" };
-    } else if (gender === "both") {
-      genderFilter =
-        currentUser.gender === "male"
-          ? { gender: "female" }
-          : { gender: "male" };
-    }
-
-    let lookingForArray = [];
-    if (lookingFor) {
-      lookingForArray = Array.isArray(lookingFor) ? lookingFor : [lookingFor];
-    }
-
-    const friendsIds = (currentUser.Matches || []).map((friend) =>
-      friend._id.toString()
-    );
-    const crushesId = (currentUser.crushes || []).map((crush) =>
-      crush._id.toString()
-    );
-    const profileDislikes = (currentUser.profileDislikes || []).map((dislike) =>
-      dislike._id.toString()
-    );
-
-    const filter = {
-      ...genderFilter,
-      ...(lookingForArray.length
-        ? { lookingFor: { $in: lookingForArray } }
-        : {}),
-      profileImages: { $exists: true, $ne: [] },
-      _id: { $nin: [userId, ...friendsIds, ...crushesId, ...profileDislikes] },
+    // Determine gender filter based on preference
+    const genderFilter = {
+      gender:
+        gender === "both"
+          ? currentUser.gender === "male"
+            ? "female"
+            : "male"
+          : gender,
     };
 
-    // Set default values for minAge and maxAge if not provided
-    const ageMin = minAge ? parseInt(minAge, 10) : 21;
-    const ageMax = maxAge ? parseInt(maxAge, 10) : 100;
+    // Use Set for faster lookups of excluded IDs
+    const excludedIds = new Set([
+      userId,
+      ...(currentUser.Matches || []),
+      ...(currentUser.crushes || []),
+      ...(currentUser.profileDislikes || []),
+    ]);
 
-    // Apply the age range filter
-    filter.age = { $gte: ageMin, $lte: ageMax };
+    // Build the filter object
+    const filter = {
+      ...genderFilter,
+      profileImages: { $exists: true, $not: { $size: 0 } },
+      _id: { $nin: Array.from(excludedIds) },
+      age: {
+        $gte: parseInt(minAge, 10),
+        $lte: parseInt(maxAge, 10),
+      },
+    };
 
-    // Fetch profiles with different priorities
-    const priorityProfiles = await User.find({ ...filter, priority: 1 })
-      .sort({ updatedAt: -1 })
-      .limit(10);
+    // Add lookingFor filter if provided
+    if (lookingFor) {
+      filter.lookingFor = {
+        $in: Array.isArray(lookingFor) ? lookingFor : [lookingFor],
+      };
+    }
 
-    const priorityIds = priorityProfiles.map((profile) =>
-      profile._id.toString()
+    // Single aggregation pipeline instead of multiple queries
+    const profiles = await User.aggregate([
+      { $match: filter },
+      {
+        $facet: {
+          priorityProfiles: [
+            { $match: { priority: 1 } },
+            { $sort: { updatedAt: -1 } },
+            { $limit: 10 },
+          ],
+          regularProfiles: [
+            { $match: { priority: { $ne: 1 } } },
+            { $sort: { createdAt: -1 } },
+            { $limit: 20 },
+          ],
+        },
+      },
+      {
+        $project: {
+          allProfiles: {
+            $slice: [
+              {
+                $concatArrays: ["$priorityProfiles", "$regularProfiles"],
+              },
+              20,
+            ],
+          },
+        },
+      },
+    ]);
+
+    // Shuffle the results
+    const shuffledProfiles = profiles[0].allProfiles.sort(
+      () => Math.random() - 0.5
     );
-    const remainingProfiles = await User.find({
-      ...filter,
-      _id: { $nin: priorityIds },
-    })
-      .sort({ createdAt: -1 })
-      .limit(20 - priorityProfiles.length);
-
-    // Combine and shuffle profiles
-    const combinedProfiles = [...priorityProfiles, ...remainingProfiles];
-    const shuffledProfiles = combinedProfiles.sort(() => Math.random() - 0.5);
 
     return res.status(200).json({
       profiles: shuffledProfiles,
