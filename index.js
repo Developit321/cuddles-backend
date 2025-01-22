@@ -33,6 +33,7 @@ app.use("/api/users", userRoutes);
 
 // controllers
 const { getUnreadCounts } = require("./Controllers/conversationController");
+const { profile } = require("console");
 
 // Configure multer for file handling
 const storage = multer.memoryStorage(); // Store files in memory
@@ -48,26 +49,10 @@ cloudinary.config({
 // MongoDB connection
 mongoose
   .connect(
-    "mongodb+srv://cuddles:LNum9ZwrrcNDyl5c@cluster0.bdtblda.mongodb.net/",
-    {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-      maxPoolSize: 10,
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 45000,
-    }
+    "mongodb+srv://cuddles:LNum9ZwrrcNDyl5c@cluster0.bdtblda.mongodb.net/"
   )
   .then(async () => {
     console.log("Connected to the Database");
-
-    // Create indexes for better query performance
-    await Promise.all([
-      mongoose.connection.db.collection("users").createIndex({ priority: 1 }),
-      mongoose.connection.db.collection("users").createIndex({ gender: 1 }),
-      mongoose.connection.db.collection("users").createIndex({ age: 1 }),
-      mongoose.connection.db.collection("users").createIndex({ updatedAt: -1 }),
-      mongoose.connection.db.collection("users").createIndex({ createdAt: -1 }),
-    ]);
   })
   .catch((error) => {
     console.log("Error connecting to the Database", error);
@@ -659,6 +644,8 @@ app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
   }
 
   try {
+    // Step 1: Detect faces in the uploaded image
+
     // Step 2: Upload the image to Cloudinary
     let imageUrl;
     const result = await new Promise((resolve, reject) => {
@@ -748,8 +735,8 @@ app.get("/profiles", async (req, res) => {
       profileImages: { $exists: true, $not: { $size: 0 } },
       _id: { $nin: Array.from(excludedIds) },
       age: {
-        $gte: parseInt(minAge, 10),
-        $lte: parseInt(maxAge, 10),
+        $gte: minAge.toString(), // Convert to string
+        $lte: maxAge.toString(), // Convert to string
       },
     };
 
@@ -767,14 +754,66 @@ app.get("/profiles", async (req, res) => {
         $facet: {
           priorityProfiles: [
             { $match: { priority: 1 } },
-            { $sort: { updatedAt: -1 } },
-            { $limit: 10 },
+            { $limit: 5 },
+            { $project: { _id: 1, data: "$$ROOT" } },
           ],
           regularProfiles: [
             { $match: { priority: { $ne: 1 } } },
-            { $sort: { createdAt: -1 } },
-            { $limit: 20 },
+            { $sort: { updatedAt: -1 } },
+            { $limit: 10 },
+            { $project: { _id: 1, data: "$$ROOT" } },
           ],
+          latestProfiles: [
+            { $match: { priority: { $ne: 1 } } },
+            { $sort: { createdAt: -1 } },
+            { $limit: 5 },
+            { $project: { _id: 1, data: "$$ROOT" } },
+          ],
+        },
+      },
+      {
+        $project: {
+          priorityIds: {
+            $map: { input: "$priorityProfiles", as: "p", in: "$$p._id" },
+          },
+          regularIds: {
+            $map: { input: "$regularProfiles", as: "r", in: "$$r._id" },
+          },
+          latestIds: {
+            $map: { input: "$latestProfiles", as: "l", in: "$$l._id" },
+          },
+          priorityProfiles: {
+            $map: { input: "$priorityProfiles", as: "p", in: "$$p.data" },
+          },
+          regularProfiles: {
+            $map: { input: "$regularProfiles", as: "r", in: "$$r.data" },
+          },
+          latestProfiles: {
+            $map: { input: "$latestProfiles", as: "l", in: "$$l.data" },
+          },
+        },
+      },
+      {
+        $addFields: {
+          regularProfiles: {
+            $filter: {
+              input: "$regularProfiles",
+              as: "r",
+              cond: { $not: { $in: ["$$r._id", "$priorityIds"] } },
+            },
+          },
+          latestProfiles: {
+            $filter: {
+              input: "$latestProfiles",
+              as: "l",
+              cond: {
+                $and: [
+                  { $not: { $in: ["$$l._id", "$priorityIds"] } },
+                  { $not: { $in: ["$$l._id", "$regularIds"] } },
+                ],
+              },
+            },
+          },
         },
       },
       {
@@ -782,7 +821,11 @@ app.get("/profiles", async (req, res) => {
           allProfiles: {
             $slice: [
               {
-                $concatArrays: ["$priorityProfiles", "$regularProfiles"],
+                $concatArrays: [
+                  "$priorityProfiles",
+                  "$regularProfiles",
+                  "$latestProfiles",
+                ],
               },
               20,
             ],
