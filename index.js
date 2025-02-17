@@ -373,18 +373,36 @@ const transporter = nodemailer.createTransport({
   },
 });
 // Send verification email
-const sendVerificationEmail = async (email, VerificationToken) => {
+const sendEmail = async (email) => {
   const mailOptions = {
-    from: "cuddles.com",
+    from: "Cuddles <support@cuddles.com>",
     to: email,
-    subject: "Email verification",
-    text: `Click on this link to verify your email: https://cuddles-batcat.onrender.com/verify/${VerificationToken}`,
+    subject: "New Feature Alert: Report Fake Accounts! 🚨",
+    text: `Hi there,
+
+We're excited to announce a new feature designed to make your experience on **Cuddles** even better!
+
+You can now easily **report users with fake accounts** directly from their profile. It's simple to flag suspicious activity, helping us keep the community safe and authentic for everyone.
+
+To report a fake account, just follow these steps:
+1. Go to the profile you'd like to report.
+2. Tap the **"Report"** button.
+3. Select **"Fake Account"** and submit!
+
+Our team will review the report and take appropriate action as needed.
+
+Thank you for being part of **Cuddles** and helping us maintain a trustworthy space for everyone!
+
+If you have any questions or need support, don’t hesitate to reach out.
+
+Stay safe,  
+The Cuddles Team`,
   };
 
   try {
     await transporter.sendMail(mailOptions);
   } catch (error) {
-    console.log("Error sending the verification email", error);
+    console.log("Error sending the update email", error);
   }
 };
 
@@ -702,9 +720,9 @@ app.get("/profiles", async (req, res) => {
         .json({ message: "Invalid userId or missing gender" });
     }
 
-    // Fetch only needed fields from current user
+    // Fetch current user's interests and other necessary fields
     const currentUser = await User.findById(userId)
-      .select("gender Matches crushes profileDislikes")
+      .select("gender Matches crushes profileDislikes interests")
       .lean();
 
     if (!currentUser) {
@@ -747,7 +765,7 @@ app.get("/profiles", async (req, res) => {
       };
     }
 
-    // Single aggregation pipeline instead of multiple queries
+    // Single aggregation pipeline to fetch profiles
     const profiles = await User.aggregate([
       { $match: filter },
       {
@@ -839,8 +857,30 @@ app.get("/profiles", async (req, res) => {
       () => Math.random() - 0.5
     );
 
+    // Calculate compatibility percentage for each profile
+    const profilesWithCompatibility = shuffledProfiles.map((profile) => {
+      const commonInterests = profile.interests.filter((interest) =>
+        currentUser.interests.includes(interest)
+      ).length;
+
+      const totalInterests = Math.max(
+        currentUser.interests.length,
+        profile.interests.length
+      );
+
+      const compatibilityPercentage =
+        totalInterests > 0
+          ? Math.round((commonInterests / totalInterests) * 100)
+          : 0;
+
+      return {
+        ...profile,
+        compatibilityPercentage,
+      };
+    });
+    console.log(profilesWithCompatibility);
     return res.status(200).json({
-      profiles: shuffledProfiles,
+      profiles: profilesWithCompatibility,
     });
   } catch (error) {
     console.error("Error fetching user profiles:", error);
@@ -1189,6 +1229,7 @@ app.post("/user/:userId/update-location", async (req, res) => {
 app.get("/nearby-users", async (req, res) => {
   try {
     const { longitude, latitude, maxDistance } = req.query;
+    const MAX_DISTANCE_METERS = 50000;
     if (!longitude || !latitude || !maxDistance) {
       return res
         .status(400)
@@ -1202,7 +1243,7 @@ app.get("/nearby-users", async (req, res) => {
             type: "Point",
             coordinates: [parseFloat(longitude), parseFloat(latitude)], // Parse to float
           },
-          $maxDistance: parseFloat(maxDistance), // Parse to float for max distance
+          $maxDistance: MAX_DISTANCE_METERS, // Parse to float for max distance
         },
       },
     }).select("name  location profileImages pushToken");
@@ -1762,3 +1803,15 @@ app.put("/user/:userId/age", async (req, res) => {
     });
   }
 });
+
+const sendUpdateEmail = async () => {
+  try {
+    const users = await User.find({}, "email");
+
+    console.log(users);
+  } catch (error) {
+    console.log(error);
+  }
+};
+
+sendUpdateEmail();
