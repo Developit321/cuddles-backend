@@ -1187,6 +1187,7 @@ app.post("/user/:userId/update-location", async (req, res) => {
 // fetch users that are close to each other due to location
 
 app.get("/nearby-users", async (req, res) => {
+  const MAX_DISTANCE_METERS = 50000;
   try {
     const { longitude, latitude, maxDistance } = req.query;
     if (!longitude || !latitude || !maxDistance) {
@@ -1202,7 +1203,7 @@ app.get("/nearby-users", async (req, res) => {
             type: "Point",
             coordinates: [parseFloat(longitude), parseFloat(latitude)], // Parse to float
           },
-          $maxDistance: parseFloat(maxDistance), // Parse to float for max distance
+          $maxDistance: MAX_DISTANCE_METERS, // Parse to float for max distance
         },
       },
     }).select("name  location profileImages pushToken");
