@@ -25,6 +25,10 @@ const userSchema = mongoose.Schema(
       type: String,
       enum: ["male", "female", "other"],
     },
+    preferences: {
+      type: String,
+      enum: ["male", "female", "Non-Binary", "all", "non-binary"],
+    },
     verified: {
       type: Boolean,
       default: false,
