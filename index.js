@@ -604,6 +604,44 @@ app.put("/users/:userId/lookingfor/add", async (req, res) => {
   }
 });
 
+app.put("/users/:userId/availability/add", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { availability } = req.body;
+
+    const validOptions = ["morning", "afternoon", "evening"];
+
+    if (
+      !Array.isArray(availability) ||
+      availability.some((item) => !validOptions.includes(item))
+    ) {
+      return res.status(400).json({
+        message:
+          "Invalid availability data. Please choose from 'morning', 'afternoon', or 'evening'.",
+      });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { $addToSet: { availability: { $each: availability } } },
+      { new: true }
+    );
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    return res
+      .status(200)
+      .json({ message: "User's 'looking for' updated successfully", user });
+  } catch (error) {
+    console.error("Error updating 'looking for':", error);
+    return res
+      .status(500)
+      .json({ message: "Error updating the user's 'availability'" });
+  }
+});
+
 // DELETE route to remove an item from the lookingFor array
 app.delete("/users/:userId/lookingfor/remove", async (req, res) => {
   try {

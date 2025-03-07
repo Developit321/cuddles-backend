@@ -123,6 +123,11 @@ const userSchema = mongoose.Schema(
       answeredAt: { type: Date },
     },
     priority: { type: Number, default: 0 },
+    availability: {
+      type: [String],
+      enum: ["morning", "afternoon", "evening"],
+      default: [],
+    },
   },
   { timestamps: true }
 ); // Add timestamps option here
