@@ -128,6 +128,10 @@ const userSchema = mongoose.Schema(
       enum: ["morning", "afternoon", "evening"],
       default: [],
     },
+    expectations: {
+      type: [String],
+      default: [],
+    },
   },
   { timestamps: true }
 ); // Add timestamps option here
