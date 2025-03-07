@@ -642,6 +642,51 @@ app.put("/users/:userId/availability/add", async (req, res) => {
   }
 });
 
+app.put("/users/:userId/cuddle-preference", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    let { expectations } = req.body;
+
+    if (!Array.isArray(expectations) || expectations.length === 0) {
+      return res
+        .status(400)
+        .json({ message: "Preferences should be a non-empty array." });
+    }
+
+    // Sanitize input: Remove empty values & trim whitespace
+    expectations = expectations
+      .map((item) => (typeof item === "string" ? item.trim() : null))
+      .filter((item) => item);
+
+    if (expectations.length === 0) {
+      return res
+        .status(400)
+        .json({ message: "Preferences cannot be empty after sanitization." });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { expectations },
+      { new: true, runValidators: true }
+    );
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    return res.status(200).json({
+      message: "Cuddle preferences updated successfully",
+      expectations: user.expectations, // Return updated preferences
+    });
+  } catch (error) {
+    console.error("Error updating cuddle expectations:", error);
+    return res.status(500).json({
+      message: "Error updating the user's cuddle expectations",
+      error: error.message,
+    });
+  }
+});
+
 // DELETE route to remove an item from the lookingFor array
 app.delete("/users/:userId/lookingfor/remove", async (req, res) => {
   try {
