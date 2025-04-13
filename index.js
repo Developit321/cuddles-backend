@@ -25,6 +25,23 @@ require("./cron/dailyReminder");
 
 const userRoutes = require("./routes/userRoutes");
 
+// Helper function to calculate distance between two coordinates
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  if (!lat1 || !lon1 || !lat2 || !lon2) return null;
+
+  const R = 6371; // Earth's radius in kilometers
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c; // Distance in kilometers
+}
+
 app.use(cors());
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
@@ -797,6 +814,8 @@ app.get("/profiles", async (req, res) => {
       lookingFor,
       minAge = "21",
       maxAge = "100",
+      longitude,
+      latitude,
     } = req.query;
 
     // Input validation
@@ -815,136 +834,285 @@ app.get("/profiles", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Determine gender filter based on preference
-    const genderFilter = {
+    // Get excluded user IDs
+    const excludedIds = [
+      userId,
+      ...(currentUser.Matches || []),
+      ...(currentUser.crushes || []),
+      ...(currentUser.profileDislikes || []),
+    ];
+
+    // Base match criteria
+    const baseMatch = {
+      _id: { $nin: excludedIds },
       gender:
         gender === "both"
           ? currentUser.gender === "male"
             ? "female"
             : "male"
           : gender,
-    };
-
-    // Use Set for faster lookups of excluded IDs
-    const excludedIds = new Set([
-      userId,
-      ...(currentUser.Matches || []),
-      ...(currentUser.crushes || []),
-      ...(currentUser.profileDislikes || []),
-    ]);
-
-    // Build the filter object
-    const filter = {
-      ...genderFilter,
-      profileImages: { $exists: true, $not: { $size: 0 } },
-      _id: { $nin: Array.from(excludedIds) },
       age: {
-        $gte: minAge.toString(), // Convert to string
-        $lte: maxAge.toString(), // Convert to string
+        $gte: minAge.toString(),
+        $lte: maxAge.toString(),
       },
+      profileImages: { $exists: true, $not: { $size: 0 } },
     };
 
     // Add lookingFor filter if provided
     if (lookingFor) {
-      filter.lookingFor = {
+      baseMatch.lookingFor = {
         $in: Array.isArray(lookingFor) ? lookingFor : [lookingFor],
       };
     }
 
-    // Single aggregation pipeline instead of multiple queries
-    const profiles = await User.aggregate([
-      { $match: filter },
-      {
-        $facet: {
-          priorityProfiles: [
-            { $match: { priority: 1 } },
-            { $limit: 5 },
-            { $project: { _id: 1, data: "$$ROOT" } },
-          ],
-          regularProfiles: [
-            { $match: { priority: { $ne: 1 } } },
-            { $sort: { updatedAt: -1 } },
-            { $limit: 10 },
-            { $project: { _id: 1, data: "$$ROOT" } },
-          ],
-          latestProfiles: [
-            { $match: { priority: { $ne: 1 } } },
-            { $sort: { createdAt: -1 } },
-            { $limit: 5 },
-            { $project: { _id: 1, data: "$$ROOT" } },
-          ],
-        },
-      },
-      {
-        $project: {
-          priorityIds: {
-            $map: { input: "$priorityProfiles", as: "p", in: "$$p._id" },
-          },
-          regularIds: {
-            $map: { input: "$regularProfiles", as: "r", in: "$$r._id" },
-          },
-          latestIds: {
-            $map: { input: "$latestProfiles", as: "l", in: "$$l._id" },
-          },
-          priorityProfiles: {
-            $map: { input: "$priorityProfiles", as: "p", in: "$$p.data" },
-          },
-          regularProfiles: {
-            $map: { input: "$regularProfiles", as: "r", in: "$$r.data" },
-          },
-          latestProfiles: {
-            $map: { input: "$latestProfiles", as: "l", in: "$$l.data" },
-          },
-        },
-      },
-      {
-        $addFields: {
-          regularProfiles: {
-            $filter: {
-              input: "$regularProfiles",
-              as: "r",
-              cond: { $not: { $in: ["$$r._id", "$priorityIds"] } },
+    // Initialize aggregation pipeline
+    const aggregationPipeline = [];
+
+    // Handle location-based search with error fallback
+    let hasLocation = false;
+    if (longitude && latitude) {
+      try {
+        // Validate coordinates
+        const parsedLong = parseFloat(longitude);
+        const parsedLat = parseFloat(latitude);
+
+        if (!isNaN(parsedLong) && !isNaN(parsedLat)) {
+          hasLocation = true;
+          aggregationPipeline.push({
+            $geoNear: {
+              near: {
+                type: "Point",
+                coordinates: [parsedLong, parsedLat],
+              },
+              distanceField: "distance",
+              maxDistance: 50000, // 50km radius
+              spherical: true,
+              query: baseMatch,
+              distanceMultiplier: 0.001, // Convert to kilometers
+              key: "location", // Specify the exact index to use
+            },
+          });
+        } else {
+          // If coordinates are invalid, fall back to regular search
+          aggregationPipeline.push({ $match: baseMatch });
+        }
+      } catch (error) {
+        console.error("Error in geospatial query:", error);
+        // Fall back to regular search if geospatial query fails
+        aggregationPipeline.push({ $match: baseMatch });
+      }
+    } else {
+      // If no coordinates, start with regular match
+      aggregationPipeline.push({ $match: baseMatch });
+    }
+
+    // Add facet stage to categorize profiles
+    aggregationPipeline.push({
+      $facet: {
+        nearbyProfiles: hasLocation
+          ? [{ $match: { distance: { $exists: true } } }, { $limit: 20 }]
+          : [],
+        priorityProfiles: [
+          {
+            $match: {
+              priority: 1,
+              ...(hasLocation && { distance: { $exists: false } }),
             },
           },
-          latestProfiles: {
-            $filter: {
-              input: "$latestProfiles",
-              as: "l",
-              cond: {
-                $and: [
-                  { $not: { $in: ["$$l._id", "$priorityIds"] } },
-                  { $not: { $in: ["$$l._id", "$regularIds"] } },
-                ],
-              },
+          { $limit: 5 },
+        ],
+        regularProfiles: [
+          {
+            $match: {
+              priority: { $ne: 1 },
+              ...(hasLocation && { distance: { $exists: false } }),
             },
           },
+          { $sort: { updatedAt: -1 } },
+          { $limit: 10 },
+        ],
+        latestProfiles: [
+          {
+            $match: {
+              priority: { $ne: 1 },
+              ...(hasLocation && { distance: { $exists: false } }),
+            },
+          },
+          { $sort: { createdAt: -1 } },
+          { $limit: 5 },
+        ],
+      },
+    });
+
+    // Combine all profile types with priority given to nearby profiles
+    aggregationPipeline.push({
+      $project: {
+        combinedProfiles: {
+          $concatArrays: [
+            "$nearbyProfiles",
+            "$priorityProfiles",
+            "$regularProfiles",
+            "$latestProfiles",
+          ],
         },
       },
-      {
-        $project: {
-          allProfiles: {
-            $slice: [
-              {
-                $concatArrays: [
-                  "$priorityProfiles",
-                  "$regularProfiles",
-                  "$latestProfiles",
-                ],
+    });
+
+    // Ensure we get unique profiles and limit to 20
+    aggregationPipeline.push({
+      $project: {
+        uniqueProfiles: {
+          $slice: [
+            {
+              $reduce: {
+                input: "$combinedProfiles",
+                initialValue: [],
+                in: {
+                  $cond: [
+                    { $in: ["$$this._id", "$$value._id"] },
+                    "$$value",
+                    { $concatArrays: ["$$value", ["$$this"]] },
+                  ],
+                },
               },
-              20,
+            },
+            20,
+          ],
+        },
+      },
+    });
+
+    // Execute the aggregation with a timeout to prevent long-running queries
+    const result = await User.aggregate(aggregationPipeline).option({
+      maxTimeMS: 5000,
+    }); // Set a 5-second timeout
+
+    let profiles = [];
+    if (result && result.length > 0 && result[0].uniqueProfiles) {
+      profiles = result[0].uniqueProfiles;
+    }
+
+    // If we didn't get enough profiles, try a simpler query as a fallback
+    if (profiles.length < 20) {
+      // Get IDs of profiles we already have
+      const existingIds = profiles.map((p) => p._id);
+
+      // Create a fallback aggregation pipeline that maintains our categorization logic
+      // but doesn't use geospatial search
+      const fallbackPipeline = [
+        {
+          $match: {
+            ...baseMatch,
+            _id: { $nin: [...existingIds] }, // Also exclude profiles we already have
+          },
+        },
+        // Use the same facet structure but without the geospatial component
+        {
+          $facet: {
+            priorityProfiles: [{ $match: { priority: 1 } }, { $limit: 5 }],
+            regularProfiles: [
+              { $match: { priority: { $ne: 1 } } },
+              { $sort: { updatedAt: -1 } },
+              { $limit: 10 },
+            ],
+            latestProfiles: [
+              { $match: { priority: { $ne: 1 } } },
+              { $sort: { createdAt: -1 } },
+              { $limit: 5 },
             ],
           },
         },
-      },
-    ]);
+        // Combine all profile types
+        {
+          $project: {
+            combinedProfiles: {
+              $concatArrays: [
+                "$priorityProfiles",
+                "$regularProfiles",
+                "$latestProfiles",
+              ],
+            },
+          },
+        },
+        // Ensure unique profiles
+        {
+          $project: {
+            uniqueProfiles: {
+              $slice: [
+                {
+                  $reduce: {
+                    input: "$combinedProfiles",
+                    initialValue: [],
+                    in: {
+                      $cond: [
+                        { $in: ["$$this._id", "$$value._id"] },
+                        "$$value",
+                        { $concatArrays: ["$$value", ["$$this"]] },
+                      ],
+                    },
+                  },
+                },
+                20 - profiles.length, // Only get what we need to reach 20
+              ],
+            },
+          },
+        },
+      ];
 
-    // Shuffle the results
-    const shuffledProfiles = profiles[0].allProfiles.sort(
-      () => Math.random() - 0.5
-    );
+      // Execute the fallback pipeline
+      const fallbackResult = await User.aggregate(fallbackPipeline).option({
+        maxTimeMS: 3000,
+      });
+
+      let additionalProfiles = [];
+      if (
+        fallbackResult &&
+        fallbackResult.length > 0 &&
+        fallbackResult[0].uniqueProfiles
+      ) {
+        additionalProfiles = fallbackResult[0].uniqueProfiles;
+      }
+
+      // Add the additional profiles
+      profiles = [...profiles, ...additionalProfiles];
+    }
+
+    // Apply in-memory shuffle for randomness
+    const shuffledProfiles = profiles.sort(() => Math.random() - 0.5);
+
+    // Calculate distances for any profiles missing distance field
+    if (hasLocation) {
+      const parsedLong = parseFloat(longitude);
+      const parsedLat = parseFloat(latitude);
+
+      shuffledProfiles.forEach((profile) => {
+        if (
+          !profile.distance &&
+          profile.location &&
+          profile.location.coordinates
+        ) {
+          profile.distance = calculateDistance(
+            parsedLat,
+            parsedLong,
+            profile.location.coordinates[1],
+            profile.location.coordinates[0]
+          );
+        }
+      });
+    }
+
+    // Log gender counts in fetched profiles
+    const genderCounts = shuffledProfiles.reduce((counts, profile) => {
+      counts[profile.gender] = (counts[profile.gender] || 0) + 1;
+      return counts;
+    }, {});
+
+    shuffledProfiles.slice(0, 5).forEach((profile, index) => {});
 
     return res.status(200).json({
       profiles: shuffledProfiles,
+      totalCount: shuffledProfiles.length,
+      nearbyCount: shuffledProfiles.filter((p) => p.distance != null).length,
     });
   } catch (error) {
     console.error("Error fetching user profiles:", error);
@@ -1258,13 +1426,22 @@ app.post("/user/:userId/update-location", async (req, res) => {
   try {
     const { userId } = req.params;
     const { longitude, latitude } = req.body;
+
+    // Parse and validate coordinates
+    const parsedLong = parseFloat(longitude);
+    const parsedLat = parseFloat(latitude);
+
+    if (isNaN(parsedLong) || isNaN(parsedLat)) {
+      return res.status(400).json({ error: "Invalid coordinates format" });
+    }
+
     const user = await User.findByIdAndUpdate(
       userId,
       {
         $set: {
           location: {
             type: "Point",
-            coordinates: [longitude, latitude],
+            coordinates: [parsedLong, parsedLat],
           },
         },
       },
@@ -1300,24 +1477,49 @@ app.get("/nearby-users", async (req, res) => {
         .json({ error: "Longitude, latitude, and maxDistance are required" });
     }
 
-    const nearbyUsers = await User.find({
-      location: {
-        $near: {
-          $geometry: {
+    // Parse coordinates
+    const parsedLong = parseFloat(longitude);
+    const parsedLat = parseFloat(latitude);
+
+    // Validate parsed coordinates
+    if (isNaN(parsedLong) || isNaN(parsedLat)) {
+      return res.status(400).json({ error: "Invalid coordinates format" });
+    }
+
+    const nearbyUsers = await User.aggregate([
+      {
+        $geoNear: {
+          near: {
             type: "Point",
-            coordinates: [parseFloat(longitude), parseFloat(latitude)], // Parse to float
+            coordinates: [parsedLong, parsedLat],
           },
-          $maxDistance: MAX_DISTANCE_METERS, // Parse to float for max distance
+          distanceField: "distance",
+          maxDistance: MAX_DISTANCE_METERS,
+          spherical: true,
+          query: {
+            profileImages: { $exists: true, $not: { $size: 0 } },
+          },
+          distanceMultiplier: 0.001, // Convert to kilometers
         },
       },
-    }).select("name  location profileImages pushToken");
+      {
+        $project: {
+          _id: 1,
+          name: 1,
+          location: 1,
+          profileImages: 1,
+          pushToken: 1,
+          distance: 1,
+        },
+      },
+    ]);
 
     if (nearbyUsers.length === 0) {
       return res.status(404).json({ message: "No users found nearby" });
     }
     res.json({ message: "Nearby users found", users: nearbyUsers });
   } catch (error) {
-    console.error("Error finding nearby users:", error); // Fix variable name from err to error
+    console.error("Error finding nearby users:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });

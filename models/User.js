@@ -33,7 +33,9 @@ const userSchema = mongoose.Schema(
       type: Boolean,
       default: false,
     },
-    VerificatiionToken: String,
+    VerificationToken: {
+      type: String,
+    },
     crushes: [
       {
         type: mongoose.Schema.Types.ObjectId,
@@ -71,9 +73,6 @@ const userSchema = mongoose.Schema(
     description: {
       type: String,
     },
-    location: {
-      type: String,
-    },
     pushToken: {
       type: String,
     },
@@ -85,9 +84,6 @@ const userSchema = mongoose.Schema(
       type: [String],
       enum: ["Friendship", "Goodtime", "Long term relationship"],
       default: [],
-    },
-    VerificationToken: {
-      type: String,
     },
     otp: {
       code: {
@@ -103,12 +99,13 @@ const userSchema = mongoose.Schema(
       type: {
         type: String,
         enum: ["Point"],
+        default: "Point",
         required: false,
       },
       coordinates: {
         type: [Number],
         required: false,
-        index: "2dsphere",
+        default: [0, 0],
       },
     },
     conversations: [
@@ -136,7 +133,14 @@ const userSchema = mongoose.Schema(
   { timestamps: true }
 ); // Add timestamps option here
 
+// Create only one 2dsphere index for geospatial queries
 userSchema.index({ location: "2dsphere" });
+
+// Add additional indexes for frequently queried fields
+userSchema.index({ gender: 1, age: 1 });
+userSchema.index({ priority: 1 });
+userSchema.index({ createdAt: -1 });
+userSchema.index({ updatedAt: -1 });
 const User = mongoose.model("User", userSchema);
 
 module.exports = User;
