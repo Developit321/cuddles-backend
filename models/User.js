@@ -129,6 +129,10 @@ const userSchema = mongoose.Schema(
       type: [String],
       default: [],
     },
+    anonymous: {
+      type: Boolean,
+      default: false,
+    },
   },
   { timestamps: true }
 ); // Add timestamps option here

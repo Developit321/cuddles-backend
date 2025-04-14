@@ -19,6 +19,21 @@ const reportSchema = new mongoose.Schema({
     type: Date,
     default: Date.now,
   },
+  status: {
+    type: String,
+    enum: ["pending", "resolved"],
+    default: "pending",
+  },
+  action: {
+    type: String,
+    enum: ["dismiss", "warn", "block"],
+  },
+  notes: {
+    type: String,
+  },
+  resolvedAt: {
+    type: Date,
+  },
 });
 
 const Report = mongoose.model("Report", reportSchema);

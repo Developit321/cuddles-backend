@@ -856,6 +856,7 @@ app.get("/profiles", async (req, res) => {
         $lte: maxAge.toString(),
       },
       profileImages: { $exists: true, $not: { $size: 0 } },
+      anonymous: { $ne: true }, // Exclude users with anonymous mode enabled
     };
 
     // Add lookingFor filter if provided
@@ -1101,6 +1102,13 @@ app.get("/profiles", async (req, res) => {
       });
     }
 
+    // Handle anonymous profiles
+    shuffledProfiles.forEach((profile) => {
+      if (profile.anonymous) {
+        profile.name = "Anonymous";
+      }
+    });
+
     // Log gender counts in fetched profiles
     const genderCounts = shuffledProfiles.reduce((counts, profile) => {
       counts[profile.gender] = (counts[profile.gender] || 0) + 1;
@@ -1317,33 +1325,51 @@ const fetchLatestMessage = async (userId, matchId) => {
   return latestMessage || {};
 };
 
+// Delete inappropriate image from user profile
 app.delete("/users/:userId/images", async (req, res) => {
-  const { userId } = req.params;
-  const { imageUrl } = req.body;
-
-  if (!imageUrl) {
-    return res.status(400).json({ error: "Image URL is required" });
-  }
-
   try {
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { $pull: { profileImages: imageUrl } },
-      { new: true }
-    );
+    const { userId } = req.params;
+    const { imageUrl, reason } = req.body;
 
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
+    // Validate input
+    if (!userId || !imageUrl) {
+      return res.status(400).json({ message: "Missing required parameters" });
     }
 
-    return res
-      .status(200)
-      .json({ message: "Image deleted successfully", user });
+    // Find the user
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Check if the image exists in the user's profile images
+    if (!user.profileImages.includes(imageUrl)) {
+      return res
+        .status(404)
+        .json({ message: "Image not found in user profile" });
+    }
+
+    // Remove the image from the profileImages array
+    user.profileImages = user.profileImages.filter((img) => img !== imageUrl);
+    await user.save();
+
+    // Log the moderation action
+    console.log(
+      `Image deleted from user ${userId} for reason: ${
+        reason || "No reason provided"
+      }`
+    );
+
+    return res.status(200).json({
+      message: "Image deleted successfully",
+      remainingImages: user.profileImages.length,
+    });
   } catch (error) {
     console.error("Error deleting image:", error);
-    return res.status(500).json({ error: "Failed to delete image" });
+    return res.status(500).json({ message: "Failed to delete image" });
   }
 });
+
 app.get("/messages/:senderId/:receiverId", async (req, res) => {
   const { senderId, receiverId } = req.params;
   const { skip = 0, limit = 20 } = req.query;
@@ -1857,6 +1883,98 @@ app.post("/report", async (req, res) => {
   }
 });
 
+// Get all reports with pagination and status filter
+app.get("/report", async (req, res) => {
+  try {
+    const { page = 1, limit = 10, status = "all" } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    // Build query based on status
+    const query = status === "all" ? {} : { status };
+
+    // Get reports with pagination
+    const reports = await Report.find(query)
+      .populate("reporterId", "name email")
+      .populate("reportedUserId", "name email")
+      .sort({ date: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    // Get total count for pagination
+    const total = await Report.countDocuments(query);
+
+    res.status(200).json({
+      reports,
+      total,
+      currentPage: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit)),
+    });
+  } catch (error) {
+    console.error("Error fetching reports:", error);
+    res
+      .status(500)
+      .json({ error: "An error occurred while fetching reports." });
+  }
+});
+
+// Get a specific report by ID
+app.get("/report/:id", async (req, res) => {
+  try {
+    const report = await Report.findById(req.params.id)
+      .populate("reporterId", "name email")
+      .populate("reportedUserId", "name email");
+
+    if (!report) {
+      return res.status(404).json({ error: "Report not found." });
+    }
+
+    res.status(200).json(report);
+  } catch (error) {
+    console.error("Error fetching report:", error);
+    res
+      .status(500)
+      .json({ error: "An error occurred while fetching the report." });
+  }
+});
+
+// Resolve a report
+app.put("/report/:id/resolve", async (req, res) => {
+  try {
+    const { action, notes } = req.body;
+    const reportId = req.params.id;
+
+    if (!action) {
+      return res.status(400).json({ error: "Action is required." });
+    }
+
+    const report = await Report.findById(reportId);
+    if (!report) {
+      return res.status(404).json({ error: "Report not found." });
+    }
+
+    // Update report status
+    report.status = "resolved";
+    report.action = action;
+    report.notes = notes;
+    report.resolvedAt = new Date();
+    await report.save();
+
+    // If action is 'block', update the reported user's status
+    if (action === "block") {
+      await User.findByIdAndUpdate(report.reportedUserId, {
+        $set: { status: "blocked" },
+      });
+    }
+
+    res.status(200).json({ message: "Report resolved successfully.", report });
+  } catch (error) {
+    console.error("Error resolving report:", error);
+    res
+      .status(500)
+      .json({ error: "An error occurred while resolving the report." });
+  }
+});
+
 app.get("/unread-counts/:userId", getUnreadCounts);
 
 app.get("/api/question", async (req, res) => {
@@ -2067,5 +2185,145 @@ app.put("/user/:userId/age", async (req, res) => {
       message: "An unexpected error occurred while updating the age.",
       error: error.message,
     });
+  }
+});
+
+// Fetch users created between specific dates
+app.get("/by-date-range", async (req, res) => {
+  try {
+    const { startDate, endDate, page = 1, limit = 10 } = req.query;
+
+    console.log(
+      `Fetching users between ${startDate} and ${endDate}, page ${page}, limit ${limit}`
+    );
+
+    if (!startDate || !endDate) {
+      return res
+        .status(400)
+        .json({ message: "Both start and end dates are required" });
+    }
+
+    // Parse dates and create query range
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    end.setHours(23, 59, 59, 999); // Set to end of day
+
+    // Validate dates
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({ message: "Invalid date format" });
+    }
+
+    // Calculate pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    // Query users within date range
+    const users = await User.find({
+      createdAt: { $gte: start, $lte: end },
+    })
+      .select("name email age gender profileImages createdAt")
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    // Get total count for pagination
+    const totalUsers = await User.countDocuments({
+      createdAt: { $gte: start, $lte: end },
+    });
+
+    console.log(`Found ${totalUsers} users within date range`);
+
+    return res.status(200).json({
+      users,
+      totalUsers,
+      totalPages: Math.ceil(totalUsers / parseInt(limit)),
+      currentPage: parseInt(page),
+    });
+  } catch (error) {
+    console.error("Error fetching users by date range:", error);
+    res.status(500).json({
+      message: "An error occurred while fetching users",
+      error: error.message,
+    });
+  }
+});
+
+// Endpoint for sending customizable push notifications from CMS
+app.post("/admin/send-notification", async (req, res) => {
+  try {
+    const { title, body, userIds, allUsers } = req.body;
+
+    if (!title || !body) {
+      return res.status(400).json({ message: "Title and body are required" });
+    }
+
+    let users = [];
+
+    if (allUsers) {
+      // Send to all users with push tokens
+      users = await User.find({ pushToken: { $exists: true, $ne: null } });
+    } else if (userIds && userIds.length > 0) {
+      // Send to specific users
+      users = await User.find({
+        _id: { $in: userIds },
+        pushToken: { $exists: true, $ne: null },
+      });
+    } else {
+      return res
+        .status(400)
+        .json({ message: "Either userIds or allUsers must be provided" });
+    }
+
+    if (users.length === 0) {
+      return res
+        .status(404)
+        .json({ message: "No users found with push tokens" });
+    }
+
+    // Send notifications to all found users
+    const notificationPromises = users.map((user) =>
+      sendNotification(user.pushToken, title, body)
+    );
+
+    await Promise.all(notificationPromises);
+
+    res.status(200).json({
+      message: `Notification sent to ${users.length} users successfully`,
+      sentTo: users.map((user) => ({ id: user._id, name: user.name })),
+    });
+  } catch (error) {
+    console.error("Error sending notifications:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// Endpoint to update user's anonymous mode
+app.put("/users/:userId/anonymous", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { anonymous } = req.body;
+
+    if (typeof anonymous !== "boolean") {
+      return res
+        .status(400)
+        .json({ message: "Anonymous field must be a boolean" });
+    }
+
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      { anonymous },
+      { new: true }
+    );
+
+    if (!updatedUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    return res.status(200).json({
+      message: "Anonymous mode updated successfully",
+      anonymous: updatedUser.anonymous,
+    });
+  } catch (error) {
+    console.error("Error updating anonymous mode:", error);
+    return res.status(500).json({ message: "Server error" });
   }
 });
