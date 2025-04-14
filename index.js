@@ -834,17 +834,25 @@ app.get("/profiles", async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Get excluded user IDs
-    const excludedIds = [
-      userId,
-      ...(currentUser.Matches || []),
-      ...(currentUser.crushes || []),
-      ...(currentUser.profileDislikes || []),
-    ];
+    // Convert all ObjectIds to strings for consistent handling
+    const userIdStr = userId.toString();
+    const matchIds = (currentUser.Matches || []).map((id) => id.toString());
+    const crushIds = (currentUser.crushes || []).map((id) => id.toString());
+    const dislikeIds = (currentUser.profileDislikes || []).map((id) =>
+      id.toString()
+    );
 
-    // Base match criteria
+    // All IDs to exclude
+    const excludedIds = [userIdStr, ...matchIds, ...crushIds, ...dislikeIds];
+
+    // Convert back to ObjectIds for MongoDB
+    const excludedObjectIds = excludedIds.map((id) =>
+      mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : id
+    );
+
+    // Base query criteria - this properly excludes all profiles we don't want to see
     const baseMatch = {
-      _id: { $nin: excludedIds },
+      _id: { $nin: excludedObjectIds },
       gender:
         gender === "both"
           ? currentUser.gender === "male"
@@ -856,7 +864,7 @@ app.get("/profiles", async (req, res) => {
         $lte: maxAge.toString(),
       },
       profileImages: { $exists: true, $not: { $size: 0 } },
-      anonymous: { $ne: true }, // Exclude users with anonymous mode enabled
+      anonymous: { $ne: true },
     };
 
     // Add lookingFor filter if provided
@@ -866,19 +874,21 @@ app.get("/profiles", async (req, res) => {
       };
     }
 
-    // Initialize aggregation pipeline
-    const aggregationPipeline = [];
+    // Initialize aggregation pipeline with our refined match criteria
+    const aggregationPipeline = [{ $match: baseMatch }];
 
-    // Handle location-based search with error fallback
+    // Add location-based search if coordinates are provided
     let hasLocation = false;
     if (longitude && latitude) {
       try {
-        // Validate coordinates
         const parsedLong = parseFloat(longitude);
         const parsedLat = parseFloat(latitude);
 
         if (!isNaN(parsedLong) && !isNaN(parsedLat)) {
+          // Replace the basic match with a geospatial query
+          aggregationPipeline.pop(); // Remove the basic match
           hasLocation = true;
+
           aggregationPipeline.push({
             $geoNear: {
               near: {
@@ -890,24 +900,17 @@ app.get("/profiles", async (req, res) => {
               spherical: true,
               query: baseMatch,
               distanceMultiplier: 0.001, // Convert to kilometers
-              key: "location", // Specify the exact index to use
+              key: "location",
             },
           });
-        } else {
-          // If coordinates are invalid, fall back to regular search
-          aggregationPipeline.push({ $match: baseMatch });
         }
       } catch (error) {
         console.error("Error in geospatial query:", error);
-        // Fall back to regular search if geospatial query fails
-        aggregationPipeline.push({ $match: baseMatch });
+        // If geospatial query fails, we already have the basic match
       }
-    } else {
-      // If no coordinates, start with regular match
-      aggregationPipeline.push({ $match: baseMatch });
     }
 
-    // Add facet stage to categorize profiles
+    // Add categorization for different types of profiles
     aggregationPipeline.push({
       $facet: {
         nearbyProfiles: hasLocation
@@ -920,7 +923,7 @@ app.get("/profiles", async (req, res) => {
               ...(hasLocation && { distance: { $exists: false } }),
             },
           },
-          { $limit: 5 },
+          { $limit: 10 },
         ],
         regularProfiles: [
           {
@@ -930,9 +933,9 @@ app.get("/profiles", async (req, res) => {
             },
           },
           { $sort: { updatedAt: -1 } },
-          { $limit: 10 },
+          { $limit: 20 },
         ],
-        latestProfiles: [
+        newProfiles: [
           {
             $match: {
               priority: { $ne: 1 },
@@ -940,33 +943,33 @@ app.get("/profiles", async (req, res) => {
             },
           },
           { $sort: { createdAt: -1 } },
-          { $limit: 5 },
+          { $limit: 20 },
         ],
       },
     });
 
-    // Combine all profile types with priority given to nearby profiles
+    // Combine all profile types
     aggregationPipeline.push({
       $project: {
-        combinedProfiles: {
+        allProfiles: {
           $concatArrays: [
             "$nearbyProfiles",
             "$priorityProfiles",
             "$regularProfiles",
-            "$latestProfiles",
+            "$newProfiles",
           ],
         },
       },
     });
 
-    // Ensure we get unique profiles and limit to 20
+    // Ensure we get unique profiles (no duplicates)
     aggregationPipeline.push({
       $project: {
         uniqueProfiles: {
           $slice: [
             {
               $reduce: {
-                input: "$combinedProfiles",
+                input: "$allProfiles",
                 initialValue: [],
                 in: {
                   $cond: [
@@ -977,112 +980,48 @@ app.get("/profiles", async (req, res) => {
                 },
               },
             },
-            20,
+            30, // Get up to 30 profiles
           ],
         },
       },
     });
 
-    // Execute the aggregation with a timeout to prevent long-running queries
+    // Execute the aggregation with a timeout
     const result = await User.aggregate(aggregationPipeline).option({
       maxTimeMS: 5000,
-    }); // Set a 5-second timeout
+    });
 
     let profiles = [];
     if (result && result.length > 0 && result[0].uniqueProfiles) {
       profiles = result[0].uniqueProfiles;
     }
 
-    // If we didn't get enough profiles, try a simpler query as a fallback
-    if (profiles.length < 20) {
-      // Get IDs of profiles we already have
-      const existingIds = profiles.map((p) => p._id);
+    // If we didn't get enough profiles, try a different approach
+    if (profiles.length < 10) {
+      // Simpler direct query
+      const additionalProfiles = await User.find(baseMatch)
+        .sort({ updatedAt: -1 })
+        .limit(20)
+        .lean();
 
-      // Create a fallback aggregation pipeline that maintains our categorization logic
-      // but doesn't use geospatial search
-      const fallbackPipeline = [
-        {
-          $match: {
-            ...baseMatch,
-            _id: { $nin: [...existingIds] }, // Also exclude profiles we already have
-          },
-        },
-        // Use the same facet structure but without the geospatial component
-        {
-          $facet: {
-            priorityProfiles: [{ $match: { priority: 1 } }, { $limit: 5 }],
-            regularProfiles: [
-              { $match: { priority: { $ne: 1 } } },
-              { $sort: { updatedAt: -1 } },
-              { $limit: 10 },
-            ],
-            latestProfiles: [
-              { $match: { priority: { $ne: 1 } } },
-              { $sort: { createdAt: -1 } },
-              { $limit: 5 },
-            ],
-          },
-        },
-        // Combine all profile types
-        {
-          $project: {
-            combinedProfiles: {
-              $concatArrays: [
-                "$priorityProfiles",
-                "$regularProfiles",
-                "$latestProfiles",
-              ],
-            },
-          },
-        },
-        // Ensure unique profiles
-        {
-          $project: {
-            uniqueProfiles: {
-              $slice: [
-                {
-                  $reduce: {
-                    input: "$combinedProfiles",
-                    initialValue: [],
-                    in: {
-                      $cond: [
-                        { $in: ["$$this._id", "$$value._id"] },
-                        "$$value",
-                        { $concatArrays: ["$$value", ["$$this"]] },
-                      ],
-                    },
-                  },
-                },
-                20 - profiles.length, // Only get what we need to reach 20
-              ],
-            },
-          },
-        },
-      ];
+      // Merge and deduplicate
+      const allProfileIds = new Set(profiles.map((p) => p._id.toString()));
 
-      // Execute the fallback pipeline
-      const fallbackResult = await User.aggregate(fallbackPipeline).option({
-        maxTimeMS: 3000,
-      });
-
-      let additionalProfiles = [];
-      if (
-        fallbackResult &&
-        fallbackResult.length > 0 &&
-        fallbackResult[0].uniqueProfiles
-      ) {
-        additionalProfiles = fallbackResult[0].uniqueProfiles;
+      for (const profile of additionalProfiles) {
+        if (!allProfileIds.has(profile._id.toString())) {
+          profiles.push(profile);
+          allProfileIds.add(profile._id.toString());
+        }
       }
 
-      // Add the additional profiles
-      profiles = [...profiles, ...additionalProfiles];
+      console.log(`After additional query: ${profiles.length} profiles`);
     }
 
     // Apply in-memory shuffle for randomness
     const shuffledProfiles = profiles.sort(() => Math.random() - 0.5);
 
-    // Calculate distances for any profiles missing distance field
-    if (hasLocation) {
+    // Calculate distances for profiles missing distance field
+    if (hasLocation && shuffledProfiles.length > 0) {
       const parsedLong = parseFloat(longitude);
       const parsedLat = parseFloat(latitude);
 
@@ -1109,13 +1048,11 @@ app.get("/profiles", async (req, res) => {
       }
     });
 
-    // Log gender counts in fetched profiles
+    // Log gender counts
     const genderCounts = shuffledProfiles.reduce((counts, profile) => {
       counts[profile.gender] = (counts[profile.gender] || 0) + 1;
       return counts;
     }, {});
-
-    shuffledProfiles.slice(0, 5).forEach((profile, index) => {});
 
     return res.status(200).json({
       profiles: shuffledProfiles,
