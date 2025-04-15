@@ -145,99 +145,14 @@ const userSchema = mongoose.Schema(
   { timestamps: true }
 ); // Add timestamps option here
 
-// Validate that coordinates are in correct format
-userSchema.path("location.coordinates").validate(function (coords) {
-  // Skip validation if coordinates are not provided
-  if (!coords || coords.length !== 2) return true;
-
-  // Validate longitude (must be between -180 and 180)
-  const lon = coords[0];
-  const isValidLon = lon >= -180 && lon <= 180;
-
-  // Validate latitude (must be between -90 and 90)
-  const lat = coords[1];
-  const isValidLat = lat >= -90 && lat <= 90;
-
-  return isValidLon && isValidLat;
-}, "Invalid coordinates. Longitude must be between -180 and 180, and latitude must be between -90 and 90.");
-
-// Create a 2dsphere index for geospatial queries with the correct name
-userSchema.index(
-  { "location.coordinates": "2dsphere" },
-  { name: "location_coordinates_2dsphere", background: true, sparse: true }
-);
+// Create only one 2dsphere index for geospatial queries
+userSchema.index({ location: "2dsphere" });
 
 // Add additional indexes for frequently queried fields
 userSchema.index({ gender: 1, age: 1 });
 userSchema.index({ priority: 1 });
 userSchema.index({ createdAt: -1 });
 userSchema.index({ updatedAt: -1 });
-
 const User = mongoose.model("User", userSchema);
-
-// Function to set up MongoDB indexes
-User.setupIndexes = async function () {
-  try {
-    const collection = User.collection;
-
-    // List current indexes
-    const indexes = await collection.listIndexes().toArray();
-    console.log(
-      "Current indexes:",
-      indexes.map((idx) => idx.name)
-    );
-
-    // Always drop the index we need to recreate
-    try {
-      console.log("Dropping any existing location indexes...");
-      // Try to drop both potential index names
-      if (indexes.some((idx) => idx.name === "location_2dsphere")) {
-        await collection.dropIndex("location_2dsphere");
-        console.log("Dropped location_2dsphere index");
-      }
-
-      if (indexes.some((idx) => idx.name === "location_coordinates_2dsphere")) {
-        await collection.dropIndex("location_coordinates_2dsphere");
-        console.log("Dropped location_coordinates_2dsphere index");
-      }
-    } catch (dropErr) {
-      console.error("Error dropping indexes:", dropErr);
-      // Continue anyway
-    }
-
-    // Recreate the index with correct specification
-    console.log("Creating new location_coordinates_2dsphere index...");
-    try {
-      await collection.createIndex(
-        { "location.coordinates": "2dsphere" },
-        {
-          name: "location_coordinates_2dsphere",
-          background: true,
-          sparse: true,
-        }
-      );
-      console.log("Successfully created location_coordinates_2dsphere index");
-    } catch (createErr) {
-      console.error("Error creating index:", createErr);
-    }
-
-    // Verify indexes after update
-    const updatedIndexes = await collection.listIndexes().toArray();
-    console.log(
-      "Updated indexes:",
-      updatedIndexes.map((idx) => idx.name)
-    );
-
-    // Additional details on the recreated index
-    const indexDetails = updatedIndexes.find(
-      (idx) => idx.name === "location_coordinates_2dsphere"
-    );
-    if (indexDetails) {
-      console.log("Index details:", JSON.stringify(indexDetails, null, 2));
-    }
-  } catch (err) {
-    console.error("Error setting up User indexes:", err);
-  }
-};
 
 module.exports = User;
