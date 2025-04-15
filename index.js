@@ -70,8 +70,6 @@ mongoose
   )
   .then(async () => {
     console.log("Connected to the Database");
-    // Setup MongoDB indexes
-    await User.setupIndexes();
   })
   .catch((error) => {
     console.log("Error connecting to the Database", error);
@@ -903,7 +901,7 @@ app.get("/profiles", async (req, res) => {
               spherical: true,
               query: baseMatch,
               distanceMultiplier: 0.001, // Convert to kilometers
-              key: "location_coordinates_2dsphere", // Match the new index name
+              key: "location",
             },
           });
         }
@@ -1466,7 +1464,6 @@ app.get("/nearby-users", async (req, res) => {
             profileImages: { $exists: true, $not: { $size: 0 } },
           },
           distanceMultiplier: 0.001, // Convert to kilometers
-          key: "location_coordinates_2dsphere", // Match the new index name
         },
       },
       {
@@ -2361,240 +2358,5 @@ app.put("/users/:userId/flag", async (req, res) => {
       message: "Error updating user flag status",
       error: error.message,
     });
-  }
-});
-
-// Endpoint to get users with location data and nearby users
-app.get("/users-with-location", async (req, res) => {
-  try {
-    const { page = 1, limit = 100, maxDistance = 50 } = req.query;
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
-    const skip = (pageNum - 1) * limitNum;
-    const maxDistanceKm = parseInt(maxDistance) * 1000; // Convert to meters
-
-    // Find users with location data
-    const usersWithLocation = await User.find({
-      "location.coordinates.0": { $ne: 0 },
-      "location.coordinates.1": { $ne: 0 },
-      pushToken: { $exists: true, $ne: null },
-    })
-      .select("_id name email location pushToken")
-      .skip(skip)
-      .limit(limitNum)
-      .lean();
-
-    // For each user with location, find nearby users
-    const usersWithNearbyData = await Promise.all(
-      usersWithLocation.map(async (user) => {
-        if (!user.location?.coordinates) {
-          return { ...user, nearbyUsers: [] };
-        }
-
-        // Find nearby users for this user
-        let nearbyUsers = [];
-        try {
-          // First attempt using $geoNear
-          nearbyUsers = await User.aggregate([
-            {
-              $geoNear: {
-                near: {
-                  type: "Point",
-                  coordinates: user.location.coordinates,
-                },
-                distanceField: "distance",
-                maxDistance: 50000, // 50km
-                spherical: true,
-                query: {
-                  _id: { $ne: user._id },
-                  flagged: { $ne: true },
-                  anonymous: { $ne: true },
-                },
-                distanceMultiplier: 0.001, // Convert to kilometers
-                key: "location_coordinates_2dsphere", // Match the new index name
-              },
-            },
-            {
-              $project: {
-                _id: 1,
-                distance: 1,
-              },
-            },
-            {
-              $limit: 50,
-            },
-          ]).option({ maxTimeMS: 5000 }); // Add timeout option
-        } catch (geoError) {
-          console.log(
-            "GeoNear query failed in notification endpoint, using fallback method:",
-            geoError.message
-          );
-
-          // Fallback method - manual distance calculation
-          const maxDistanceKm = 50; // 50km
-          const userLat = user.location.coordinates[1];
-          const userLng = user.location.coordinates[0];
-
-          // Get users and calculate distance manually
-          const allUsers = await User.find({
-            _id: { $ne: user._id },
-            flagged: { $ne: true },
-            anonymous: { $ne: true },
-            "location.coordinates.0": { $ne: 0 },
-            "location.coordinates.1": { $ne: 0 },
-          })
-            .limit(100)
-            .lean();
-
-          // Calculate distances manually
-          nearbyUsers = allUsers
-            .map((otherUser) => {
-              if (!otherUser.location?.coordinates) return null;
-
-              const distance = calculateDistance(
-                userLat,
-                userLng,
-                otherUser.location.coordinates[1],
-                otherUser.location.coordinates[0]
-              );
-
-              if (distance <= maxDistanceKm) {
-                return {
-                  _id: otherUser._id,
-                  distance: distance,
-                };
-              }
-              return null;
-            })
-            .filter((user) => user !== null)
-            .slice(0, 50);
-        }
-
-        return {
-          ...user,
-          nearbyUsersCount: nearbyUsers.length,
-          nearbyUsers: nearbyUsers,
-        };
-      })
-    );
-
-    // Count total users with location
-    const totalUsersWithLocation = await User.countDocuments({
-      "location.coordinates.0": { $ne: 0 },
-      "location.coordinates.1": { $ne: 0 },
-      pushToken: { $exists: true, $ne: null },
-    });
-
-    return res.status(200).json({
-      users: usersWithNearbyData,
-      total: totalUsersWithLocation,
-      page: pageNum,
-      pages: Math.ceil(totalUsersWithLocation / limitNum),
-    });
-  } catch (error) {
-    console.error("Error fetching users with location:", error);
-    return res.status(500).json({
-      message: "Error fetching users with location",
-      error: error.message,
-    });
-  }
-});
-
-// Endpoint for sending notifications about nearby users
-app.post("/admin/send-nearby-notification", async (req, res) => {
-  try {
-    const { userIds, customMessage } = req.body;
-
-    if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
-      return res.status(400).json({ message: "User IDs are required" });
-    }
-
-    let successCount = 0;
-    let failCount = 0;
-    const notificationPromises = [];
-
-    // Process each user
-    for (const userId of userIds) {
-      try {
-        // Find the user to get their push token
-        const user = await User.findById(userId).select(
-          "_id name pushToken location"
-        );
-
-        if (!user || !user.pushToken || !user.location?.coordinates) {
-          failCount++;
-          continue;
-        }
-
-        // Find nearby users for this user
-        const nearbyUsers = await User.aggregate([
-          {
-            $geoNear: {
-              near: {
-                type: "Point",
-                coordinates: user.location.coordinates,
-              },
-              distanceField: "distance",
-              maxDistance: 50000, // 50km
-              spherical: true,
-              query: {
-                _id: { $ne: user._id },
-                flagged: { $ne: true },
-                anonymous: { $ne: true },
-              },
-              distanceMultiplier: 0.001, // Convert to kilometers
-              key: "location_coordinates_2dsphere", // Match the new index name
-            },
-          },
-          {
-            $project: {
-              _id: 1,
-              distance: 1,
-            },
-          },
-          {
-            $limit: 50,
-          },
-        ]);
-
-        const nearbyCount = nearbyUsers.length;
-
-        if (nearbyCount === 0) {
-          failCount++;
-          continue;
-        }
-
-        // Format the notification
-        const title = "Cuddles Nearby!";
-        const defaultMessage = `There are ${nearbyCount} users near you looking to cuddle! Open the app to find your match!`;
-        const body = customMessage
-          ? customMessage.replace("{{count}}", String(nearbyCount))
-          : defaultMessage;
-
-        // Send the notification
-        notificationPromises.push(
-          sendNotification(user.pushToken, title, body)
-        );
-        successCount++;
-      } catch (error) {
-        console.error(
-          `Error processing nearby notification for user ${userId}:`,
-          error
-        );
-        failCount++;
-      }
-    }
-
-    // Wait for all notifications to be sent
-    await Promise.all(notificationPromises);
-
-    return res.status(200).json({
-      message: `Nearby notifications sent successfully to ${successCount} users (${failCount} failed)`,
-      successCount,
-      failCount,
-    });
-  } catch (error) {
-    console.error("Error sending nearby notifications:", error);
-    return res.status(500).json({ message: "Server error" });
   }
 });
