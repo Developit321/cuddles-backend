@@ -862,7 +862,7 @@ app.get("/profiles", async (req, res) => {
         $lte: maxAge.toString(),
       },
       profileImages: { $exists: true, $not: { $size: 0 } },
-      anonymous: { $ne: true },
+      anonymous: false, // Completely exclude anonymous users
       flagged: { $ne: true }, // Exclude flagged/banned users
     };
 
@@ -873,148 +873,93 @@ app.get("/profiles", async (req, res) => {
       };
     }
 
-    // Initialize aggregation pipeline with our refined match criteria
-    const aggregationPipeline = [{ $match: baseMatch }];
-
-    // Add location-based search if coordinates are provided
+    // Sequential approach to fetch profiles
+    let profiles = [];
     let hasLocation = false;
+
+    // Step 1: First try to get nearby profiles if location is provided
     if (longitude && latitude) {
       try {
         const parsedLong = parseFloat(longitude);
         const parsedLat = parseFloat(latitude);
 
         if (!isNaN(parsedLong) && !isNaN(parsedLat)) {
-          // Replace the basic match with a geospatial query
-          aggregationPipeline.pop(); // Remove the basic match
           hasLocation = true;
 
-          aggregationPipeline.push({
-            $geoNear: {
-              near: {
-                type: "Point",
-                coordinates: [parsedLong, parsedLat],
+          // Fetch nearby profiles using geospatial query
+          const nearbyProfiles = await User.aggregate([
+            {
+              $geoNear: {
+                near: {
+                  type: "Point",
+                  coordinates: [parsedLong, parsedLat],
+                },
+                distanceField: "distance",
+                maxDistance: 50000, // 50km radius
+                spherical: true,
+                query: baseMatch,
+                distanceMultiplier: 0.001, // Convert to kilometers
+                key: "location",
               },
-              distanceField: "distance",
-              maxDistance: 50000, // 50km radius
-              spherical: true,
-              query: baseMatch,
-              distanceMultiplier: 0.001, // Convert to kilometers
-              key: "location",
             },
+            { $limit: 20 }, // Limit to 20 nearby profiles
+          ]).option({
+            maxTimeMS: 5000,
           });
+
+          console.log(`Found ${nearbyProfiles.length} nearby profiles`);
+          profiles = nearbyProfiles;
         }
       } catch (error) {
         console.error("Error in geospatial query:", error);
-        // If geospatial query fails, we already have the basic match
+        // Continue to other profile types if geospatial query fails
       }
     }
 
-    // Add categorization for different types of profiles
-    aggregationPipeline.push({
-      $facet: {
-        nearbyProfiles: hasLocation
-          ? [{ $match: { distance: { $exists: true } } }, { $limit: 20 }]
-          : [],
-        priorityProfiles: [
-          {
-            $match: {
-              priority: 1,
-              ...(hasLocation && { distance: { $exists: false } }),
-            },
-          },
-          { $limit: 10 },
-        ],
-        regularProfiles: [
-          {
-            $match: {
-              priority: { $ne: 1 },
-              ...(hasLocation && { distance: { $exists: false } }),
-            },
-          },
-          { $sort: { updatedAt: -1 } },
-          { $limit: 20 },
-        ],
-        newProfiles: [
-          {
-            $match: {
-              priority: { $ne: 1 },
-              ...(hasLocation && { distance: { $exists: false } }),
-            },
-          },
-          { $sort: { createdAt: -1 } },
-          { $limit: 20 },
-        ],
-      },
-    });
+    // Step 2: If we don't have enough profiles, get priority profiles
+    if (profiles.length < 20) {
+      // Get IDs of profiles we already have to avoid duplicates
+      const existingProfileIds = new Set(profiles.map((p) => p._id.toString()));
+      const neededProfiles = 20 - profiles.length;
 
-    // Combine all profile types
-    aggregationPipeline.push({
-      $project: {
-        allProfiles: {
-          $concatArrays: [
-            "$nearbyProfiles",
-            "$priorityProfiles",
-            "$regularProfiles",
-            "$newProfiles",
-          ],
-        },
-      },
-    });
-
-    // Ensure we get unique profiles (no duplicates)
-    aggregationPipeline.push({
-      $project: {
-        uniqueProfiles: {
-          $slice: [
-            {
-              $reduce: {
-                input: "$allProfiles",
-                initialValue: [],
-                in: {
-                  $cond: [
-                    { $in: ["$$this._id", "$$value._id"] },
-                    "$$value",
-                    { $concatArrays: ["$$value", ["$$this"]] },
-                  ],
-                },
-              },
-            },
-            30, // Get up to 30 profiles
-          ],
-        },
-      },
-    });
-
-    // Execute the aggregation with a timeout
-    const result = await User.aggregate(aggregationPipeline).option({
-      maxTimeMS: 5000,
-    });
-
-    let profiles = [];
-    if (result && result.length > 0 && result[0].uniqueProfiles) {
-      profiles = result[0].uniqueProfiles;
-    }
-
-    // If we didn't get enough profiles, try a different approach
-    if (profiles.length < 10) {
-      // Simpler direct query
-      const additionalProfiles = await User.find(baseMatch)
-        .sort({ updatedAt: -1 })
-        .limit(20)
+      // Find priority users that match our criteria and aren't already in results
+      const priorityProfiles = await User.find({
+        _id: { $nin: [...excludedObjectIds, ...existingProfileIds] },
+        priority: 1,
+        ...baseMatch,
+      })
+        .limit(neededProfiles)
         .lean();
 
-      // Merge and deduplicate
-      const allProfileIds = new Set(profiles.map((p) => p._id.toString()));
+      console.log(`Found ${priorityProfiles.length} priority profiles`);
 
-      for (const profile of additionalProfiles) {
-        if (!allProfileIds.has(profile._id.toString())) {
-          profiles.push(profile);
-          allProfileIds.add(profile._id.toString());
-        }
+      // Add priority profiles to our results
+      for (const profile of priorityProfiles) {
+        profiles.push(profile);
+        existingProfileIds.add(profile._id.toString());
       }
 
-      console.log(`After additional query: ${profiles.length} profiles`);
+      // Step 3: If we still don't have enough profiles, get newest users
+      if (profiles.length < 20) {
+        const neededAfterPriority = 20 - profiles.length;
+
+        // Find newest users that match our criteria and aren't already in results
+        const newestProfiles = await User.find({
+          _id: { $nin: [...excludedObjectIds, ...existingProfileIds] },
+          ...baseMatch,
+        })
+          .sort({ createdAt: -1 })
+          .limit(neededAfterPriority)
+          .lean();
+
+        console.log(`Found ${newestProfiles.length} newest profiles`);
+
+        // Add newest profiles to our results
+        profiles.push(...newestProfiles);
+      }
     }
+
+    console.log(`Total profiles found: ${profiles.length}`);
 
     // Apply in-memory shuffle for randomness
     const shuffledProfiles = profiles.sort(() => Math.random() - 0.5);
@@ -1039,13 +984,6 @@ app.get("/profiles", async (req, res) => {
         }
       });
     }
-
-    // Handle anonymous profiles
-    shuffledProfiles.forEach((profile) => {
-      if (profile.anonymous) {
-        profile.name = "Anonymous";
-      }
-    });
 
     // Log gender counts
     const genderCounts = shuffledProfiles.reduce((counts, profile) => {
