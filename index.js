@@ -862,8 +862,18 @@ app.get("/profiles", async (req, res) => {
         $lte: maxAge.toString(),
       },
       profileImages: { $exists: true, $not: { $size: 0 } },
-      anonymous: false, // Completely exclude anonymous users
-      flagged: { $ne: true }, // Exclude flagged/banned users
+      $or: [
+        { anonymous: { $exists: false } }, // Include profiles where anonymous field doesn't exist yet
+        { anonymous: false }, // Or where anonymous is explicitly false
+      ],
+      $and: [
+        {
+          $or: [
+            { flagged: { $exists: false } }, // Include profiles where flagged field doesn't exist yet
+            { flagged: { $ne: true } }, // Or where flagged is not true
+          ],
+        },
+      ],
     };
 
     // Add lookingFor filter if provided
