@@ -25,7 +25,6 @@ const sendDailyReminders = async () => {
   }
 };
 
-// Schedule reminders every day at 8 AM
-cron.schedule("0 8 * * *", sendDailyReminders);
+// The cron schedule has been removed as requested
 
 module.exports = { sendDailyReminders };

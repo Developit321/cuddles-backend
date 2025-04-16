@@ -19,9 +19,7 @@ const Chat = require("./models/message");
 const http = require("http").createServer(app);
 const io = require("socket.io")(http); // Pass the HTTP server instance
 const bcrypt = require("bcryptjs");
-const { sendDailyReminders } = require("./cron/dailyReminder");
 const { sendNotification } = require("./notifications/pushNotifications");
-require("./cron/dailyReminder");
 
 const userRoutes = require("./routes/userRoutes");
 
@@ -1612,13 +1610,28 @@ app.post("/cuddles/request-otp", async (req, res) => {
     await user.save();
 
     // Send OTP to email
-    await transporter.sendMail({
-      to: email,
-      subject: "Your OTP Code",
-      text: `Your OTP code is ${otp}. It is valid for 1 minute.`,
-    });
+    try {
+      const emailResult = await transporter.sendMail({
+        to: email,
+        subject: "Your OTP Code",
+        text: `Your OTP code is ${otp}. It is valid for 1 minute.`,
+      });
 
-    res.status(200).json({ message: "OTP sent to your email." });
+      console.log("Email sent successfully:", emailResult.messageId);
+      res.status(200).json({
+        message: "OTP sent to your email.",
+        emailSent: true,
+        messageId: emailResult.messageId,
+      });
+    } catch (emailError) {
+      console.error("Failed to send email:", emailError);
+      // Still save the OTP but notify about email delivery failure
+      res.status(200).json({
+        message: "OTP generated but email delivery failed. Please try again.",
+        emailSent: false,
+        error: emailError.message,
+      });
+    }
   } catch (error) {
     console.error("Error in requesting OTP:", error);
     res.status(500).json({ message: "An error occurred." });
@@ -2188,45 +2201,88 @@ app.get("/by-date-range", async (req, res) => {
 // Endpoint for sending customizable push notifications from CMS
 app.post("/admin/send-notification", async (req, res) => {
   try {
-    const { title, body, userIds, allUsers } = req.body;
+    const { title, body, userIds, allUsers, ignoreWeeklyLimit } = req.body;
 
     if (!title || !body) {
       return res.status(400).json({ message: "Title and body are required" });
     }
 
-    let users = [];
+    // Calculate one week ago to check for recent notifications
+    const oneWeekAgo = new Date();
+    oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
 
-    if (allUsers) {
-      // Send to all users with push tokens
-      users = await User.find({ pushToken: { $exists: true, $ne: null } });
-    } else if (userIds && userIds.length > 0) {
-      // Send to specific users
-      users = await User.find({
+    // Build the query for users with push tokens
+    let query = { pushToken: { $exists: true, $ne: null } };
+
+    // Add user ID filter if not sending to all users
+    if (!allUsers && userIds && userIds.length > 0) {
+      query._id = { $in: userIds };
+    }
+
+    // Add weekly notification check unless explicitly ignored
+    if (!ignoreWeeklyLimit) {
+      query.$or = [
+        { lastNotificationSent: { $exists: false } },
+        { lastNotificationSent: { $lt: oneWeekAgo } },
+      ];
+    }
+
+    // Find eligible users with push tokens
+    const users = await User.find(query);
+
+    // If specific users were requested, calculate how many were filtered out due to recent notifications
+    let recentlyNotifiedCount = 0;
+    if (!allUsers && userIds && userIds.length > 0 && !ignoreWeeklyLimit) {
+      const totalUsersWithTokens = await User.countDocuments({
         _id: { $in: userIds },
         pushToken: { $exists: true, $ne: null },
       });
-    } else {
-      return res
-        .status(400)
-        .json({ message: "Either userIds or allUsers must be provided" });
+      recentlyNotifiedCount = totalUsersWithTokens - users.length;
     }
 
     if (users.length === 0) {
-      return res
-        .status(404)
-        .json({ message: "No users found with push tokens" });
+      const message =
+        recentlyNotifiedCount > 0
+          ? `All selected users (${recentlyNotifiedCount}) were already notified within the last week`
+          : "No users found with push tokens";
+
+      return res.status(404).json({ message });
     }
 
     // Send notifications to all found users
-    const notificationPromises = users.map((user) =>
-      sendNotification(user.pushToken, title, body)
-    );
+    const notificationPromises = users.map(async (user) => {
+      try {
+        await sendNotification(user.pushToken, title, body);
 
-    await Promise.all(notificationPromises);
+        // Update the lastNotificationSent timestamp for this user
+        await User.findByIdAndUpdate(user._id, {
+          lastNotificationSent: new Date(),
+        });
+
+        return { success: true, userId: user._id };
+      } catch (error) {
+        console.error(`Error sending notification to user ${user._id}:`, error);
+        return { success: false, userId: user._id, error: error.message };
+      }
+    });
+
+    const results = await Promise.all(notificationPromises);
+    const successCount = results.filter((r) => r.success).length;
+    const failureCount = results.length - successCount;
 
     res.status(200).json({
-      message: `Notification sent to ${users.length} users successfully`,
+      message: `Notification sent to ${successCount} users successfully${
+        failureCount > 0 ? `, ${failureCount} failed` : ""
+      }${
+        recentlyNotifiedCount > 0
+          ? `, ${recentlyNotifiedCount} skipped (recently notified)`
+          : ""
+      }`,
       sentTo: users.map((user) => ({ id: user._id, name: user.name })),
+      successCount,
+      failureCount,
+      skippedCount: recentlyNotifiedCount,
+      results,
     });
   } catch (error) {
     console.error("Error sending notifications:", error);
@@ -2357,6 +2413,325 @@ app.put("/users/:userId/flag", async (req, res) => {
     return res.status(500).json({
       message: "Error updating user flag status",
       error: error.message,
+    });
+  }
+});
+
+// Endpoint to get users with location data and their nearby users
+app.get("/users-with-nearby", async (req, res) => {
+  try {
+    const {
+      maxDistance = 50,
+      limit = 20,
+      page = 1,
+      minNearbyCount = 0, // Minimum number of nearby users to include in results
+    } = req.query;
+
+    // Parse and validate parameters
+    const maxDistanceMeters = parseFloat(maxDistance) * 1000; // Convert km to meters
+    const userLimit = parseInt(limit, 10);
+    const currentPage = parseInt(page, 10);
+    const minNearby = parseInt(minNearbyCount, 10);
+    const skip = (currentPage - 1) * userLimit;
+
+    // Build the query for users with valid location data
+    const query = {
+      "location.coordinates": { $exists: true },
+      "location.coordinates.0": { $ne: null, $exists: true },
+      "location.coordinates.1": { $ne: null, $exists: true },
+      pushToken: { $exists: true, $ne: null },
+    };
+
+    // Count total users matching the query for pagination info
+    const totalUsers = await User.countDocuments(query);
+
+    // Find users with valid location data with pagination
+    const usersWithLocation = await User.find(query)
+      .select("_id name email gender location profileImages pushToken")
+      .skip(skip)
+      .limit(userLimit)
+      .lean();
+
+    if (usersWithLocation.length === 0) {
+      return res.status(404).json({
+        message: "No users with location data found",
+        pagination: {
+          total: totalUsers,
+          page: currentPage,
+          limit: userLimit,
+          pages: Math.ceil(totalUsers / userLimit),
+        },
+      });
+    }
+
+    // 2. For each user, find nearby users
+    const usersWithNearbyData = await Promise.all(
+      usersWithLocation.map(async (user) => {
+        // Skip users with missing location data
+        if (!user.location || !user.location.coordinates) {
+          return { ...user, nearbyUsers: [], nearbyCount: 0 };
+        }
+
+        const coordinates = user.location.coordinates;
+
+        // Skip users with invalid coordinates
+        if (!Array.isArray(coordinates) || coordinates.length !== 2) {
+          return { ...user, nearbyUsers: [], nearbyCount: 0 };
+        }
+
+        const [longitude, latitude] = coordinates;
+
+        // Skip users with invalid coordinates values
+        if (
+          longitude === undefined ||
+          latitude === undefined ||
+          longitude === null ||
+          latitude === null ||
+          isNaN(longitude) ||
+          isNaN(latitude) ||
+          longitude === 0 ||
+          latitude === 0
+        ) {
+          return { ...user, nearbyUsers: [], nearbyCount: 0 };
+        }
+
+        try {
+          // Build the gender query based on the current user's gender
+          let genderQuery = {};
+
+          // If the user's gender is male or female, look for opposite gender
+          if (user.gender === "male") {
+            genderQuery = { gender: "female" };
+          } else if (user.gender === "female") {
+            genderQuery = { gender: "male" };
+          }
+          // If the user's gender is not male or female (or undefined),
+          // don't filter by gender to show all nearby users
+
+          // Find nearby users
+          const nearbyUsers = await User.aggregate([
+            {
+              $geoNear: {
+                near: {
+                  type: "Point",
+                  coordinates: [longitude, latitude],
+                },
+                distanceField: "distance",
+                maxDistance: maxDistanceMeters,
+                spherical: true,
+                query: {
+                  _id: { $ne: user._id }, // Exclude the user themselves
+                  ...genderQuery, // Apply gender filter if applicable
+                  profileImages: { $exists: true, $not: { $size: 0 } },
+                  flagged: { $ne: true },
+                  pushToken: { $exists: true, $ne: null },
+                },
+                distanceMultiplier: 0.001, // Convert to kilometers
+                key: "location",
+              },
+            },
+            {
+              $project: {
+                _id: 1,
+                name: 1,
+                gender: 1,
+                distance: 1,
+                pushToken: 1,
+                profileImages: { $slice: ["$profileImages", 1] }, // Only return first profile image
+              },
+            },
+            { $limit: 20 }, // Limit nearby users per person
+          ]);
+
+          return {
+            ...user,
+            nearbyUsers,
+            nearbyCount: nearbyUsers.length,
+          };
+        } catch (error) {
+          console.error(
+            `Error finding nearby users for user ${user._id}:`,
+            error
+          );
+          return { ...user, nearbyUsers: [], nearbyCount: 0 };
+        }
+      })
+    );
+
+    // 3. Filter and sort users by nearby count
+    const filteredUsers = usersWithNearbyData
+      .filter((user) => user.nearbyCount >= minNearby)
+      .sort((a, b) => b.nearbyCount - a.nearbyCount);
+
+    return res.status(200).json({
+      pagination: {
+        total: totalUsers,
+        page: currentPage,
+        limit: userLimit,
+        pages: Math.ceil(totalUsers / userLimit),
+      },
+      totalUsersWithLocation: usersWithLocation.length,
+      usersWithNearbyUsers: filteredUsers.length,
+      users: filteredUsers,
+    });
+  } catch (error) {
+    console.error("Error finding users with nearby data:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Endpoint for sending notifications about nearby users via email
+app.post("/admin/send-nearby-email", async (req, res) => {
+  try {
+    const {
+      userIds,
+      customMessage,
+      emailSubject,
+      emailTemplate,
+      nearbyUserCounts,
+      ignoreWeeklyLimit,
+    } = req.body;
+
+    if (!userIds || !userIds.length || !customMessage) {
+      return res.status(400).json({
+        message: "User IDs array and customMessage are required",
+      });
+    }
+
+    // Calculate one week ago to check for recent notifications
+    const oneWeekAgo = new Date();
+    oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+
+    // Find users with email addresses who haven't received a notification in the last week
+    let query = {
+      _id: { $in: userIds },
+      email: { $exists: true, $ne: null },
+    };
+
+    // Add weekly notification check unless explicitly ignored
+    if (!ignoreWeeklyLimit) {
+      query.$or = [
+        { lastNotificationSent: { $exists: false } },
+        { lastNotificationSent: { $lt: oneWeekAgo } },
+      ];
+    }
+
+    const users = await User.find(query).select("_id name email");
+
+    // Find filtered out users who recently received notifications
+    const recentlyNotifiedCount = userIds.length - users.length;
+
+    if (users.length === 0) {
+      return res.status(404).json({
+        message:
+          recentlyNotifiedCount > 0
+            ? `All selected users (${recentlyNotifiedCount}) were already notified within the last week`
+            : "No users found with valid email addresses",
+      });
+    }
+
+    console.log(
+      `Starting to send emails to ${users.length} users (${recentlyNotifiedCount} filtered out due to recent notifications)`
+    );
+
+    // Send emails to all found users
+    const emailPromises = users.map(async (user) => {
+      const messageWithCount = customMessage.replace(
+        "{count}",
+        nearbyUserCounts && nearbyUserCounts[user._id.toString()]
+          ? nearbyUserCounts[user._id.toString()].toString()
+          : "0"
+      );
+
+      // Default template if none provided
+      const defaultTemplate = `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2 style="color: #6200ee;">Cuddles</h2>
+          <p>Hello ${user.name || "there"},</p>
+          <p>${messageWithCount}</p>
+          <p>Open the Cuddles app to see who's nearby and make connections!</p>
+          <p style="margin-top: 20px;">Warm regards,<br>The Cuddles Team</p>
+        </div>
+      `;
+
+      // Process the custom template if provided
+      let htmlContent = defaultTemplate;
+      if (emailTemplate) {
+        htmlContent = emailTemplate
+          .replace("{name}", user.name || "there")
+          .replace("{message}", messageWithCount)
+          .replace(
+            "{count}",
+            nearbyUserCounts && nearbyUserCounts[user._id.toString()]
+              ? nearbyUserCounts[user._id.toString()].toString()
+              : "0"
+          );
+      }
+
+      const mailOptions = {
+        from: "Charlotte from Cuddles <cuddlesquery@gmail.com>",
+        to: user.email,
+        subject: emailSubject || "Nearby Users Alert",
+        text: messageWithCount,
+        html: htmlContent,
+      };
+
+      try {
+        const emailResult = await transporter.sendMail(mailOptions);
+        console.log(
+          `Email sent to ${user.email} - Message ID: ${emailResult.messageId}`
+        );
+
+        // Update the lastNotificationSent timestamp for this user
+        await User.findByIdAndUpdate(user._id, {
+          lastNotificationSent: new Date(),
+        });
+
+        return {
+          userId: user._id,
+          email: user.email,
+          success: true,
+          messageId: emailResult.messageId,
+        };
+      } catch (error) {
+        console.error(`Error sending email to ${user.email}:`, error);
+        return {
+          userId: user._id,
+          email: user.email,
+          success: false,
+          error: error.message,
+        };
+      }
+    });
+
+    const emailResults = await Promise.all(emailPromises);
+
+    // Count successes and failures
+    const successCount = emailResults.filter((result) => result.success).length;
+    const failureCount = emailResults.length - successCount;
+
+    console.log(
+      `Email sending complete: ${successCount} succeeded, ${failureCount} failed, ${recentlyNotifiedCount} skipped (recently notified)`
+    );
+
+    res.status(200).json({
+      message: `Email notifications sent to ${successCount} users, failed for ${failureCount} users${
+        recentlyNotifiedCount > 0
+          ? `, ${recentlyNotifiedCount} skipped (recently notified)`
+          : ""
+      }`,
+      results: emailResults,
+      successCount,
+      failureCount,
+      skippedCount: recentlyNotifiedCount,
+      emailsSent: successCount > 0,
+    });
+  } catch (error) {
+    console.error("Error sending email notifications:", error);
+    res.status(500).json({
+      message: "Server error",
+      error: error.message,
+      emailsSent: false,
     });
   }
 });

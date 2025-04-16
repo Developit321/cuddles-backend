@@ -141,6 +141,10 @@ const userSchema = mongoose.Schema(
       type: String,
       default: "",
     },
+    lastNotificationSent: {
+      type: Date,
+      default: null,
+    },
   },
   { timestamps: true }
 ); // Add timestamps option here
