@@ -2274,8 +2274,9 @@ app.put("/users/:userId/anonymous", async (req, res) => {
 app.put("/set-priority/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
+    const { action } = req.body; // Optional: 'set' or 'remove', if not specified, toggle
 
-    console.log("Setting priority for user:", userId);
+    console.log("Updating priority for user:", userId);
 
     // Validate userId format
     if (!mongoose.Types.ObjectId.isValid(userId)) {
@@ -2283,21 +2284,42 @@ app.put("/set-priority/:userId", async (req, res) => {
       return res.status(400).json({ message: "Invalid user ID format" });
     }
 
-    // Find and update the user's priority
-    const updatedUser = await User.findByIdAndUpdate(
-      userId,
-      { priority: 1 },
-      { new: true }
-    );
+    // Find the user first to determine current priority
+    const user = await User.findById(userId);
 
-    if (!updatedUser) {
+    if (!user) {
       console.log("User not found:", userId);
       return res.status(404).json({ message: "User not found" });
     }
 
-    console.log("Priority updated for user:", updatedUser.name);
+    // Determine new priority value
+    let newPriority = 1; // Default to setting priority
+
+    if (action === "remove") {
+      newPriority = 0;
+    } else if (action === "set") {
+      newPriority = 1;
+    } else {
+      // Toggle behavior - if no specific action provided
+      newPriority = user.priority === 1 ? 0 : 1;
+    }
+
+    // Update the user's priority
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      { priority: newPriority },
+      { new: true }
+    );
+
+    console.log(
+      `Priority ${newPriority === 1 ? "set" : "removed"} for user:`,
+      updatedUser.name
+    );
     return res.status(200).json({
-      message: "User priority updated successfully",
+      message:
+        newPriority === 1
+          ? "User priority set successfully"
+          : "User priority removed successfully",
       user: {
         id: updatedUser._id,
         name: updatedUser.name,
@@ -2681,5 +2703,271 @@ app.post("/admin/send-nearby-email", async (req, res) => {
       error: error.message,
       emailsSent: false,
     });
+  }
+});
+
+// Get users with filtering options for admin
+app.get("/admin/users", async (req, res) => {
+  try {
+    const {
+      page = 1,
+      limit = 10,
+      hasImages,
+      priority,
+      flagged,
+      email,
+      name,
+      userId,
+      sortBy = "createdAt",
+      sortOrder = -1,
+    } = req.query;
+
+    // Build query based on filters
+    const query = {};
+
+    // Filter by user ID if provided (exact match)
+    if (userId) {
+      // Check if it's a valid ObjectId format
+      if (mongoose.Types.ObjectId.isValid(userId)) {
+        query._id = new mongoose.Types.ObjectId(userId);
+      } else {
+        // If not a valid ObjectId, return empty result
+        return res.status(200).json({
+          users: [],
+          totalUsers: 0,
+          totalPages: 0,
+          currentPage: parseInt(page),
+        });
+      }
+    }
+
+    // Filter by whether user has profile images
+    if (hasImages === "true") {
+      query.$expr = { $gt: [{ $size: "$profileImages" }, 0] };
+    } else if (hasImages === "false") {
+      query.$expr = { $eq: [{ $size: "$profileImages" }, 0] };
+    }
+
+    // Filter by priority
+    if (priority !== undefined) {
+      query.priority = parseInt(priority);
+    }
+
+    // Filter by flagged status
+    if (flagged === "true") {
+      query.flagged = true;
+    } else if (flagged === "false") {
+      query.flagged = false;
+    }
+
+    // Search by email (partial match)
+    if (email) {
+      query.email = { $regex: email, $options: "i" };
+    }
+
+    // Search by name (partial match)
+    if (name) {
+      query.name = { $regex: name, $options: "i" };
+    }
+
+    // Calculate pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    // Prepare sort options
+    const sortOptions = {};
+    sortOptions[sortBy] = parseInt(sortOrder);
+
+    // Fetch users with query and pagination
+    const users = await User.find(query)
+      .select(
+        "name email age gender profileImages flagged flagReason priority createdAt pushToken"
+      )
+      .sort(sortOptions)
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    // Get total count for pagination
+    const totalUsers = await User.countDocuments(query);
+
+    return res.status(200).json({
+      users,
+      totalUsers,
+      totalPages: Math.ceil(totalUsers / parseInt(limit)),
+      currentPage: parseInt(page),
+    });
+  } catch (error) {
+    console.error("Error fetching filtered users:", error);
+    res.status(500).json({
+      message: "An error occurred while fetching users",
+      error: error.message,
+    });
+  }
+});
+
+// Endpoint to upload verification selfie
+app.post(
+  "/verify/:userId/verification-selfie",
+  upload.single("file"),
+  async (req, res) => {
+    const userId = req.params.userId;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No selfie image uploaded" });
+    }
+
+    console.log("userId", userId);
+
+    try {
+      // Upload the verification selfie to Cloudinary
+      let selfieUrl;
+      const result = await new Promise((resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+          (uploadResult, error) => {
+            if (error) {
+              console.log("Cloudinary upload error:", error);
+              return reject(error);
+            }
+
+            selfieUrl = uploadResult.secure_url;
+            resolve(uploadResult); // Resolve the promise with the upload result
+          }
+        );
+        uploadStream.end(req.file.buffer);
+      });
+
+      // Update the user's profile with the verification selfie URL
+
+      console.log("selfieUrl", selfieUrl);
+      if (selfieUrl) {
+        const user = await User.findByIdAndUpdate(
+          userId,
+          {
+            "profileVerification.selfieUrl": selfieUrl,
+            "profileVerification.status": "pending",
+            "profileVerification.submittedAt": new Date(),
+          },
+          { new: true }
+        );
+
+        if (!user) {
+          return res.status(404).json({ error: "User not found" });
+        }
+
+        return res.status(200).json({
+          message: "Verification selfie uploaded successfully",
+          selfieUrl,
+          status: "pending",
+        });
+      }
+    } catch (error) {
+      console.error("Verification selfie upload failed:", error);
+      res.status(500).json({ error: "Verification selfie upload failed" });
+    }
+  }
+);
+
+// Endpoint to check verification status
+app.get("/users/:userId/verification-status", async (req, res) => {
+  const userId = req.params.userId;
+
+  try {
+    const user = await User.findById(userId);
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    return res.status(200).json({
+      verificationStatus: user.profileVerification?.status || "not_submitted",
+      selfieUrl: user.profileVerification?.selfieUrl || null,
+      submittedAt: user.profileVerification?.submittedAt || null,
+    });
+  } catch (error) {
+    console.error("Error checking verification status:", error);
+    res.status(500).json({ error: "Failed to check verification status" });
+  }
+});
+
+// Admin endpoint to update verification status
+app.put("/admin/users/:userId/verification-status", async (req, res) => {
+  const { userId } = req.params;
+  const { status, adminId, notes } = req.body;
+
+  if (!["approved", "rejected"].includes(status)) {
+    return res.status(400).json({ error: "Invalid status value" });
+  }
+
+  try {
+    // Optional: Add admin authentication check here
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      {
+        "profileVerification.status": status,
+        "profileVerification.reviewedAt": new Date(),
+        "profileVerification.reviewedBy": adminId,
+        "profileVerification.notes": notes,
+      },
+      { new: true }
+    );
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    // If the user is approved, you might want to add a verified badge to their profile
+    if (status === "approved") {
+      // This uses the existing verified flag in the schema
+      user.verified = true;
+      await user.save();
+    }
+
+    return res.status(200).json({
+      message: `Verification ${status}`,
+      user: {
+        id: user._id,
+        name: user.name,
+        profileVerification: user.profileVerification,
+      },
+    });
+  } catch (error) {
+    console.error("Error updating verification status:", error);
+    res.status(500).json({ error: "Failed to update verification status" });
+  }
+});
+
+// Endpoint to get all pending verifications
+app.get("/admin/verifications/pending", async (req, res) => {
+  try {
+    const { page = 1, limit = 10 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    // Find users with pending verification status
+    const pendingVerifications = await User.find({
+      "profileVerification.status": "pending",
+      "profileVerification.selfieUrl": { $ne: null },
+    })
+      .select(
+        "_id name email profileVerification.selfieUrl profileVerification.submittedAt profileImages"
+      )
+      .sort({ "profileVerification.submittedAt": -1 })
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    // Get total count for pagination
+    const totalCount = await User.countDocuments({
+      "profileVerification.status": "pending",
+      "profileVerification.selfieUrl": { $ne: null },
+    });
+
+    return res.status(200).json({
+      verifications: pendingVerifications,
+      totalVerifications: totalCount,
+      totalPages: Math.ceil(totalCount / parseInt(limit)),
+      currentPage: parseInt(page),
+    });
+  } catch (error) {
+    console.error("Error fetching pending verifications:", error);
+    res.status(500).json({ error: "Failed to fetch pending verifications" });
   }
 });

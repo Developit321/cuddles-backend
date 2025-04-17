@@ -36,6 +36,34 @@ const userSchema = mongoose.Schema(
     VerificationToken: {
       type: String,
     },
+    profileVerification: {
+      selfieUrl: {
+        type: String,
+        default: null,
+      },
+      status: {
+        type: String,
+        enum: ["pending", "approved", "rejected"],
+        default: "pending",
+      },
+      submittedAt: {
+        type: Date,
+        default: null,
+      },
+      reviewedAt: {
+        type: Date,
+        default: null,
+      },
+      reviewedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        default: null,
+      },
+      notes: {
+        type: String,
+        default: "",
+      },
+    },
     crushes: [
       {
         type: mongoose.Schema.Types.ObjectId,
