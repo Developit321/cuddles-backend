@@ -56,9 +56,9 @@ const upload = multer({ storage });
 
 // Cloudinary configuration
 cloudinary.config({
-  cloud_name: "dfnwpmv4l",
-  api_key: "816434434476967",
-  api_secret: "xm7lG-Q39W1TyL9HK6lTaLGXmFA",
+  cloud_name: "dmqt8wnrd",
+  api_key: "362393959313675",
+  api_secret: "sL1aM1tebd3pkvXD51c37_0EERg",
 });
 
 // MongoDB connection
