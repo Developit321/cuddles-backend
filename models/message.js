@@ -11,7 +11,17 @@ const chatSchema = new mongoose.Schema({
   },
   message: {
     type: String,
-    required: true,
+    required: function () {
+      return this.type !== "image";
+    },
+  },
+  type: {
+    type: String,
+    enum: ["text", "image"],
+    default: "text",
+  },
+  image: {
+    type: String, // This will store the base64 image data
   },
   timestamp: {
     type: Date,

@@ -21,6 +21,9 @@ const io = require("socket.io")(http); // Pass the HTTP server instance
 const bcrypt = require("bcryptjs");
 const { sendNotification } = require("./notifications/pushNotifications");
 
+// Map to store user socket connections
+const userSockets = new Map();
+
 const userRoutes = require("./routes/userRoutes");
 
 // Helper function to calculate distance between two coordinates
@@ -83,6 +86,8 @@ module.exports = mongoose;
 io.on("connection", (socket) => {
   // Listen for the join event and make the user join a specific room
   socket.on("join", ({ userId }) => {
+    // Store the socket connection for this user
+    userSockets.set(userId, socket.id);
     socket.join(userId); // User joins a room with their own userId
     // Emit a success message back to the client
     socket.emit("joinSuccess", {
@@ -119,49 +124,84 @@ io.on("connection", (socket) => {
   });
 
   // Listen for incoming messages
-  socket.on("sendMessage", async ({ senderId, receiverId, message }) => {
+  socket.on("sendMessage", async (data) => {
+    const { senderId, receiverId, message, image, type } = data;
+    console.log("Received message:", {
+      senderId,
+      receiverId,
+      message,
+      type,
+      hasImage: !!image,
+    });
+
     try {
-      console.log("Message received from client:", {
+      // Create a new message object
+      const newMessage = {
         senderId,
         receiverId,
         message,
-      });
+        type,
+        image: type === "image" ? image : undefined,
+        timestamp: new Date(),
+        read: false,
+      };
 
-      const recieverInfo = await User.findById(receiverId).select("pushToken");
+      // Save the message to the database
+      const savedMessage = await Chat.create(newMessage);
+      console.log("Message saved to database:", savedMessage);
 
-      const newMessage = new Message({ senderId, receiverId, message });
-      const updatedUser = await User.findOneAndUpdate(
-        { _id: receiverId, "conversations.receiverId": senderId },
-        { $inc: { "conversations.$.unreadMessagesCount": 1 } },
-        { new: true }
-      );
+      // Emit the message to the receiver if they are online
+      const receiverSocketId = userSockets.get(receiverId);
+      if (receiverSocketId) {
+        io.to(receiverSocketId).emit("receiveMessage", savedMessage);
+      }
 
-      // If the conversation was not found, add a new one
-      if (!updatedUser) {
-        await User.findOneAndUpdate(
-          { _id: receiverId },
-          {
-            $push: {
-              conversations: {
-                receiverId: senderId,
-                unreadMessagesCount: 1,
-              },
-            },
-          }
+      // Send push notification if receiver has a push token
+      const receiver = await User.findById(receiverId);
+      if (receiver?.pushToken) {
+        const sender = await User.findById(senderId);
+        const notificationMessage =
+          type === "image" ? `${sender.name} sent you an image` : message;
+
+        await sendPushNotification(
+          receiver.pushToken,
+          sender.name,
+          notificationMessage
         );
       }
-      await newMessage.save();
 
-      // Emit the message to the receiver's room
-      io.to(receiverId).emit("receiveMessage", newMessage); // Emit to the room based on receiverId
+      // Update or create conversation for the sender
+      await User.findByIdAndUpdate(
+        senderId,
+        {
+          $push: {
+            conversations: {
+              receiverId,
+              unreadMessagesCount: 0,
+            },
+          },
+        },
+        { upsert: true }
+      );
 
-      if (recieverInfo.pushToken) {
-        await sendNotification(recieverInfo.pushToken, "Message", message);
-      }
+      // Update or create conversation for the receiver
+      await User.findByIdAndUpdate(
+        receiverId,
+        {
+          $push: {
+            conversations: {
+              receiverId: senderId,
+              unreadMessagesCount: 1,
+            },
+          },
+        },
+        { upsert: true }
+      );
     } catch (error) {
-      console.error("Error saving message:", error);
+      console.error("Error handling message:", error);
     }
   });
+
   // Listen for marking messages as read
   socket.on("markAsRead", async ({ userId, senderId }) => {
     try {
@@ -243,7 +283,13 @@ io.on("connection", (socket) => {
 
   // Handle user disconnect
   socket.on("disconnect", () => {
-    // console.log("A user disconnected: " + socket.id);
+    // Remove the user's socket connection when they disconnect
+    for (const [userId, socketId] of userSockets.entries()) {
+      if (socketId === socket.id) {
+        userSockets.delete(userId);
+        break;
+      }
+    }
   });
 });
 
@@ -1285,6 +1331,8 @@ app.post("/messages/save", async (req, res) => {
       senderId: msg.senderId,
       receiverId: msg.receiverId,
       message: msg.message,
+      type: msg.type || "text",
+      image: msg.image, // Include the image field
       timestamp: new Date(msg.timestamp),
     }));
 
