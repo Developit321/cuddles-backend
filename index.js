@@ -3070,11 +3070,27 @@ app.get("/admin/verifications/pending", async (req, res) => {
 // Add this function before the message handling code
 const sendPushNotification = async (receiverId, title, body) => {
   try {
-    // Find the user's push token
+    // Find the user by their ID
     const user = await User.findById(receiverId);
-    if (!user || !user.pushToken) {
+    if (!user) {
+      console.log(`[Push Notification] User not found with ID ${receiverId}`);
+      return;
+    }
+
+    if (!user.pushToken) {
       console.log(
         `[Push Notification] No push token found for user ${receiverId}`
+      );
+      return;
+    }
+
+    // Validate the push token format
+    if (
+      !user.pushToken.startsWith("ExponentPushToken[") ||
+      !user.pushToken.endsWith("]")
+    ) {
+      console.log(
+        `[Push Notification] Invalid push token format for user ${receiverId}`
       );
       return;
     }
