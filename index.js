@@ -3066,3 +3066,28 @@ app.get("/admin/verifications/pending", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch pending verifications" });
   }
 });
+
+// Add this function before the message handling code
+const sendPushNotification = async (receiverId, title, body) => {
+  try {
+    // Find the user's push token
+    const user = await User.findById(receiverId);
+    if (!user || !user.pushToken) {
+      console.log(
+        `[Push Notification] No push token found for user ${receiverId}`
+      );
+      return;
+    }
+
+    console.log(
+      `[Push Notification] Sending message notification to user ${receiverId}`
+    );
+    await sendNotification(user.pushToken, title, body);
+    console.log(`[Push Notification] Successfully sent to user ${receiverId}`);
+  } catch (error) {
+    console.error(
+      `[Push Notification] Error sending to user ${receiverId}:`,
+      error
+    );
+  }
+};
