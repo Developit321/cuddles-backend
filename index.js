@@ -20,6 +20,7 @@ const http = require("http").createServer(app);
 const io = require("socket.io")(http); // Pass the HTTP server instance
 const bcrypt = require("bcryptjs");
 const { sendNotification } = require("./notifications/pushNotifications");
+const { ObjectId } = require("mongodb");
 
 // Map to store user socket connections
 const userSockets = new Map();
@@ -432,7 +433,46 @@ const transporter = nodemailer.createTransport({
     user: "cuddlesquery@gmail.com",
     pass: "nlvj jxji vkni ftxv",
   },
+  pool: true, // Use pooled connections
+  maxConnections: 5, // Limit concurrent connections
+  maxMessages: 100, // Limit messages per connection
+  rateDelta: 1000, // How many messages to send per second
+  rateLimit: 5, // Max number of messages per rateDelta
 });
+
+// Verify transporter configuration
+transporter.verify(function (error, success) {
+  if (error) {
+    console.error("Transporter verification failed:", error);
+  } else {
+    console.log("Transporter is ready to send emails");
+  }
+});
+
+// Helper function to send email with retry logic
+const sendEmailWithRetry = async (mailOptions, maxRetries = 3) => {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await transporter.sendMail(mailOptions);
+      console.log(
+        `Email sent successfully on attempt ${attempt}:`,
+        result.messageId
+      );
+      return { success: true, messageId: result.messageId };
+    } catch (error) {
+      console.error(`Email send attempt ${attempt} failed:`, error);
+      if (attempt === maxRetries) {
+        return { success: false, error: error.message };
+      }
+      // Wait before retrying (exponential backoff)
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.pow(2, attempt) * 1000)
+      );
+    }
+  }
+  return { success: false, error: "Max retries exceeded" };
+};
+
 // Send verification email
 const sendVerificationEmail = async (email, VerificationToken) => {
   const mailOptions = {
@@ -2197,92 +2237,99 @@ app.get("/by-date-range", async (req, res) => {
 // Endpoint for sending customizable push notifications from CMS
 app.post("/admin/send-notification", async (req, res) => {
   try {
-    const { title, body, userIds, allUsers, ignoreWeeklyLimit } = req.body;
+    const { title, body, userIds, ignoreWeeklyLimit } = req.body;
 
-    if (!title || !body) {
-      return res.status(400).json({ message: "Title and body are required" });
-    }
-
-    // Calculate one week ago to check for recent notifications
-    const oneWeekAgo = new Date();
-    oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
-
-    // Build the query for users with push tokens
-    let query = { pushToken: { $exists: true, $ne: null } };
-
-    // Add user ID filter if not sending to all users
-    if (!allUsers && userIds && userIds.length > 0) {
-      query._id = { $in: userIds };
-    }
-
-    // Add weekly notification check unless explicitly ignored
-    if (!ignoreWeeklyLimit) {
-      query.$or = [
-        { lastNotificationSent: { $exists: false } },
-        { lastNotificationSent: { $lt: oneWeekAgo } },
-      ];
-    }
-
-    // Find eligible users with push tokens
-    const users = await User.find(query);
-
-    // If specific users were requested, calculate how many were filtered out due to recent notifications
-    let recentlyNotifiedCount = 0;
-    if (!allUsers && userIds && userIds.length > 0 && !ignoreWeeklyLimit) {
-      const totalUsersWithTokens = await User.countDocuments({
-        _id: { $in: userIds },
-        pushToken: { $exists: true, $ne: null },
+    if (!title || !body || !userIds || !Array.isArray(userIds)) {
+      console.error("[Notification Endpoint] Invalid request parameters:", {
+        title,
+        body,
+        userIds,
       });
-      recentlyNotifiedCount = totalUsersWithTokens - users.length;
+      return res.status(400).json({ error: "Missing required fields" });
     }
 
-    if (users.length === 0) {
-      const message =
-        recentlyNotifiedCount > 0
-          ? `All selected users (${recentlyNotifiedCount}) were already notified within the last week`
-          : "No users found with push tokens";
+    console.log(`[Notification Endpoint] Processing notification request:`, {
+      title,
+      body,
+      userIdCount: userIds.length,
+      ignoreWeeklyLimit,
+    });
 
-      return res.status(404).json({ message });
+    // Build query to find users with push tokens
+    const query = {
+      _id: { $in: userIds.map((id) => new ObjectId(id)) },
+      pushToken: { $exists: true, $ne: null },
+    };
+
+    // Add weekly limit check if not ignored
+    if (!ignoreWeeklyLimit) {
+      const oneWeekAgo = new Date();
+      oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+      query.lastNotificationSent = { $lt: oneWeekAgo };
     }
 
-    // Send notifications to all found users
-    const notificationPromises = users.map(async (user) => {
+    const users = await User.find(query);
+    console.log(
+      `[Notification Endpoint] Found ${users.length} eligible users with push tokens`
+    );
+
+    let successCount = 0;
+    let failureCount = 0;
+    const errors = [];
+
+    for (const user of users) {
       try {
+        console.log(`[Notification Endpoint] Sending notification to user:`, {
+          userId: user._id,
+          pushToken: user.pushToken.substring(0, 10) + "...",
+        });
+
         await sendNotification(user.pushToken, title, body);
 
-        // Update the lastNotificationSent timestamp for this user
+        // Update last notification timestamp
         await User.findByIdAndUpdate(user._id, {
           lastNotificationSent: new Date(),
         });
 
-        return { success: true, userId: user._id };
+        successCount++;
+        console.log(
+          `[Notification Endpoint] Successfully sent notification to user ${user._id}`
+        );
       } catch (error) {
-        console.error(`Error sending notification to user ${user._id}:`, error);
-        return { success: false, userId: user._id, error: error.message };
+        failureCount++;
+        errors.push({
+          userId: user._id,
+          error: error.message,
+        });
+        console.error(
+          `[Notification Endpoint] Failed to send notification to user ${user._id}:`,
+          error
+        );
       }
-    });
+    }
 
-    const results = await Promise.all(notificationPromises);
-    const successCount = results.filter((r) => r.success).length;
-    const failureCount = results.length - successCount;
-
-    res.status(200).json({
-      message: `Notification sent to ${successCount} users successfully${
-        failureCount > 0 ? `, ${failureCount} failed` : ""
-      }${
-        recentlyNotifiedCount > 0
-          ? `, ${recentlyNotifiedCount} skipped (recently notified)`
-          : ""
-      }`,
-      sentTo: users.map((user) => ({ id: user._id, name: user.name })),
+    console.log(`[Notification Endpoint] Notification summary:`, {
+      totalUsers: users.length,
       successCount,
       failureCount,
-      skippedCount: recentlyNotifiedCount,
-      results,
+      errors: errors.length > 0 ? errors : undefined,
+    });
+
+    res.json({
+      success: true,
+      message: `Notifications sent successfully to ${successCount} users${
+        failureCount > 0 ? `, ${failureCount} failed` : ""
+      }`,
+      stats: {
+        totalUsers: users.length,
+        successCount,
+        failureCount,
+        errors: errors.length > 0 ? errors : undefined,
+      },
     });
   } catch (error) {
-    console.error("Error sending notifications:", error);
-    res.status(500).json({ message: "Server error" });
+    console.error("[Notification Endpoint] Unexpected error:", error);
+    res.status(500).json({ error: "Failed to send notifications" });
   }
 });
 
@@ -2695,21 +2742,21 @@ app.post("/admin/send-nearby-email", async (req, res) => {
       };
 
       try {
-        const emailResult = await transporter.sendMail(mailOptions);
-        console.log(
-          `Email sent to ${user.email} - Message ID: ${emailResult.messageId}`
-        );
+        const result = await sendEmailWithRetry(mailOptions);
 
-        // Update the lastNotificationSent timestamp for this user
-        await User.findByIdAndUpdate(user._id, {
-          lastNotificationSent: new Date(),
-        });
+        if (result.success) {
+          // Update the lastNotificationSent timestamp for this user
+          await User.findByIdAndUpdate(user._id, {
+            lastNotificationSent: new Date(),
+          });
+        }
 
         return {
           userId: user._id,
           email: user.email,
-          success: true,
-          messageId: emailResult.messageId,
+          success: result.success,
+          messageId: result.messageId,
+          error: result.error,
         };
       } catch (error) {
         console.error(`Error sending email to ${user.email}:`, error);
