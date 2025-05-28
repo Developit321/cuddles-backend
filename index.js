@@ -21,6 +21,7 @@ const io = require("socket.io")(http); // Pass the HTTP server instance
 const bcrypt = require("bcryptjs");
 const { sendNotification } = require("./notifications/pushNotifications");
 const { ObjectId } = require("mongodb");
+const { updateUserCountry } = require("./Controllers/userController");
 
 // Map to store user socket connections
 const userSockets = new Map();
@@ -911,12 +912,15 @@ app.get("/profiles", async (req, res) => {
 
     // Fetch only needed fields from current user
     const currentUser = await User.findById(userId)
-      .select("gender Matches crushes profileDislikes")
+      .select("gender Matches crushes profileDislikes location")
       .lean();
 
     if (!currentUser) {
       return res.status(404).json({ message: "User not found" });
     }
+
+    // Get user's country from their location object
+    const userCountry = currentUser.location?.country;
 
     // Convert all ObjectIds to strings for consistent handling
     const userIdStr = userId.toString();
@@ -934,7 +938,7 @@ app.get("/profiles", async (req, res) => {
       mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : id
     );
 
-    // Base query criteria - this properly excludes all profiles we don't want to see
+    // Base query criteria with country filter
     const baseMatch = {
       _id: { $nin: excludedObjectIds },
       gender:
@@ -948,16 +952,10 @@ app.get("/profiles", async (req, res) => {
         $lte: maxAge.toString(),
       },
       profileImages: { $exists: true, $not: { $size: 0 } },
-      $or: [
-        { anonymous: { $exists: false } }, // Include profiles where anonymous field doesn't exist yet
-        { anonymous: false }, // Or where anonymous is explicitly false
-      ],
+      $or: [{ anonymous: { $exists: false } }, { anonymous: false }],
       $and: [
         {
-          $or: [
-            { flagged: { $exists: false } }, // Include profiles where flagged field doesn't exist yet
-            { flagged: { $ne: true } }, // Or where flagged is not true
-          ],
+          $or: [{ flagged: { $exists: false } }, { flagged: { $ne: true } }],
         },
       ],
     };
@@ -969,56 +967,94 @@ app.get("/profiles", async (req, res) => {
       };
     }
 
-    // Sequential approach to fetch profiles
+    // Add country filter if user has a country
+    if (userCountry) {
+      baseMatch["location.country"] = userCountry;
+      console.log(`Filtering profiles from country: ${userCountry}`);
+    }
+
     let profiles = [];
     let hasLocation = false;
 
-    // Step 1: First try to get nearby profiles if location is provided
+    // Try to get nearby profiles with all filters including country
     if (longitude && latitude) {
       try {
-        const parsedLong = parseFloat(longitude);
-        const parsedLat = parseFloat(latitude);
+        const nearbyProfiles = await User.aggregate([
+          {
+            $geoNear: {
+              near: {
+                type: "Point",
+                coordinates: [parseFloat(longitude), parseFloat(latitude)],
+              },
+              distanceField: "distance",
+              maxDistance: 50000, // 50km radius
+              spherical: true,
+              query: baseMatch, // This now includes the country filter
+              distanceMultiplier: 0.001,
+              key: "location",
+            },
+          },
+          { $limit: 20 },
+        ]).option({ maxTimeMS: 5000 });
 
-        if (!isNaN(parsedLong) && !isNaN(parsedLat)) {
-          hasLocation = true;
+        profiles = nearbyProfiles;
+        hasLocation = true;
+        console.log(
+          `Found ${profiles.length} nearby profiles with country filter`
+        );
 
-          // Fetch nearby profiles using geospatial query
-          const nearbyProfiles = await User.aggregate([
+        // If we don't have enough profiles with country filter, try without it
+        if (profiles.length < 20 && userCountry) {
+          delete baseMatch["location.country"];
+          console.log(
+            "Not enough profiles in same country, removing country filter"
+          );
+
+          const additionalProfiles = await User.aggregate([
             {
               $geoNear: {
                 near: {
                   type: "Point",
-                  coordinates: [parsedLong, parsedLat],
+                  coordinates: [parseFloat(longitude), parseFloat(latitude)],
                 },
                 distanceField: "distance",
-                maxDistance: 50000, // 50km radius
+                maxDistance: 50000,
                 spherical: true,
-                query: baseMatch,
-                distanceMultiplier: 0.001, // Convert to kilometers
+                query: baseMatch, // Now without country filter
+                distanceMultiplier: 0.001,
                 key: "location",
               },
             },
-            { $limit: 20 }, // Limit to 20 nearby profiles
-          ]).option({
-            maxTimeMS: 5000,
-          });
+            {
+              $match: {
+                _id: { $nin: profiles.map((p) => p._id) }, // Exclude already found profiles
+              },
+            },
+            { $limit: 20 - profiles.length },
+          ]).option({ maxTimeMS: 5000 });
 
-          console.log(`Found ${nearbyProfiles.length} nearby profiles`);
-          profiles = nearbyProfiles;
+          profiles = [...profiles, ...additionalProfiles];
+          console.log(
+            `Added ${additionalProfiles.length} additional profiles from other countries`
+          );
         }
       } catch (error) {
         console.error("Error in geospatial query:", error);
-        // Continue to other profile types if geospatial query fails
       }
     }
 
-    // Step 2: If we don't have enough profiles, get priority profiles
+    // If we still don't have enough profiles, get additional ones
     if (profiles.length < 20) {
-      // Get IDs of profiles we already have to avoid duplicates
       const existingProfileIds = new Set(profiles.map((p) => p._id.toString()));
       const neededProfiles = 20 - profiles.length;
 
-      // Find priority users that match our criteria and aren't already in results
+      // If we were filtering by country but didn't get enough profiles, remove the country filter
+      if (baseMatch["location.country"]) {
+        delete baseMatch["location.country"];
+        console.log("Removing country filter for additional profiles");
+      }
+
+      // Find priority users
       const priorityProfiles = await User.find({
         _id: { $nin: [...excludedObjectIds, ...existingProfileIds] },
         priority: 1,
@@ -1027,19 +1063,11 @@ app.get("/profiles", async (req, res) => {
         .limit(neededProfiles)
         .lean();
 
-      console.log(`Found ${priorityProfiles.length} priority profiles`);
+      profiles.push(...priorityProfiles);
 
-      // Add priority profiles to our results
-      for (const profile of priorityProfiles) {
-        profiles.push(profile);
-        existingProfileIds.add(profile._id.toString());
-      }
-
-      // Step 3: If we still don't have enough profiles, get newest users
+      // If still need more profiles, get newest users
       if (profiles.length < 20) {
         const neededAfterPriority = 20 - profiles.length;
-
-        // Find newest users that match our criteria and aren't already in results
         const newestProfiles = await User.find({
           _id: { $nin: [...excludedObjectIds, ...existingProfileIds] },
           ...baseMatch,
@@ -1048,29 +1076,20 @@ app.get("/profiles", async (req, res) => {
           .limit(neededAfterPriority)
           .lean();
 
-        console.log(`Found ${newestProfiles.length} newest profiles`);
-
-        // Add newest profiles to our results
         profiles.push(...newestProfiles);
       }
     }
 
-    console.log(`Total profiles found: ${profiles.length}`);
-
     // Apply in-memory shuffle for randomness
     const shuffledProfiles = profiles.sort(() => Math.random() - 0.5);
 
-    // Calculate distances for profiles missing distance field
+    // Calculate distances if location is provided
     if (hasLocation && shuffledProfiles.length > 0) {
       const parsedLong = parseFloat(longitude);
       const parsedLat = parseFloat(latitude);
 
       shuffledProfiles.forEach((profile) => {
-        if (
-          !profile.distance &&
-          profile.location &&
-          profile.location.coordinates
-        ) {
+        if (!profile.distance && profile.location?.coordinates) {
           profile.distance = calculateDistance(
             parsedLat,
             parsedLong,
@@ -1081,16 +1100,14 @@ app.get("/profiles", async (req, res) => {
       });
     }
 
-    // Log gender counts
-    const genderCounts = shuffledProfiles.reduce((counts, profile) => {
-      counts[profile.gender] = (counts[profile.gender] || 0) + 1;
-      return counts;
-    }, {});
-
     return res.status(200).json({
       profiles: shuffledProfiles,
       totalCount: shuffledProfiles.length,
       nearbyCount: shuffledProfiles.filter((p) => p.distance != null).length,
+      userCountry: userCountry || "Unknown",
+      sameCountryCount: shuffledProfiles.filter(
+        (p) => p.location?.country === userCountry
+      ).length,
     });
   } catch (error) {
     console.error("Error fetching user profiles:", error);
@@ -1433,6 +1450,7 @@ app.post("/user/:userId/update-location", async (req, res) => {
       return res.status(400).json({ error: "Invalid coordinates format" });
     }
 
+    // Update user's location
     const user = await User.findByIdAndUpdate(
       userId,
       {
@@ -1443,20 +1461,34 @@ app.post("/user/:userId/update-location", async (req, res) => {
           },
         },
       },
-      { new: true } // Return the updated user document
+      { new: true }
     );
 
     if (!user) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    // Log success and respond
-    console.log("User coordinates updated successfully");
-    return res
-      .status(200)
-      .json({ message: "Location updated successfully", user });
+    // Update the user's country based on coordinates
+    try {
+      const countryResult = await updateUserCountry(userId);
+      console.log("Country updated successfully:", countryResult);
+
+      return res.status(200).json({
+        message: "Location and country updated successfully",
+        user,
+        country: countryResult.country,
+      });
+    } catch (countryError) {
+      console.error("Error updating country:", countryError);
+      // Still return success for location update even if country update fails
+      return res.status(200).json({
+        message: "Location updated successfully, but country update failed",
+        user,
+        countryError: countryError.message,
+      });
+    }
   } catch (error) {
-    console.error("Error updating user's location:", error); // Log any errors
+    console.error("Error updating user's location:", error);
     return res
       .status(500)
       .json({ message: "Error updating user's location", error });
@@ -2813,6 +2845,7 @@ app.get("/admin/users", async (req, res) => {
       email,
       name,
       userId,
+      country,
       sortBy = "createdAt",
       sortOrder = -1,
     } = req.query;
@@ -2865,6 +2898,11 @@ app.get("/admin/users", async (req, res) => {
       query.name = { $regex: name, $options: "i" };
     }
 
+    // Filter by country
+    if (country) {
+      query["location.country"] = { $regex: country, $options: "i" };
+    }
+
     // Calculate pagination
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
@@ -2875,7 +2913,7 @@ app.get("/admin/users", async (req, res) => {
     // Fetch users with query and pagination
     const users = await User.find(query)
       .select(
-        "name email age gender profileImages flagged flagReason priority createdAt pushToken"
+        "name email age gender profileImages flagged flagReason priority createdAt pushToken location.country"
       )
       .sort(sortOptions)
       .skip(skip)
@@ -3107,3 +3145,277 @@ const sendPushNotification = async (receiverId, title, body) => {
     );
   }
 };
+
+// Endpoint to get users with received likes for admin panel
+app.get("/admin/users-with-likes", async (req, res) => {
+  try {
+    const {
+      limit = 20,
+      page = 1,
+      minLikesCount = 0, // Minimum number of likes to include in results
+    } = req.query;
+
+    // Parse and validate parameters
+    const userLimit = parseInt(limit, 10);
+    const currentPage = parseInt(page, 10);
+    const minLikes = parseInt(minLikesCount, 10);
+    const skip = (currentPage - 1) * userLimit;
+
+    // Build the query for users with received likes AND valid push tokens
+    const query = {
+      recievedLikes: { $exists: true, $not: { $size: 0 } },
+      pushToken: { $exists: true, $ne: null, $ne: "" }, // Ensure pushToken exists, isn't null, and isn't empty
+    };
+
+    // Count total users matching the query for pagination info
+    const totalUsers = await User.countDocuments(query);
+
+    // Find users with received likes with pagination
+    const usersWithLikes = await User.find(query)
+      .select("_id name email gender profileImages pushToken recievedLikes")
+      .skip(skip)
+      .limit(userLimit)
+      .lean();
+
+    if (usersWithLikes.length === 0) {
+      return res.status(404).json({
+        message: "No users with received likes and push tokens found",
+        pagination: {
+          total: totalUsers,
+          page: currentPage,
+          limit: userLimit,
+          pages: Math.ceil(totalUsers / userLimit),
+        },
+      });
+    }
+
+    // For each user, get detailed information about who liked them
+    const usersWithLikesData = await Promise.all(
+      usersWithLikes.map(async (user) => {
+        try {
+          // Get users who liked this person
+          const likesDetails = await User.find(
+            { _id: { $in: user.recievedLikes } },
+            {
+              _id: 1,
+              name: 1,
+              gender: 1,
+              profileImages: { $slice: 1 },
+              pushToken: 1,
+            }
+          ).lean();
+
+          return {
+            ...user,
+            likedBy: likesDetails,
+            likesCount: likesDetails.length,
+          };
+        } catch (error) {
+          console.error(
+            `Error fetching like details for user ${user._id}:`,
+            error
+          );
+          return { ...user, likedBy: [], likesCount: 0 };
+        }
+      })
+    );
+
+    // Filter and sort users by likes count
+    const filteredUsers = usersWithLikesData
+      .filter((user) => user.likesCount >= minLikes)
+      .sort((a, b) => b.likesCount - a.likesCount);
+
+    return res.status(200).json({
+      pagination: {
+        total: totalUsers,
+        page: currentPage,
+        limit: userLimit,
+        pages: Math.ceil(totalUsers / userLimit),
+      },
+      totalUsersWithLikes: usersWithLikes.length,
+      usersWithFilteredLikes: filteredUsers.length,
+      users: filteredUsers,
+    });
+  } catch (error) {
+    console.error("Error finding users with received likes:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Endpoint to send push notifications to users with received likes
+app.post("/admin/send-likes-notification", async (req, res) => {
+  try {
+    const {
+      userIds,
+      customMessage,
+      emailSubject,
+      emailTemplate,
+      likesDetails,
+      ignoreWeeklyLimit = false,
+    } = req.body;
+
+    if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({
+        message: "User IDs are required and must be a non-empty array",
+        success: false,
+      });
+    }
+
+    if (!customMessage) {
+      return res.status(400).json({
+        message: "Custom message is required",
+        success: false,
+      });
+    }
+
+    // Track success and failure counts
+    let successCount = 0;
+    let failureCount = 0;
+    let skippedCount = 0;
+    let emailCount = 0;
+    let pushCount = 0;
+
+    // Process each user in the array
+    await Promise.all(
+      userIds.map(async (userId) => {
+        try {
+          // Get the user with their received likes
+          const user = await User.findById(userId)
+            .select("name email pushToken recievedLikes lastNotificationSent")
+            .lean();
+
+          if (!user) {
+            console.log(`User ${userId} not found`);
+            failureCount++;
+            return;
+          }
+
+          // Check if we should skip due to weekly limit
+          if (!ignoreWeeklyLimit && user.lastNotificationSent) {
+            const lastSentDate = new Date(user.lastNotificationSent);
+            const now = new Date();
+            const daysSinceLastNotification = Math.floor(
+              (now - lastSentDate) / (1000 * 60 * 60 * 24)
+            );
+
+            if (daysSinceLastNotification < 7) {
+              console.log(
+                `Skipping user ${userId} due to weekly notification limit`
+              );
+              skippedCount++;
+              return;
+            }
+          }
+
+          // Get the count of likes
+          const likesCount = user.recievedLikes ? user.recievedLikes.length : 0;
+
+          if (likesCount === 0) {
+            console.log(`User ${userId} has no received likes, skipping`);
+            skippedCount++;
+            return;
+          }
+
+          // Track if any notification was sent
+          let notificationSent = false;
+
+          // Send push notification if the user has a push token
+          if (user.pushToken) {
+            try {
+              // Customize the notification message
+              const title = "You have new likes!";
+              const body = customMessage.replace(
+                "{likesCount}",
+                likesCount.toString()
+              );
+
+              await sendNotification(user.pushToken, title, body);
+              pushCount++;
+              notificationSent = true;
+              console.log(`Push notification sent to user ${userId}`);
+            } catch (pushError) {
+              console.error(
+                `Error sending push notification to user ${userId}:`,
+                pushError
+              );
+            }
+          }
+
+          // Send email if emailTemplate is provided and user has an email
+          if (emailTemplate && emailSubject && user.email) {
+            try {
+              // Customize the email content
+              const userName = user.name || "there";
+              const emailBody = emailTemplate
+                .replace(/{name}/g, userName)
+                .replace(/{likesCount}/g, likesCount.toString());
+
+              const mailOptions = {
+                from: "Charlotte from Cuddles <cuddlesquery@gmail.com>",
+                to: user.email,
+                subject: emailSubject.replace(
+                  /{likesCount}/g,
+                  likesCount.toString()
+                ),
+                html: emailBody,
+              };
+
+              const emailResult = await sendEmailWithRetry(mailOptions);
+
+              if (emailResult.success) {
+                emailCount++;
+                notificationSent = true;
+                console.log(
+                  `Email notification sent to user ${userId} at ${user.email}`
+                );
+              } else {
+                console.error(
+                  `Failed to send email to user ${userId}:`,
+                  emailResult.error
+                );
+              }
+            } catch (emailError) {
+              console.error(
+                `Error sending email to user ${userId}:`,
+                emailError
+              );
+            }
+          }
+
+          // If any notification was sent, update the last notification timestamp
+          if (notificationSent) {
+            await User.findByIdAndUpdate(userId, {
+              lastNotificationSent: new Date(),
+            });
+
+            // Increment success count
+            successCount++;
+          } else {
+            failureCount++;
+          }
+        } catch (error) {
+          console.error(`Error sending notification to user ${userId}:`, error);
+          failureCount++;
+        }
+      })
+    );
+
+    // Return the response with counts
+    return res.status(200).json({
+      message: `Notifications processed: ${successCount} sent, ${failureCount} failed, ${skippedCount} skipped (${pushCount} push, ${emailCount} email)`,
+      successCount,
+      failureCount,
+      skippedCount,
+      pushCount,
+      emailCount,
+      success: successCount > 0,
+    });
+  } catch (error) {
+    console.error("Error sending likes notifications:", error);
+    return res.status(500).json({
+      message: "Error sending likes notifications",
+      error: error.message,
+      success: false,
+    });
+  }
+});
