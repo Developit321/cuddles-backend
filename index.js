@@ -938,7 +938,7 @@ app.get("/profiles", async (req, res) => {
       mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : id
     );
 
-    // Base query criteria with country filter
+    // Base query criteria
     const baseMatch = {
       _id: { $nin: excludedObjectIds },
       gender:
@@ -967,50 +967,28 @@ app.get("/profiles", async (req, res) => {
       };
     }
 
-    // Add country filter if user has a country
-    if (userCountry) {
-      baseMatch["location.country"] = userCountry;
-      console.log(`Filtering profiles from country: ${userCountry}`);
-    }
-
     let profiles = [];
     let hasLocation = false;
 
-    // Try to get nearby profiles with all filters including country
-    if (longitude && latitude) {
-      try {
-        const nearbyProfiles = await User.aggregate([
-          {
-            $geoNear: {
-              near: {
-                type: "Point",
-                coordinates: [parseFloat(longitude), parseFloat(latitude)],
-              },
-              distanceField: "distance",
-              maxDistance: 50000, // 50km radius
-              spherical: true,
-              query: baseMatch, // This now includes the country filter
-              distanceMultiplier: 0.001,
-              key: "location",
-            },
-          },
-          { $limit: 20 },
-        ]).option({ maxTimeMS: 5000 });
+    // Function to get profiles with country filter
+    const getProfilesWithCountry = async (countryFilter = true) => {
+      const query = { ...baseMatch };
+      if (countryFilter && userCountry) {
+        // Only add country filter here when we want same country
+        query["location.country"] = userCountry;
+        console.log(`🌍 Attempting to find profiles from ${userCountry}`);
+      } else {
+        // When searching other countries, ensure we get profiles with a country set but not user's country
+        query["location.country"] = { $exists: true, $ne: userCountry };
+        console.log(`🌍 Searching for profiles from other countries`);
+      }
 
-        profiles = nearbyProfiles;
-        hasLocation = true;
-        console.log(
-          `Found ${profiles.length} nearby profiles with country filter`
-        );
+      let countryProfiles = [];
 
-        // If we don't have enough profiles with country filter, try without it
-        if (profiles.length < 20 && userCountry) {
-          delete baseMatch["location.country"];
-          console.log(
-            "Not enough profiles in same country, removing country filter"
-          );
-
-          const additionalProfiles = await User.aggregate([
+      // Try to get nearby profiles first if location is provided
+      if (longitude && latitude) {
+        try {
+          const nearbyProfiles = await User.aggregate([
             {
               $geoNear: {
                 near: {
@@ -1018,66 +996,118 @@ app.get("/profiles", async (req, res) => {
                   coordinates: [parseFloat(longitude), parseFloat(latitude)],
                 },
                 distanceField: "distance",
-                maxDistance: 50000,
+                maxDistance: 50000, // 50km radius
                 spherical: true,
-                query: baseMatch, // Now without country filter
+                query: query,
                 distanceMultiplier: 0.001,
                 key: "location",
               },
             },
-            {
-              $match: {
-                _id: { $nin: profiles.map((p) => p._id) }, // Exclude already found profiles
-              },
-            },
-            { $limit: 20 - profiles.length },
+            { $limit: 20 },
           ]).option({ maxTimeMS: 5000 });
 
-          profiles = [...profiles, ...additionalProfiles];
+          countryProfiles = nearbyProfiles;
+          hasLocation = true;
           console.log(
-            `Added ${additionalProfiles.length} additional profiles from other countries`
+            `📍 Found ${countryProfiles.length} nearby profiles${
+              countryFilter ? ` in ${userCountry}` : ""
+            }`
           );
+        } catch (error) {
+          console.error("❌ Error in geospatial query:", error);
         }
-      } catch (error) {
-        console.error("Error in geospatial query:", error);
-      }
-    }
-
-    // If we still don't have enough profiles, get additional ones
-    if (profiles.length < 20) {
-      const existingProfileIds = new Set(profiles.map((p) => p._id.toString()));
-      const neededProfiles = 20 - profiles.length;
-
-      // If we were filtering by country but didn't get enough profiles, remove the country filter
-      if (baseMatch["location.country"]) {
-        delete baseMatch["location.country"];
-        console.log("Removing country filter for additional profiles");
       }
 
-      // Find priority users
-      const priorityProfiles = await User.find({
-        _id: { $nin: [...excludedObjectIds, ...existingProfileIds] },
-        priority: 1,
-        ...baseMatch,
-      })
-        .limit(neededProfiles)
-        .lean();
+      // If we don't have enough profiles, get priority users from same country/filter
+      if (countryProfiles.length < 20) {
+        const existingProfileIds = new Set(
+          countryProfiles.map((p) => p._id.toString())
+        );
+        const neededProfiles = 20 - countryProfiles.length;
+        console.log(
+          `🎯 Attempting to find ${neededProfiles} priority profiles${
+            countryFilter ? ` in ${userCountry}` : ""
+          }`
+        );
 
-      profiles.push(...priorityProfiles);
-
-      // If still need more profiles, get newest users
-      if (profiles.length < 20) {
-        const neededAfterPriority = 20 - profiles.length;
-        const newestProfiles = await User.find({
+        const priorityProfiles = await User.find({
           _id: { $nin: [...excludedObjectIds, ...existingProfileIds] },
-          ...baseMatch,
+          priority: 1,
+          ...query,
         })
-          .sort({ createdAt: -1 })
-          .limit(neededAfterPriority)
+          .limit(neededProfiles)
           .lean();
 
-        profiles.push(...newestProfiles);
+        countryProfiles.push(...priorityProfiles);
+        console.log(
+          `⭐ Found ${priorityProfiles.length} priority profiles${
+            countryFilter ? ` in ${userCountry}` : ""
+          }`
+        );
+        console.log(
+          `📊 Total profiles after priority: ${countryProfiles.length}`
+        );
       }
+
+      // If still need more profiles, get newest users from same country/filter
+      if (countryProfiles.length < 20) {
+        const existingProfileIds = new Set(
+          countryProfiles.map((p) => p._id.toString())
+        );
+        const neededProfiles = 20 - countryProfiles.length;
+        console.log(
+          `🆕 Attempting to find ${neededProfiles} newest profiles${
+            countryFilter ? ` in ${userCountry}` : ""
+          }`
+        );
+
+        const newestProfiles = await User.find({
+          _id: { $nin: [...excludedObjectIds, ...existingProfileIds] },
+          ...query,
+        })
+          .sort({ createdAt: -1 })
+          .limit(neededProfiles)
+          .lean();
+
+        countryProfiles.push(...newestProfiles);
+        console.log(
+          `📅 Found ${newestProfiles.length} newest profiles${
+            countryFilter ? ` in ${userCountry}` : ""
+          }`
+        );
+        console.log(
+          `📊 Total profiles after newest: ${countryProfiles.length}`
+        );
+      }
+
+      return countryProfiles;
+    };
+
+    // First try to get profiles from the same country
+    if (userCountry) {
+      console.log(`\n🔍 Starting profile search for user in ${userCountry}`);
+      profiles = await getProfilesWithCountry(true);
+    }
+
+    // If we don't have enough profiles from the same country, get profiles from other countries
+    if (profiles.length < 20) {
+      console.log(
+        `\n⚠️ Not enough profiles from ${userCountry} (found ${profiles.length}), searching in other countries`
+      );
+      const otherCountryProfiles = await getProfilesWithCountry(false);
+
+      // Filter out profiles we already have
+      const existingProfileIds = new Set(profiles.map((p) => p._id.toString()));
+      const newProfiles = otherCountryProfiles.filter(
+        (p) => !existingProfileIds.has(p._id.toString())
+      );
+
+      const addedProfiles = newProfiles.slice(0, 20 - profiles.length);
+      profiles.push(...addedProfiles);
+      console.log(
+        `➕ Added ${addedProfiles.length} profiles from other countries`
+      );
+      console.log(`📊 Final total profiles: ${profiles.length}`);
     }
 
     // Apply in-memory shuffle for randomness

@@ -135,6 +135,11 @@ const userSchema = mongoose.Schema(
         required: false,
         default: [0, 0],
       },
+      country: {
+        // Add this field
+        type: String,
+        required: false,
+      },
     },
     conversations: [
       {
