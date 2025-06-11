@@ -1466,7 +1466,6 @@ app.put("/push-notification-token/:userId", async (req, res) => {
 });
 
 // add users location
-
 app.post("/user/:userId/update-location", async (req, res) => {
   try {
     const { userId } = req.params;
@@ -1480,6 +1479,20 @@ app.post("/user/:userId/update-location", async (req, res) => {
       return res.status(400).json({ error: "Invalid coordinates format" });
     }
 
+    // Validate coordinate bounds
+    if (Math.abs(parsedLat) > 90 || Math.abs(parsedLong) > 180) {
+      return res.status(400).json({ error: "Coordinates out of bounds" });
+    }
+
+    // Validate non-zero coordinates
+    if (parsedLong === 0 && parsedLat === 0) {
+      return res.status(400).json({ error: "Invalid zero coordinates" });
+    }
+
+    console.log(
+      `📍 Updating location for user ${userId} - [${parsedLat}, ${parsedLong}]`
+    );
+
     // Update user's location
     const user = await User.findByIdAndUpdate(
       userId,
@@ -1487,7 +1500,7 @@ app.post("/user/:userId/update-location", async (req, res) => {
         $set: {
           location: {
             type: "Point",
-            coordinates: [parsedLong, parsedLat],
+            coordinates: [parsedLong, parsedLat], // MongoDB expects [longitude, latitude]
           },
         },
       },
@@ -1500,8 +1513,9 @@ app.post("/user/:userId/update-location", async (req, res) => {
 
     // Update the user's country based on coordinates
     try {
+      console.log("🌍 Attempting to update country...");
       const countryResult = await updateUserCountry(userId);
-      console.log("Country updated successfully:", countryResult);
+      console.log("✅ Country updated successfully:", countryResult);
 
       return res.status(200).json({
         message: "Location and country updated successfully",
@@ -1509,19 +1523,24 @@ app.post("/user/:userId/update-location", async (req, res) => {
         country: countryResult.country,
       });
     } catch (countryError) {
-      console.error("Error updating country:", countryError);
-      // Still return success for location update even if country update fails
+      console.error("❌ Error updating country:", countryError);
+      // Return detailed error information
       return res.status(200).json({
         message: "Location updated successfully, but country update failed",
         user,
-        countryError: countryError.message,
+        countryError: {
+          message: countryError.message,
+          details: countryError.stack,
+        },
       });
     }
   } catch (error) {
-    console.error("Error updating user's location:", error);
-    return res
-      .status(500)
-      .json({ message: "Error updating user's location", error });
+    console.error("❌ Error updating user's location:", error);
+    return res.status(500).json({
+      message: "Error updating user's location",
+      error: error.message,
+      stack: error.stack,
+    });
   }
 });
 

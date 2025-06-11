@@ -1,9 +1,15 @@
 const User = require("../models/User"); // Use require to import User model
 const NodeGeocoder = require("node-geocoder");
 
-// Initialize the geocoder with OpenStreetMap (free, no API key required)
+// Initialize the geocoder with OpenStreetMap with better configuration
 const geocoder = NodeGeocoder({
   provider: "openstreetmap",
+  httpAdapter: "https",
+  formatter: null,
+  timeout: 5000,
+  headers: {
+    "User-Agent": "Cuddles-App/1.0.4", // Add user agent to avoid rate limiting
+  },
 });
 
 const checkIfAnsweredToday = async (userId) => {
@@ -52,12 +58,43 @@ const updateUserCountry = async (userId) => {
     }
 
     const [longitude, latitude] = user.location.coordinates;
+
+    // Validate coordinates are within reasonable bounds
+    if (Math.abs(latitude) > 90 || Math.abs(longitude) > 180) {
+      console.log(`❌ Coordinates out of bounds: [${latitude}, ${longitude}]`);
+      throw new Error("Coordinates out of bounds");
+    }
+
     console.log(
       `🌍 Processing user ${userId} - Coordinates: [${latitude}, ${longitude}]`
     );
 
-    // Get country from coordinates using geocoder
-    const geoData = await geocoder.reverse({ lat: latitude, lon: longitude });
+    // Add retry logic for geocoding
+    let retries = 3;
+    let geoData = null;
+    let error = null;
+
+    while (retries > 0 && !geoData) {
+      try {
+        // Note: Nominatim expects lat,lon order
+        geoData = await geocoder.reverse({ lat: latitude, lon: longitude });
+        break;
+      } catch (err) {
+        error = err;
+        retries--;
+        if (retries > 0) {
+          // Wait before retrying (exponential backoff)
+          await new Promise((resolve) =>
+            setTimeout(resolve, (3 - retries) * 1000)
+          );
+        }
+      }
+    }
+
+    if (!geoData && error) {
+      console.error("Failed all retry attempts:", error);
+      throw error;
+    }
 
     if (geoData && geoData[0] && geoData[0].country) {
       // Update the user's country
