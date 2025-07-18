@@ -1547,23 +1547,29 @@ app.post("/user/:userId/update-location", async (req, res) => {
 // fetch users that are close to each other due to location
 
 app.get("/nearby-users", async (req, res) => {
-  const MAX_DISTANCE_METERS = 50000;
   try {
     const { longitude, latitude, maxDistance } = req.query;
+    console.log(longitude, latitude, maxDistance);
+
     if (!longitude || !latitude || !maxDistance) {
       return res
         .status(400)
         .json({ error: "Longitude, latitude, and maxDistance are required" });
     }
 
-    // Parse coordinates
+    // Parse coordinates and distance
     const parsedLong = parseFloat(longitude);
     const parsedLat = parseFloat(latitude);
+    const parsedMaxDistance = parseInt(maxDistance) || 5000; // Default to 5km if not valid
 
     // Validate parsed coordinates
     if (isNaN(parsedLong) || isNaN(parsedLat)) {
       return res.status(400).json({ error: "Invalid coordinates format" });
     }
+
+    console.log(
+      `Searching for users within ${parsedMaxDistance}m of [${parsedLong}, ${parsedLat}]`
+    );
 
     const nearbyUsers = await User.aggregate([
       {
@@ -1573,10 +1579,11 @@ app.get("/nearby-users", async (req, res) => {
             coordinates: [parsedLong, parsedLat],
           },
           distanceField: "distance",
-          maxDistance: MAX_DISTANCE_METERS,
+          maxDistance: parsedMaxDistance, // Use the actual parameter instead of hardcoded value
           spherical: true,
           query: {
-            profileImages: { $exists: true, $not: { $size: 0 } },
+            profileImages: { $exists: true, $not: { $size: 0 } }, // Has profile images
+            "location.coordinates": { $exists: true, $not: { $size: 0 } }, // Has location data
           },
           distanceMultiplier: 0.001, // Convert to kilometers
         },
@@ -1585,21 +1592,33 @@ app.get("/nearby-users", async (req, res) => {
         $project: {
           _id: 1,
           name: 1,
+          age: 1,
           location: 1,
           profileImages: 1,
           pushToken: 1,
           distance: 1,
+          verified: 1,
         },
+      },
+      {
+        $limit: 50, // Limit results to prevent overwhelming the frontend
       },
     ]);
 
+    console.log(`Found ${nearbyUsers.length} nearby users`);
+
     if (nearbyUsers.length === 0) {
-      return res.status(404).json({ message: "No users found nearby" });
+      return res
+        .status(200)
+        .json({ message: "No users found nearby", users: [] });
     }
-    res.json({ message: "Nearby users found", users: nearbyUsers });
+
+    res.status(200).json({ message: "Nearby users found", users: nearbyUsers });
   } catch (error) {
     console.error("Error finding nearby users:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res
+      .status(500)
+      .json({ error: "Internal server error", details: error.message });
   }
 });
 

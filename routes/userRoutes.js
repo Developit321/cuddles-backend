@@ -3,6 +3,7 @@ const {
   checkIfAnsweredToday,
   updateUserCountry,
   updateAllUsersCountries,
+  updateUsersWithNoCountry,
 } = require("../Controllers/userController");
 
 const router = express.Router();
@@ -47,6 +48,25 @@ router.post("/update-all-countries", async (req, res) => {
     res.status(500).json({
       success: false,
       message: error.message,
+    });
+  }
+});
+
+// Update countries for users with coordinates but no country
+router.post("/update-missing-countries", async (req, res) => {
+  try {
+    console.log("🚀 Starting update for users with missing countries...");
+    const results = await updateUsersWithNoCountry();
+    res.status(200).json({
+      success: true,
+      ...results,
+    });
+  } catch (error) {
+    console.error("❌ Error in update-missing-countries endpoint:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message,
+      details: error.stack,
     });
   }
 });
