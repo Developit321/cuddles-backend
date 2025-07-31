@@ -3487,3 +3487,81 @@ app.post("/admin/send-likes-notification", async (req, res) => {
     });
   }
 });
+
+// Support email endpoint
+app.post("/support-email", async (req, res) => {
+  try {
+    const { userId, subject, message, userEmail } = req.body;
+
+    if (!userId || !subject || !message || !userEmail) {
+      return res.status(400).json({
+        message: "Missing required fields: userId, subject, message, userEmail",
+      });
+    }
+
+    // Get user details
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const mailOptions = {
+      from: "Cuddles Support <cuddlesquery@gmail.com>",
+      to: "cuddlesquery@gmail.com", // Support team email
+      subject: `Support Request: ${subject}`,
+      html: `
+        <h3>Support Request from Cuddles App</h3>
+        <p><strong>User ID:</strong> ${userId}</p>
+        <p><strong>User Email:</strong> ${userEmail}</p>
+        <p><strong>User Name:</strong> ${user.name || "Not provided"}</p>
+        <p><strong>Subject:</strong> ${subject}</p>
+        <p><strong>Message:</strong></p>
+        <p>${message.replace(/\n/g, "<br>")}</p>
+        <hr>
+        <p><em>This email was sent from the Cuddles mobile app support form.</em></p>
+      `,
+    };
+
+    const result = await sendEmailWithRetry(mailOptions);
+
+    if (result.success) {
+      // Send confirmation email to user
+      const confirmationMailOptions = {
+        from: "Cuddles Support <cuddlesquery@gmail.com>",
+        to: userEmail,
+        subject: "Support Request Received - Cuddles",
+        html: `
+          <h3>Thank you for contacting Cuddles Support!</h3>
+          <p>We have received your support request and will get back to you as soon as possible.</p>
+          <p><strong>Your request details:</strong></p>
+          <p><strong>Subject:</strong> ${subject}</p>
+          <p><strong>Message:</strong></p>
+          <p>${message.replace(/\n/g, "<br>")}</p>
+          <hr>
+          <p>If you have any urgent concerns, please don't hesitate to reach out to us directly.</p>
+          <p>Best regards,<br>The Cuddles Team</p>
+        `,
+      };
+
+      await sendEmailWithRetry(confirmationMailOptions);
+
+      res.status(200).json({
+        message: "Support request sent successfully",
+        success: true,
+      });
+    } else {
+      res.status(500).json({
+        message: "Failed to send support request",
+        error: result.error,
+        success: false,
+      });
+    }
+  } catch (error) {
+    console.error("Error sending support email:", error);
+    res.status(500).json({
+      message: "Error sending support request",
+      error: error.message,
+      success: false,
+    });
+  }
+});
