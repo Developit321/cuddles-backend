@@ -524,11 +524,18 @@ const secretKey = generateSecreteKey();
 app.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-    console.log(email);
+    console.log("Login attempt for email:", email);
+
     // Find the user by email
     const user = await User.findOne({ email });
     if (!user) {
       console.log("no user ");
+      return res.status(401).json({ message: "Invalid email or password" });
+    }
+
+    // Check if password is null
+    if (!user.password) {
+      console.log("User has no password set");
       return res.status(401).json({ message: "Invalid email or password" });
     }
 
