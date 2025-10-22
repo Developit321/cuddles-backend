@@ -2589,6 +2589,169 @@ app.put("/users/:userId/flag", async (req, res) => {
   }
 });
 
+// Endpoint to get total count of flagged profiles
+app.get("/admin/flagged-profiles/count", async (req, res) => {
+  try {
+    // Count all users where flagged is true
+    const totalFlagged = await User.countDocuments({ flagged: true });
+
+    return res.status(200).json({
+      message: "Flagged profiles count retrieved successfully",
+      totalFlagged: totalFlagged,
+    });
+  } catch (error) {
+    console.error("Error counting flagged profiles:", error);
+    return res.status(500).json({
+      message: "Error counting flagged profiles",
+      error: error.message,
+    });
+  }
+});
+
+// Endpoint to get all flagged profiles with pagination
+app.get("/admin/flagged-profiles", async (req, res) => {
+  try {
+    const {
+      page = 1,
+      limit = 20,
+      sortBy = "createdAt",
+      sortOrder = -1,
+    } = req.query;
+
+    // Calculate pagination
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    // Prepare sort options
+    const sortOptions = {};
+    sortOptions[sortBy] = parseInt(sortOrder);
+
+    // Find all flagged users
+    const flaggedUsers = await User.find({ flagged: true })
+      .select(
+        "name email age gender profileImages flagged flagReason createdAt pushToken location.country"
+      )
+      .sort(sortOptions)
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    // Get total count for pagination
+    const totalFlagged = await User.countDocuments({ flagged: true });
+
+    return res.status(200).json({
+      users: flaggedUsers,
+      totalUsers: totalFlagged,
+      totalPages: Math.ceil(totalFlagged / parseInt(limit)),
+      currentPage: parseInt(page),
+      message: "Flagged profiles retrieved successfully",
+    });
+  } catch (error) {
+    console.error("Error fetching flagged profiles:", error);
+    return res.status(500).json({
+      message: "Error fetching flagged profiles",
+      error: error.message,
+    });
+  }
+});
+
+// Endpoint to bulk delete multiple users
+app.post("/admin/users/bulk-delete", async (req, res) => {
+  try {
+    const { userIds } = req.body;
+
+    // Validate input
+    if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({
+        message: "User IDs array is required and must not be empty",
+      });
+    }
+
+    console.log(`Attempting to delete ${userIds.length} users`);
+
+    // Validate all IDs are valid ObjectIds
+    const validIds = userIds.filter((id) =>
+      mongoose.Types.ObjectId.isValid(id)
+    );
+
+    if (validIds.length !== userIds.length) {
+      return res.status(400).json({
+        message: "Some user IDs are invalid",
+        invalidCount: userIds.length - validIds.length,
+      });
+    }
+
+    // Convert to ObjectIds
+    const objectIds = validIds.map((id) => new mongoose.Types.ObjectId(id));
+
+    // Delete multiple users
+    const result = await User.deleteMany({ _id: { $in: objectIds } });
+
+    console.log(`Successfully deleted ${result.deletedCount} users`);
+
+    return res.status(200).json({
+      message: `Successfully deleted ${result.deletedCount} user(s)`,
+      deletedCount: result.deletedCount,
+      requestedCount: userIds.length,
+    });
+  } catch (error) {
+    console.error("Error bulk deleting users:", error);
+    return res.status(500).json({
+      message: "Error deleting users",
+      error: error.message,
+    });
+  }
+});
+
+// Endpoint to bulk unflag multiple users
+app.post("/admin/users/bulk-unflag", async (req, res) => {
+  try {
+    const { userIds } = req.body;
+
+    // Validate input
+    if (!userIds || !Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({
+        message: "User IDs array is required and must not be empty",
+      });
+    }
+
+    console.log(`Attempting to unflag ${userIds.length} users`);
+
+    // Validate all IDs are valid ObjectIds
+    const validIds = userIds.filter((id) =>
+      mongoose.Types.ObjectId.isValid(id)
+    );
+
+    if (validIds.length !== userIds.length) {
+      return res.status(400).json({
+        message: "Some user IDs are invalid",
+        invalidCount: userIds.length - validIds.length,
+      });
+    }
+
+    // Convert to ObjectIds
+    const objectIds = validIds.map((id) => new mongoose.Types.ObjectId(id));
+
+    // Update multiple users to unflag them
+    const result = await User.updateMany(
+      { _id: { $in: objectIds } },
+      { $set: { flagged: false, flagReason: "" } }
+    );
+
+    console.log(`Successfully unflagged ${result.modifiedCount} users`);
+
+    return res.status(200).json({
+      message: `Successfully unflagged ${result.modifiedCount} user(s)`,
+      unflaggedCount: result.modifiedCount,
+      requestedCount: userIds.length,
+    });
+  } catch (error) {
+    console.error("Error bulk unflagging users:", error);
+    return res.status(500).json({
+      message: "Error unflagging users",
+      error: error.message,
+    });
+  }
+});
+
 // Endpoint to get users with location data and their nearby users
 app.get("/users-with-nearby", async (req, res) => {
   try {
