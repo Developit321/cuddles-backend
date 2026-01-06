@@ -1,5 +1,6 @@
 const User = require("../models/User"); // Use require to import User model
 const NodeGeocoder = require("node-geocoder");
+const readline = require("readline");
 
 // Initialize the geocoder with OpenStreetMap with better configuration
 const geocoder = NodeGeocoder({
@@ -11,6 +12,21 @@ const geocoder = NodeGeocoder({
     "User-Agent": "Cuddles-App/1.0.4", // Add user agent to avoid rate limiting
   },
 });
+
+// Helper function to prompt user for confirmation
+const promptUser = (question) => {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.toLowerCase().trim());
+    });
+  });
+};
 
 const checkIfAnsweredToday = async (userId) => {
   const now = new Date();
@@ -295,6 +311,30 @@ const updateUsersWithNoCountry = async () => {
         },
       };
     }
+
+    // Show count and prompt for confirmation
+    console.log(`\n⚠️  Found ${users.length} users with coordinates but no country set.`);
+    console.log(`📅 Date Range: ${results.dateRange.newest} to ${results.dateRange.oldest}\n`);
+    
+    const answer = await promptUser(
+      `Do you want to proceed with updating countries for these ${users.length} users? (yes/no): `
+    );
+
+    if (answer !== "yes" && answer !== "y") {
+      console.log("\n❌ Operation cancelled by user.");
+      return {
+        ...results,
+        cancelled: true,
+        message: "Operation cancelled by user",
+        databaseStats: {
+          totalUsers: totalUsersCount,
+          usersWithCoordinates,
+          usersWithCountry,
+        },
+      };
+    }
+
+    console.log("\n✅ Proceeding with country updates...\n");
 
     console.log(
       `\n🚀 Beginning processing of ${users.length} users (newest to oldest)...`
