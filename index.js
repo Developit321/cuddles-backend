@@ -9,6 +9,8 @@ const Report = require("./models/Report");
 const SharedQuestion = require("./models/SharedQuestion");
 const Question = require("./models/ Question");
 const Message = require("./models/message");
+const Event = require("./models/Event");
+const EventMessage = require("./models/EventMessage");
 const jwt = require("jsonwebtoken");
 const cloudinary = require("cloudinary");
 const app = express();
@@ -122,6 +124,199 @@ io.on("connection", (socket) => {
       console.log(`Message sent to group ${groupId}:`, message);
     } catch (error) {
       console.error("Error sending group message:", error);
+    }
+  });
+
+  // ============================================================
+  // EVENT CHAT SOCKET EVENTS (Open Tables)
+  // ============================================================
+
+  // Join event chat room
+  socket.on("joinEventChat", async ({ userId, eventId }) => {
+    try {
+      // Verify user is a participant of the event
+      const event = await Event.findById(eventId);
+      if (!event) {
+        socket.emit("joinEventChatError", {
+          status: 404,
+          message: "Event not found",
+        });
+        return;
+      }
+
+      const isParticipant = event.participants.some(
+        (p) => p.userId.toString() === userId
+      );
+      if (!isParticipant) {
+        socket.emit("joinEventChatError", {
+          status: 403,
+          message: "Only participants can join event chat",
+        });
+        return;
+      }
+
+      // Join the event chat room
+      const roomName = `event_${eventId}`;
+      socket.join(roomName);
+
+      // Store the event room mapping for this socket
+      if (!socket.eventRooms) {
+        socket.eventRooms = new Set();
+      }
+      socket.eventRooms.add(roomName);
+
+      socket.emit("joinEventChatSuccess", {
+        status: 200,
+        eventId,
+        message: `Joined event chat successfully`,
+      });
+
+      console.log(`User ${userId} joined event chat: ${eventId}`);
+    } catch (error) {
+      console.error("Error joining event chat:", error);
+      socket.emit("joinEventChatError", {
+        status: 500,
+        message: "Error joining event chat",
+      });
+    }
+  });
+
+  // Leave event chat room
+  socket.on("leaveEventChat", ({ eventId }) => {
+    const roomName = `event_${eventId}`;
+    socket.leave(roomName);
+
+    if (socket.eventRooms) {
+      socket.eventRooms.delete(roomName);
+    }
+
+    socket.emit("leaveEventChatSuccess", {
+      status: 200,
+      eventId,
+      message: "Left event chat successfully",
+    });
+  });
+
+  // Send message to event chat
+  socket.on(
+    "sendEventMessage",
+    async ({ senderId, eventId, message, type = "text", image }) => {
+      try {
+        // Verify user is a participant
+        const event = await Event.findById(eventId);
+        if (!event) {
+          socket.emit("sendEventMessageError", {
+            status: 404,
+            message: "Event not found",
+          });
+          return;
+        }
+
+        const isParticipant = event.participants.some(
+          (p) => p.userId.toString() === senderId
+        );
+        if (!isParticipant) {
+          socket.emit("sendEventMessageError", {
+            status: 403,
+            message: "Only participants can send messages",
+          });
+          return;
+        }
+
+        // Create and save the message
+        const newEventMessage = new EventMessage({
+          eventId,
+          senderId,
+          message: type === "text" ? message : undefined,
+          type,
+          image: type === "image" ? image : undefined,
+          createdAt: new Date(),
+        });
+
+        await newEventMessage.save();
+
+        // Populate sender info
+        const populatedMessage = await EventMessage.findById(
+          newEventMessage._id
+        ).populate("senderId", "name profileImages");
+
+        // Emit to all users in the event room
+        const roomName = `event_${eventId}`;
+        io.to(roomName).emit("receiveEventMessage", {
+          ...populatedMessage.toObject(),
+          eventId,
+        });
+
+        console.log(`Event message sent to ${roomName}:`, message || "[image]");
+
+        // Send push notifications to participants not in the room
+        const sender = await User.findById(senderId).select("name");
+        const participantsToNotify = await User.find({
+          _id: {
+            $in: event.participants
+              .filter((p) => p.userId.toString() !== senderId)
+              .map((p) => p.userId),
+          },
+          pushToken: { $exists: true, $ne: null },
+        }).select("pushToken");
+
+        const notificationMessage =
+          type === "image"
+            ? `${sender.name} sent an image`
+            : message.length > 50
+            ? `${message.substring(0, 50)}...`
+            : message;
+
+        for (const participant of participantsToNotify) {
+          try {
+            await sendNotification(
+              participant.pushToken,
+              `${event.title}`,
+              `${sender.name}: ${notificationMessage}`
+            );
+          } catch (notifError) {
+            console.error(
+              "Error sending event message notification:",
+              notifError
+            );
+          }
+        }
+      } catch (error) {
+        console.error("Error sending event message:", error);
+        socket.emit("sendEventMessageError", {
+          status: 500,
+          message: "Error sending message",
+        });
+      }
+    }
+  );
+
+  // Send system message to event chat (e.g., "John joined the table")
+  socket.on("sendEventSystemMessage", async ({ eventId, message }) => {
+    try {
+      const event = await Event.findById(eventId);
+      if (!event) return;
+
+      // Create system message
+      const systemMessage = new EventMessage({
+        eventId,
+        senderId: event.hostId, // Use host as sender for system messages
+        message,
+        type: "system",
+        createdAt: new Date(),
+      });
+
+      await systemMessage.save();
+
+      // Emit to event room
+      const roomName = `event_${eventId}`;
+      io.to(roomName).emit("receiveEventMessage", {
+        ...systemMessage.toObject(),
+        eventId,
+        isSystem: true,
+      });
+    } catch (error) {
+      console.error("Error sending system message:", error);
     }
   });
 
@@ -3732,6 +3927,1032 @@ app.post("/support-email", async (req, res) => {
       message: "Error sending support request",
       error: error.message,
       success: false,
+    });
+  }
+});
+
+// ============================================================
+// OPEN TABLES / EVENTS ENDPOINTS
+// ============================================================
+
+// Helper function to update event status based on time
+const updateEventStatus = async (event) => {
+  const now = new Date();
+  let newStatus = event.status;
+
+  if (event.status === "cancelled" || event.status === "ended") {
+    return event;
+  }
+
+  // Check if event should be live
+  if (event.startTime <= now && event.status === "upcoming") {
+    newStatus = "live";
+  }
+
+  // Check if event should be ended
+  if (event.endTime && event.endTime <= now) {
+    newStatus = "ended";
+  }
+
+  // Check if event is full
+  const goingCount = event.participants.filter(
+    (p) => p.status === "going" || p.status === "checked_in"
+  ).length;
+  if (goingCount >= event.capacity && newStatus !== "ended") {
+    newStatus = "full";
+  } else if (goingCount < event.capacity && event.status === "full") {
+    newStatus = event.startTime <= now ? "live" : "upcoming";
+  }
+
+  if (newStatus !== event.status) {
+    event.status = newStatus;
+    await event.save();
+  }
+
+  return event;
+};
+
+// Create new event
+app.post("/events", async (req, res) => {
+  try {
+    const {
+      hostId,
+      title,
+      description,
+      location,
+      coverImage,
+      startTime,
+      endTime,
+      capacity,
+      tags,
+    } = req.body;
+
+    // Validate required fields
+    if (!hostId || !title || !location || !startTime) {
+      return res.status(400).json({
+        message: "Missing required fields: hostId, title, location, startTime",
+      });
+    }
+
+    // Validate location structure
+    if (!location.coordinates || !location.name) {
+      return res.status(400).json({
+        message: "Location must include coordinates and name",
+      });
+    }
+
+    // Validate startTime is in the future
+    if (new Date(startTime) <= new Date()) {
+      return res.status(400).json({
+        message: "Start time must be in the future",
+      });
+    }
+
+    // Validate capacity
+    if (capacity && (capacity < 1 || capacity > 6)) {
+      return res.status(400).json({
+        message: "Capacity must be between 1 and 6",
+      });
+    }
+
+    // Check if host exists
+    const host = await User.findById(hostId);
+    if (!host) {
+      return res.status(404).json({ message: "Host user not found" });
+    }
+
+    // Create the event
+    const newEvent = new Event({
+      hostId,
+      title,
+      description,
+      location: {
+        type: "Point",
+        coordinates: location.coordinates,
+        name: location.name,
+        address: location.address,
+      },
+      coverImage,
+      startTime: new Date(startTime),
+      endTime: endTime ? new Date(endTime) : null,
+      capacity: capacity || 6,
+      tags: tags || [],
+      participants: [
+        {
+          userId: hostId,
+          status: "going",
+          joinedAt: new Date(),
+        },
+      ],
+      status: "upcoming",
+    });
+
+    await newEvent.save();
+
+    // Populate host info for response
+    const populatedEvent = await Event.findById(newEvent._id).populate(
+      "hostId",
+      "name profileImages"
+    );
+
+    res.status(201).json({
+      message: "Event created successfully",
+      event: populatedEvent,
+    });
+  } catch (error) {
+    console.error("Error creating event:", error);
+    res.status(500).json({
+      message: "Error creating event",
+      error: error.message,
+    });
+  }
+});
+
+// Update event (host only)
+app.put("/events/:eventId", async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const {
+      userId,
+      title,
+      description,
+      startTime,
+      endTime,
+      capacity,
+      tags,
+      coverImage,
+    } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(eventId)) {
+      return res.status(400).json({ message: "Invalid event ID format" });
+    }
+
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    // Check if user is the host
+    if (event.hostId.toString() !== userId) {
+      return res
+        .status(403)
+        .json({ message: "Only the host can update this event" });
+    }
+
+    // Don't allow updates to ended or cancelled events
+    if (event.status === "ended" || event.status === "cancelled") {
+      return res
+        .status(400)
+        .json({ message: "Cannot update ended or cancelled events" });
+    }
+
+    // Update allowed fields
+    if (title) event.title = title;
+    if (description !== undefined) event.description = description;
+    if (startTime) event.startTime = new Date(startTime);
+    if (endTime) event.endTime = new Date(endTime);
+    if (capacity && capacity >= 1 && capacity <= 6) event.capacity = capacity;
+    if (tags) event.tags = tags;
+    if (coverImage !== undefined) event.coverImage = coverImage;
+
+    await event.save();
+
+    // Notify participants of update
+    const participantsWithTokens = await User.find({
+      _id: { $in: event.participants.map((p) => p.userId) },
+      pushToken: { $exists: true, $ne: null },
+    }).select("pushToken");
+
+    for (const participant of participantsWithTokens) {
+      if (participant._id.toString() !== userId) {
+        try {
+          await sendNotification(
+            participant.pushToken,
+            "Event Updated",
+            `"${event.title}" has been updated by the host.`
+          );
+        } catch (notifError) {
+          console.error("Error sending notification:", notifError);
+        }
+      }
+    }
+
+    const updatedEvent = await Event.findById(eventId)
+      .populate("hostId", "name profileImages")
+      .populate("participants.userId", "name profileImages");
+
+    res.status(200).json({
+      message: "Event updated successfully",
+      event: updatedEvent,
+    });
+  } catch (error) {
+    console.error("Error updating event:", error);
+    res.status(500).json({
+      message: "Error updating event",
+      error: error.message,
+    });
+  }
+});
+
+// Cancel/Delete event (host only)
+app.delete("/events/:eventId", async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { userId } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(eventId)) {
+      return res.status(400).json({ message: "Invalid event ID format" });
+    }
+
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    // Check if user is the host
+    if (event.hostId.toString() !== userId) {
+      return res
+        .status(403)
+        .json({ message: "Only the host can cancel this event" });
+    }
+
+    // Mark as cancelled instead of deleting
+    event.status = "cancelled";
+    await event.save();
+
+    // Notify participants
+    const participantsWithTokens = await User.find({
+      _id: { $in: event.participants.map((p) => p.userId) },
+      pushToken: { $exists: true, $ne: null },
+    }).select("pushToken");
+
+    for (const participant of participantsWithTokens) {
+      if (participant._id.toString() !== userId) {
+        try {
+          await sendNotification(
+            participant.pushToken,
+            "Event Cancelled",
+            `"${event.title}" has been cancelled by the host.`
+          );
+        } catch (notifError) {
+          console.error("Error sending notification:", notifError);
+        }
+      }
+    }
+
+    res.status(200).json({ message: "Event cancelled successfully" });
+  } catch (error) {
+    console.error("Error cancelling event:", error);
+    res.status(500).json({
+      message: "Error cancelling event",
+      error: error.message,
+    });
+  }
+});
+
+// Get nearby events
+app.get("/events/nearby", async (req, res) => {
+  try {
+    const { latitude, longitude, radius = 50000, userId } = req.query;
+
+    if (!latitude || !longitude) {
+      return res.status(400).json({
+        message: "Latitude and longitude are required",
+      });
+    }
+
+    const parsedLat = parseFloat(latitude);
+    const parsedLng = parseFloat(longitude);
+    const parsedRadius = parseInt(radius);
+
+    if (isNaN(parsedLat) || isNaN(parsedLng)) {
+      return res.status(400).json({ message: "Invalid coordinates format" });
+    }
+
+    // Get blocked users list if userId provided
+    let blockedUserIds = [];
+    if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+      const currentUser = await User.findById(userId).select("blockedBy");
+      if (currentUser) {
+        blockedUserIds = currentUser.blockedBy.map((id) => id.toString());
+      }
+    }
+
+    const nearbyEvents = await Event.aggregate([
+      {
+        $geoNear: {
+          near: {
+            type: "Point",
+            coordinates: [parsedLng, parsedLat],
+          },
+          distanceField: "distance",
+          maxDistance: parsedRadius,
+          spherical: true,
+          query: {
+            status: { $in: ["upcoming", "live"] },
+            hostId: {
+              $nin: blockedUserIds.map((id) => new mongoose.Types.ObjectId(id)),
+            },
+          },
+          distanceMultiplier: 0.001, // Convert to km
+        },
+      },
+      {
+        $lookup: {
+          from: "users",
+          localField: "hostId",
+          foreignField: "_id",
+          as: "host",
+          pipeline: [{ $project: { name: 1, profileImages: 1 } }],
+        },
+      },
+      {
+        $unwind: "$host",
+      },
+      {
+        $addFields: {
+          participantCount: { $size: "$participants" },
+        },
+      },
+      {
+        $sort: { startTime: 1 },
+      },
+      {
+        $limit: 50,
+      },
+    ]);
+
+    // Update status for each event if needed
+    for (let event of nearbyEvents) {
+      const eventDoc = await Event.findById(event._id);
+      if (eventDoc) {
+        await updateEventStatus(eventDoc);
+      }
+    }
+
+    res.status(200).json({
+      message: "Nearby events found",
+      events: nearbyEvents,
+      count: nearbyEvents.length,
+    });
+  } catch (error) {
+    console.error("Error fetching nearby events:", error);
+    res.status(500).json({
+      message: "Error fetching nearby events",
+      error: error.message,
+    });
+  }
+});
+
+// Search events by title/tags
+app.get("/events/search", async (req, res) => {
+  try {
+    const {
+      q,
+      tags,
+      latitude,
+      longitude,
+      userId,
+      page = 1,
+      limit = 20,
+    } = req.query;
+
+    const query = {
+      status: { $in: ["upcoming", "live"] },
+    };
+
+    // Search by title or description
+    if (q) {
+      query.$or = [
+        { title: { $regex: q, $options: "i" } },
+        { description: { $regex: q, $options: "i" } },
+        { "location.name": { $regex: q, $options: "i" } },
+      ];
+    }
+
+    // Filter by tags
+    if (tags) {
+      const tagArray = Array.isArray(tags) ? tags : tags.split(",");
+      query.tags = { $in: tagArray };
+    }
+
+    // Exclude blocked users
+    if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+      const currentUser = await User.findById(userId).select("blockedBy");
+      if (currentUser && currentUser.blockedBy.length > 0) {
+        query.hostId = { $nin: currentUser.blockedBy };
+      }
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    let events;
+
+    // If location provided, sort by distance
+    if (latitude && longitude) {
+      const parsedLat = parseFloat(latitude);
+      const parsedLng = parseFloat(longitude);
+
+      events = await Event.aggregate([
+        {
+          $geoNear: {
+            near: {
+              type: "Point",
+              coordinates: [parsedLng, parsedLat],
+            },
+            distanceField: "distance",
+            spherical: true,
+            query: query,
+            distanceMultiplier: 0.001,
+          },
+        },
+        { $skip: skip },
+        { $limit: parseInt(limit) },
+        {
+          $lookup: {
+            from: "users",
+            localField: "hostId",
+            foreignField: "_id",
+            as: "host",
+            pipeline: [{ $project: { name: 1, profileImages: 1 } }],
+          },
+        },
+        { $unwind: "$host" },
+      ]);
+    } else {
+      events = await Event.find(query)
+        .populate("hostId", "name profileImages")
+        .sort({ startTime: 1 })
+        .skip(skip)
+        .limit(parseInt(limit));
+    }
+
+    const total = await Event.countDocuments(query);
+
+    res.status(200).json({
+      events,
+      total,
+      page: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit)),
+    });
+  } catch (error) {
+    console.error("Error searching events:", error);
+    res.status(500).json({
+      message: "Error searching events",
+      error: error.message,
+    });
+  }
+});
+
+// Get user's events (hosting + joined)
+app.get("/events/user/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { type = "all" } = req.query; // 'hosting', 'joined', 'all'
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Invalid user ID format" });
+    }
+
+    let query = {};
+
+    if (type === "hosting") {
+      query = { hostId: userId };
+    } else if (type === "joined") {
+      query = {
+        "participants.userId": userId,
+        hostId: { $ne: userId },
+      };
+    } else {
+      query = {
+        $or: [{ hostId: userId }, { "participants.userId": userId }],
+      };
+    }
+
+    const events = await Event.find(query)
+      .populate("hostId", "name profileImages")
+      .populate("participants.userId", "name profileImages")
+      .sort({ startTime: -1 });
+
+    // Update statuses
+    for (let event of events) {
+      await updateEventStatus(event);
+    }
+
+    res.status(200).json({
+      events,
+      count: events.length,
+    });
+  } catch (error) {
+    console.error("Error fetching user events:", error);
+    res.status(500).json({
+      message: "Error fetching user events",
+      error: error.message,
+    });
+  }
+});
+
+// Join event
+app.post("/events/:eventId/join", async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { userId, status = "interested" } = req.body;
+
+    if (
+      !mongoose.Types.ObjectId.isValid(eventId) ||
+      !mongoose.Types.ObjectId.isValid(userId)
+    ) {
+      return res.status(400).json({ message: "Invalid ID format" });
+    }
+
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    // Update event status first
+    await updateEventStatus(event);
+
+    // Check if event is joinable
+    if (event.status === "ended" || event.status === "cancelled") {
+      return res
+        .status(400)
+        .json({ message: "Cannot join ended or cancelled events" });
+    }
+
+    if (event.status === "full") {
+      return res.status(400).json({ message: "Event is full" });
+    }
+
+    // Check if user is already a participant
+    const existingParticipant = event.participants.find(
+      (p) => p.userId.toString() === userId
+    );
+    if (existingParticipant) {
+      return res
+        .status(400)
+        .json({ message: "You have already joined this event" });
+    }
+
+    // Check if user is blocked by host
+    const host = await User.findById(event.hostId).select("blockedBy");
+    if (host && host.blockedBy.includes(userId)) {
+      return res.status(403).json({ message: "You cannot join this event" });
+    }
+
+    // Add user as participant
+    event.participants.push({
+      userId,
+      status: status,
+      joinedAt: new Date(),
+    });
+
+    // Update event status if now full
+    const goingCount = event.participants.filter(
+      (p) => p.status === "going" || p.status === "checked_in"
+    ).length;
+    if (goingCount >= event.capacity) {
+      event.status = "full";
+    }
+
+    await event.save();
+
+    // Notify host
+    const hostUser = await User.findById(event.hostId).select("pushToken name");
+    const joiningUser = await User.findById(userId).select("name");
+
+    if (hostUser && hostUser.pushToken) {
+      try {
+        await sendNotification(
+          hostUser.pushToken,
+          "New Participant",
+          `${joiningUser.name} joined your event "${event.title}"`
+        );
+      } catch (notifError) {
+        console.error("Error sending notification:", notifError);
+      }
+    }
+
+    const updatedEvent = await Event.findById(eventId)
+      .populate("hostId", "name profileImages")
+      .populate("participants.userId", "name profileImages");
+
+    res.status(200).json({
+      message: "Successfully joined event",
+      event: updatedEvent,
+    });
+  } catch (error) {
+    console.error("Error joining event:", error);
+    res.status(500).json({
+      message: "Error joining event",
+      error: error.message,
+    });
+  }
+});
+
+// Update RSVP status
+app.put("/events/:eventId/rsvp", async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { userId, status } = req.body;
+
+    if (!["interested", "going", "checked_in"].includes(status)) {
+      return res.status(400).json({
+        message: "Invalid status. Must be: interested, going, or checked_in",
+      });
+    }
+
+    if (
+      !mongoose.Types.ObjectId.isValid(eventId) ||
+      !mongoose.Types.ObjectId.isValid(userId)
+    ) {
+      return res.status(400).json({ message: "Invalid ID format" });
+    }
+
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    // Find participant
+    const participantIndex = event.participants.findIndex(
+      (p) => p.userId.toString() === userId
+    );
+    if (participantIndex === -1) {
+      return res
+        .status(404)
+        .json({ message: "You are not a participant of this event" });
+    }
+
+    // Update status
+    event.participants[participantIndex].status = status;
+
+    // Update event status if needed
+    const goingCount = event.participants.filter(
+      (p) => p.status === "going" || p.status === "checked_in"
+    ).length;
+
+    if (goingCount >= event.capacity && event.status !== "ended") {
+      event.status = "full";
+    } else if (goingCount < event.capacity && event.status === "full") {
+      const now = new Date();
+      event.status = event.startTime <= now ? "live" : "upcoming";
+    }
+
+    await event.save();
+
+    const updatedEvent = await Event.findById(eventId)
+      .populate("hostId", "name profileImages")
+      .populate("participants.userId", "name profileImages");
+
+    res.status(200).json({
+      message: "RSVP status updated",
+      event: updatedEvent,
+    });
+  } catch (error) {
+    console.error("Error updating RSVP:", error);
+    res.status(500).json({
+      message: "Error updating RSVP",
+      error: error.message,
+    });
+  }
+});
+
+// Check-in to event (validates location)
+app.post("/events/:eventId/check-in", async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { userId, latitude, longitude } = req.body;
+
+    if (
+      !mongoose.Types.ObjectId.isValid(eventId) ||
+      !mongoose.Types.ObjectId.isValid(userId)
+    ) {
+      return res.status(400).json({ message: "Invalid ID format" });
+    }
+
+    if (!latitude || !longitude) {
+      return res
+        .status(400)
+        .json({ message: "Location is required for check-in" });
+    }
+
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    // Update event status
+    await updateEventStatus(event);
+
+    // Check if event is live
+    if (event.status !== "live" && event.status !== "full") {
+      return res.status(400).json({
+        message: "Check-in is only available for live events",
+      });
+    }
+
+    // Find participant
+    const participantIndex = event.participants.findIndex(
+      (p) => p.userId.toString() === userId
+    );
+    if (participantIndex === -1) {
+      return res
+        .status(404)
+        .json({ message: "You are not a participant of this event" });
+    }
+
+    // Calculate distance using existing helper
+    const userLat = parseFloat(latitude);
+    const userLng = parseFloat(longitude);
+    const eventLat = event.location.coordinates[1];
+    const eventLng = event.location.coordinates[0];
+
+    const distance = calculateDistance(userLat, userLng, eventLat, eventLng);
+    const distanceInMeters = distance * 1000;
+
+    if (distanceInMeters > event.checkInRadius) {
+      return res.status(400).json({
+        message: `You must be within ${
+          event.checkInRadius
+        }m of the event location to check in. You are ${Math.round(
+          distanceInMeters
+        )}m away.`,
+      });
+    }
+
+    // Update participant status to checked_in
+    event.participants[participantIndex].status = "checked_in";
+    await event.save();
+
+    // Notify other participants
+    const otherParticipants = await User.find({
+      _id: {
+        $in: event.participants
+          .filter((p) => p.userId.toString() !== userId)
+          .map((p) => p.userId),
+      },
+      pushToken: { $exists: true, $ne: null },
+    }).select("pushToken");
+
+    const checkedInUser = await User.findById(userId).select("name");
+
+    for (const participant of otherParticipants) {
+      try {
+        await sendNotification(
+          participant.pushToken,
+          "Participant Checked In",
+          `${checkedInUser.name} has arrived at "${event.title}"`
+        );
+      } catch (notifError) {
+        console.error("Error sending notification:", notifError);
+      }
+    }
+
+    const updatedEvent = await Event.findById(eventId)
+      .populate("hostId", "name profileImages")
+      .populate("participants.userId", "name profileImages");
+
+    res.status(200).json({
+      message: "Successfully checked in",
+      event: updatedEvent,
+    });
+  } catch (error) {
+    console.error("Error checking in:", error);
+    res.status(500).json({
+      message: "Error checking in",
+      error: error.message,
+    });
+  }
+});
+
+// Leave event
+app.delete("/events/:eventId/leave", async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { userId } = req.body;
+
+    if (
+      !mongoose.Types.ObjectId.isValid(eventId) ||
+      !mongoose.Types.ObjectId.isValid(userId)
+    ) {
+      return res.status(400).json({ message: "Invalid ID format" });
+    }
+
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    // Host cannot leave their own event
+    if (event.hostId.toString() === userId) {
+      return res.status(400).json({
+        message: "Host cannot leave the event. Cancel the event instead.",
+      });
+    }
+
+    // Find and remove participant
+    const participantIndex = event.participants.findIndex(
+      (p) => p.userId.toString() === userId
+    );
+    if (participantIndex === -1) {
+      return res
+        .status(404)
+        .json({ message: "You are not a participant of this event" });
+    }
+
+    event.participants.splice(participantIndex, 1);
+
+    // Update event status if it was full
+    if (event.status === "full") {
+      const now = new Date();
+      event.status = event.startTime <= now ? "live" : "upcoming";
+    }
+
+    await event.save();
+
+    res.status(200).json({ message: "Successfully left event" });
+  } catch (error) {
+    console.error("Error leaving event:", error);
+    res.status(500).json({
+      message: "Error leaving event",
+      error: error.message,
+    });
+  }
+});
+
+// Remove participant (host only)
+app.delete("/events/:eventId/participants/:participantId", async (req, res) => {
+  try {
+    const { eventId, participantId } = req.params;
+    const { userId } = req.body; // Host's userId
+
+    if (
+      !mongoose.Types.ObjectId.isValid(eventId) ||
+      !mongoose.Types.ObjectId.isValid(participantId) ||
+      !mongoose.Types.ObjectId.isValid(userId)
+    ) {
+      return res.status(400).json({ message: "Invalid ID format" });
+    }
+
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    // Check if requester is the host
+    if (event.hostId.toString() !== userId) {
+      return res
+        .status(403)
+        .json({ message: "Only the host can remove participants" });
+    }
+
+    // Cannot remove self (host)
+    if (participantId === userId) {
+      return res
+        .status(400)
+        .json({ message: "Host cannot be removed from the event" });
+    }
+
+    // Find and remove participant
+    const participantIndex = event.participants.findIndex(
+      (p) => p.userId.toString() === participantId
+    );
+    if (participantIndex === -1) {
+      return res
+        .status(404)
+        .json({ message: "Participant not found in this event" });
+    }
+
+    event.participants.splice(participantIndex, 1);
+
+    // Update event status if it was full
+    if (event.status === "full") {
+      const now = new Date();
+      event.status = event.startTime <= now ? "live" : "upcoming";
+    }
+
+    await event.save();
+
+    // Notify removed participant
+    const removedUser = await User.findById(participantId).select("pushToken");
+    if (removedUser && removedUser.pushToken) {
+      try {
+        await sendNotification(
+          removedUser.pushToken,
+          "Removed from Event",
+          `You have been removed from "${event.title}"`
+        );
+      } catch (notifError) {
+        console.error("Error sending notification:", notifError);
+      }
+    }
+
+    res.status(200).json({ message: "Participant removed successfully" });
+  } catch (error) {
+    console.error("Error removing participant:", error);
+    res.status(500).json({
+      message: "Error removing participant",
+      error: error.message,
+    });
+  }
+});
+
+// Get event chat messages
+app.get("/events/:eventId/messages", async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { userId, skip = 0, limit = 50 } = req.query;
+
+    if (!mongoose.Types.ObjectId.isValid(eventId)) {
+      return res.status(400).json({ message: "Invalid event ID format" });
+    }
+
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    // Check if user is a participant
+    if (userId) {
+      const isParticipant = event.participants.some(
+        (p) => p.userId.toString() === userId
+      );
+      if (!isParticipant) {
+        return res.status(403).json({
+          message: "Only participants can view event messages",
+        });
+      }
+    }
+
+    const messages = await EventMessage.find({ eventId })
+      .populate("senderId", "name profileImages")
+      .sort({ createdAt: -1 })
+      .skip(parseInt(skip))
+      .limit(parseInt(limit));
+
+    res.status(200).json({
+      messages: messages.reverse(), // Return in chronological order
+      count: messages.length,
+    });
+  } catch (error) {
+    console.error("Error fetching event messages:", error);
+    res.status(500).json({
+      message: "Error fetching event messages",
+      error: error.message,
+    });
+  }
+});
+
+// Get popular tags
+app.get("/events/tags/popular", async (req, res) => {
+  try {
+    const tags = await Event.aggregate([
+      { $match: { status: { $in: ["upcoming", "live"] } } },
+      { $unwind: "$tags" },
+      { $group: { _id: "$tags", count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 20 },
+    ]);
+
+    res.status(200).json({
+      tags: tags.map((t) => ({ tag: t._id, count: t.count })),
+    });
+  } catch (error) {
+    console.error("Error fetching popular tags:", error);
+    res.status(500).json({
+      message: "Error fetching popular tags",
+      error: error.message,
+    });
+  }
+});
+
+// Get event by ID (MUST be after specific routes like /events/nearby, /events/search, etc.)
+app.get("/events/:eventId", async (req, res) => {
+  try {
+    const { eventId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(eventId)) {
+      return res.status(400).json({ message: "Invalid event ID format" });
+    }
+
+    let event = await Event.findById(eventId)
+      .populate("hostId", "name profileImages")
+      .populate("participants.userId", "name profileImages");
+
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    // Update status if needed
+    event = await updateEventStatus(event);
+
+    res.status(200).json(event);
+  } catch (error) {
+    console.error("Error fetching event:", error);
+    res.status(500).json({
+      message: "Error fetching event",
+      error: error.message,
     });
   }
 });
