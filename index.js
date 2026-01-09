@@ -4,6 +4,7 @@ const mongoose = require("mongoose");
 const nodemailer = require("nodemailer");
 const crypto = require("crypto");
 const cors = require("cors");
+const cron = require("node-cron");
 const User = require("./models/User");
 const Report = require("./models/Report");
 const SharedQuestion = require("./models/SharedQuestion");
@@ -1103,7 +1104,14 @@ app.get("/profiles", async (req, res) => {
       maxAge = "100",
       longitude,
       latitude,
+      maxDistance = "50",
     } = req.query;
+
+    const parsedMaxDistanceKm =
+      maxDistance && !isNaN(parseFloat(maxDistance))
+        ? parseFloat(maxDistance)
+        : 50;
+    const maxDistanceMeters = parsedMaxDistanceKm * 1000;
 
     // Input validation
     if (!mongoose.Types.ObjectId.isValid(userId) || !gender) {
@@ -1198,7 +1206,7 @@ app.get("/profiles", async (req, res) => {
                   coordinates: [parseFloat(longitude), parseFloat(latitude)],
                 },
                 distanceField: "distance",
-                maxDistance: 50000, // 50km radius
+                maxDistance: maxDistanceMeters,
                 spherical: true,
                 query: query,
                 distanceMultiplier: 0.001,
@@ -3972,6 +3980,32 @@ const updateEventStatus = async (event) => {
   return event;
 };
 
+const cleanupExpiredEvents = async () => {
+  const cutoffDate = new Date(Date.now() - 24 * 60 * 60 * 1000); // 24 hours ago
+  const result = await Event.deleteMany({
+    $or: [
+      { endTime: { $exists: true, $lte: cutoffDate } },
+      {
+        endTime: { $exists: false },
+        startTime: { $lte: cutoffDate },
+      },
+    ],
+  });
+  if (result.deletedCount > 0) {
+    console.log(
+      `[Event Cleanup] Removed ${
+        result.deletedCount
+      } event(s) older than ${cutoffDate.toISOString()}`
+    );
+  }
+};
+
+// Schedule cleanup to run every hour
+cron.schedule("0 * * * *", cleanupExpiredEvents);
+cleanupExpiredEvents().catch((error) =>
+  console.error("[Event Cleanup] Error deleting old events:", error)
+);
+
 // Create new event
 app.post("/events", async (req, res) => {
   try {
@@ -4061,6 +4095,9 @@ app.post("/events", async (req, res) => {
     });
   } catch (error) {
     console.error("Error creating event:", error);
+    if (error.status) {
+      return res.status(error.status).json({ message: error.message });
+    }
     res.status(500).json({
       message: "Error creating event",
       error: error.message,
@@ -4465,6 +4502,11 @@ app.post("/events/:eventId/join", async (req, res) => {
       return res.status(400).json({ message: "Invalid ID format" });
     }
 
+    const joiningUser = await User.findById(userId).select("name");
+    if (!joiningUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
     const event = await Event.findById(eventId);
     if (!event) {
       return res.status(404).json({ message: "Event not found" });
@@ -4519,7 +4561,6 @@ app.post("/events/:eventId/join", async (req, res) => {
 
     // Notify host
     const hostUser = await User.findById(event.hostId).select("pushToken name");
-    const joiningUser = await User.findById(userId).select("name");
 
     if (hostUser && hostUser.pushToken) {
       try {
@@ -4543,6 +4584,9 @@ app.post("/events/:eventId/join", async (req, res) => {
     });
   } catch (error) {
     console.error("Error joining event:", error);
+    if (error.status) {
+      return res.status(error.status).json({ message: error.message });
+    }
     res.status(500).json({
       message: "Error joining event",
       error: error.message,
