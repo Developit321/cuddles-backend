@@ -80,6 +80,10 @@ const eventSchema = new mongoose.Schema(
       type: Number,
       default: 100, // meters
     },
+    reminderSent: {
+      type: Boolean,
+      default: false,
+    },
   },
   { timestamps: true }
 );
@@ -93,6 +97,11 @@ eventSchema.index({ "participants.userId": 1 });
 
 const Event = mongoose.model("Event", eventSchema);
 module.exports = Event;
+
+
+
+
+
 
 
 
