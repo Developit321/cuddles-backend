@@ -15,6 +15,7 @@ const notificationSchema = new mongoose.Schema({
       "event_nearby",
       "event_cancelled",
       "event_updated",
+      "profile_like",
     ],
     required: true,
   },
@@ -24,6 +25,7 @@ const notificationSchema = new mongoose.Schema({
   eventName: String,
   actorId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   actorName: String,
+  actorImage: String,
   read: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now, index: true },
 });

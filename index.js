@@ -59,6 +59,7 @@ const createNotification = async ({
   eventName,
   actorId,
   actorName,
+  actorImage,
 }) => {
   try {
     // 1. Save to database
@@ -71,6 +72,7 @@ const createNotification = async ({
       eventName,
       actorId,
       actorName,
+      actorImage,
     });
     await notification.save();
 
@@ -1092,6 +1094,58 @@ app.get("/users/:userId", async (req, res) => {
   }
 });
 
+// Get relationship status between two users
+app.get("/users/:userId/relationship/:otherUserId", async (req, res) => {
+  try {
+    const { userId, otherUserId } = req.params;
+
+    if (
+      !mongoose.Types.ObjectId.isValid(userId) ||
+      !mongoose.Types.ObjectId.isValid(otherUserId)
+    ) {
+      return res.status(400).json({ message: "Invalid user ID format" });
+    }
+
+    const currentUser = await User.findById(userId).select(
+      "Matches crushes recievedLikes"
+    );
+    const otherUser = await User.findById(otherUserId).select(
+      "Matches crushes recievedLikes"
+    );
+
+    if (!currentUser || !otherUser) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Check if users are matched (mutual)
+    const isMatched = currentUser.Matches.some(
+      (id) => id.toString() === otherUserId
+    );
+
+    // Check if current user is following (has liked) the other user
+    const isFollowing = currentUser.crushes.some(
+      (id) => id.toString() === otherUserId
+    );
+
+    // Check if other user is following (has liked) the current user
+    const isFollowedBy = otherUser.crushes.some(
+      (id) => id.toString() === userId
+    );
+
+    return res.status(200).json({
+      isMatched,
+      isFollowing,
+      isFollowedBy,
+    });
+  } catch (error) {
+    console.error("Error fetching relationship status:", error);
+    res.status(500).json({
+      message: "Error fetching relationship status",
+      error: error.message,
+    });
+  }
+});
+
 //image upload
 
 app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
@@ -1446,11 +1500,19 @@ app.post("/likeprofile", async (req, res) => {
       $push: { crushes: selectedUserId },
     });
 
-    // Send notification to the selected user if they have a push token
-    if (selectedUser.pushToken) {
-      const title = "Someone likes your profile!";
-      const body = `${currentUser.name || "A user"} has liked your profile.`;
-      await sendNotification(selectedUser.pushToken, title, body);
+    // Create persistent notification for the profile like
+    try {
+      await createNotification({
+        userId: selectedUserId,
+        type: "profile_like",
+        title: "Someone likes you!",
+        message: `${currentUser.name || "A user"} wants to connect with you`,
+        actorId: currentUserId,
+        actorName: currentUser.name,
+        actorImage: currentUser.profileImages?.[0] || null,
+      });
+    } catch (notifError) {
+      console.error("Error creating profile like notification:", notifError);
     }
 
     return res.status(200).json({ message: "Profile liked successfully." });
