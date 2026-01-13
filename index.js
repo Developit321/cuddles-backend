@@ -4388,31 +4388,44 @@ app.delete("/events/:eventId", async (req, res) => {
         .json({ message: "Only the host can cancel this event" });
     }
 
-    // Mark as cancelled instead of deleting
-    event.status = "cancelled";
-    await event.save();
-
-    // Notify all participants (except host) about cancellation
+    // Store event info for notifications before deletion
+    const eventTitle = event.title;
     const participantIds = event.participants
       .map((p) => p.userId.toString())
       .filter((id) => id !== userId);
 
+    // Notify all participants (except host) about cancellation before deleting
     for (const participantId of participantIds) {
       try {
         await createNotification({
           userId: participantId,
           type: "event_cancelled",
           title: "Event cancelled",
-          message: `The event "${event.title}" has been cancelled`,
+          message: `The event "${eventTitle}" has been cancelled`,
           eventId: event._id,
-          eventName: event.title,
+          eventName: eventTitle,
         });
       } catch (notifError) {
         console.error("Error creating cancel notification:", notifError);
       }
     }
 
-    res.status(200).json({ message: "Event cancelled successfully" });
+    // Delete all event chat messages
+    try {
+      const deleteMessagesResult = await EventMessage.deleteMany({ eventId });
+      console.log(
+        `[Event Delete] Deleted ${deleteMessagesResult.deletedCount} messages for event ${eventId}`
+      );
+    } catch (messageError) {
+      console.error("Error deleting event messages:", messageError);
+    }
+
+    // Delete the event itself
+    await Event.findByIdAndDelete(eventId);
+
+    console.log(`[Event Delete] Successfully deleted event ${eventId}`);
+
+    res.status(200).json({ message: "Event cancelled and deleted successfully" });
   } catch (error) {
     console.error("Error cancelling event:", error);
     res.status(500).json({
@@ -4461,7 +4474,7 @@ app.get("/events/nearby", async (req, res) => {
           maxDistance: parsedRadius,
           spherical: true,
           query: {
-            status: { $in: ["upcoming", "live"] },
+            status: { $in: ["upcoming", "live", "full"] },
             hostId: {
               $nin: blockedUserIds.map((id) => new mongoose.Types.ObjectId(id)),
             },
@@ -4530,7 +4543,7 @@ app.get("/events/search", async (req, res) => {
     } = req.query;
 
     const query = {
-      status: { $in: ["upcoming", "live"] },
+      status: { $in: ["upcoming", "live", "full"] },
     };
 
     // Search by title or description
@@ -5128,7 +5141,7 @@ app.get("/events/:eventId/messages", async (req, res) => {
 app.get("/events/tags/popular", async (req, res) => {
   try {
     const tags = await Event.aggregate([
-      { $match: { status: { $in: ["upcoming", "live"] } } },
+      { $match: { status: { $in: ["upcoming", "live", "full"] } } },
       { $unwind: "$tags" },
       { $group: { _id: "$tags", count: { $sum: 1 } } },
       { $sort: { count: -1 } },
