@@ -12,6 +12,7 @@ const Question = require("./models/ Question");
 const Message = require("./models/message");
 const Event = require("./models/Event");
 const EventMessage = require("./models/EventMessage");
+const Notification = require("./models/Notification");
 const jwt = require("jsonwebtoken");
 const cloudinary = require("cloudinary");
 const app = express();
@@ -47,6 +48,54 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c; // Distance in kilometers
 }
+
+// Helper function to create and send notifications
+const createNotification = async ({
+  userId,
+  type,
+  title,
+  message,
+  eventId,
+  eventName,
+  actorId,
+  actorName,
+}) => {
+  try {
+    // 1. Save to database
+    const notification = new Notification({
+      userId,
+      type,
+      title,
+      message,
+      eventId,
+      eventName,
+      actorId,
+      actorName,
+    });
+    await notification.save();
+
+    // 2. Send push notification if user has token
+    const user = await User.findById(userId).select("pushToken");
+    if (user?.pushToken) {
+      try {
+        await sendNotification(user.pushToken, title, message);
+      } catch (pushError) {
+        console.error(
+          `[Notification] Failed to send push notification to user ${userId}:`,
+          pushError
+        );
+      }
+    }
+
+    console.log(
+      `[Notification] Created ${type} notification for user ${userId}`
+    );
+    return notification;
+  } catch (error) {
+    console.error("[Notification] Error creating notification:", error);
+    throw error;
+  }
+};
 
 app.use(cors());
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -4006,6 +4055,78 @@ cleanupExpiredEvents().catch((error) =>
   console.error("[Event Cleanup] Error deleting old events:", error)
 );
 
+// Send reminder notifications for events starting within 1 hour
+const sendEventReminders = async () => {
+  try {
+    const now = new Date();
+    const oneHourFromNow = new Date(now.getTime() + 60 * 60 * 1000);
+
+    // Find upcoming events starting within 1 hour that haven't had reminders sent
+    const upcomingEvents = await Event.find({
+      startTime: { $gte: now, $lte: oneHourFromNow },
+      status: "upcoming",
+      reminderSent: { $ne: true },
+    }).populate("participants.userId", "name");
+
+    if (upcomingEvents.length === 0) {
+      return;
+    }
+
+    console.log(
+      `[Event Reminder] Found ${upcomingEvents.length} events starting soon`
+    );
+
+    for (const event of upcomingEvents) {
+      // Calculate time until event starts
+      const minutesUntilStart = Math.round(
+        (event.startTime - now) / (1000 * 60)
+      );
+      const timeString =
+        minutesUntilStart > 60
+          ? "1 hour"
+          : minutesUntilStart > 1
+          ? `${minutesUntilStart} minutes`
+          : "soon";
+
+      // Send reminder to all participants
+      for (const participant of event.participants) {
+        try {
+          await createNotification({
+            userId: participant.userId._id || participant.userId,
+            type: "event_reminder",
+            title: "Event starting soon",
+            message: `Your event "${event.title}" starts in ${timeString}`,
+            eventId: event._id,
+            eventName: event.title,
+          });
+        } catch (notifError) {
+          console.error(
+            `Error creating reminder notification for user ${participant.userId}:`,
+            notifError
+          );
+        }
+      }
+
+      // Mark event as reminder sent
+      event.reminderSent = true;
+      await event.save();
+
+      console.log(
+        `[Event Reminder] Sent reminders for event "${event.title}" to ${event.participants.length} participants`
+      );
+    }
+  } catch (error) {
+    console.error("[Event Reminder] Error sending reminders:", error);
+  }
+};
+
+// Schedule event reminders to run every 15 minutes
+cron.schedule("*/15 * * * *", sendEventReminders);
+// Run once on startup
+sendEventReminders().catch((error) =>
+  console.error("[Event Reminder] Error on startup:", error)
+);
+
 // Create new event
 app.post("/events", async (req, res) => {
   try {
@@ -4083,6 +4204,60 @@ app.post("/events", async (req, res) => {
 
     await newEvent.save();
 
+    // Notify nearby users about the new event (within 50km)
+    try {
+      const [eventLng, eventLat] = location.coordinates;
+      const maxDistanceMeters = 50000; // 50km
+
+      // Find nearby users with push tokens (exclude the host)
+      const nearbyUsers = await User.aggregate([
+        {
+          $geoNear: {
+            near: {
+              type: "Point",
+              coordinates: [eventLng, eventLat],
+            },
+            distanceField: "distance",
+            maxDistance: maxDistanceMeters,
+            spherical: true,
+            query: {
+              _id: { $ne: new mongoose.Types.ObjectId(hostId) },
+              pushToken: { $exists: true, $ne: null },
+            },
+          },
+        },
+        { $limit: 50 }, // Limit to 50 users
+        { $project: { _id: 1, name: 1 } },
+      ]);
+
+      console.log(
+        `[Event Nearby] Found ${nearbyUsers.length} users near new event "${title}"`
+      );
+
+      // Create notifications for nearby users
+      for (const nearbyUser of nearbyUsers) {
+        try {
+          await createNotification({
+            userId: nearbyUser._id,
+            type: "event_nearby",
+            title: "New event nearby",
+            message: `A new event "${title}" is happening near you`,
+            eventId: newEvent._id,
+            eventName: title,
+            actorId: hostId,
+            actorName: host.name,
+          });
+        } catch (notifError) {
+          console.error(
+            `Error creating nearby notification for user ${nearbyUser._id}:`,
+            notifError
+          );
+        }
+      }
+    } catch (nearbyError) {
+      console.error("Error notifying nearby users:", nearbyError);
+    }
+
     // Populate host info for response
     const populatedEvent = await Event.findById(newEvent._id).populate(
       "hostId",
@@ -4154,23 +4329,23 @@ app.put("/events/:eventId", async (req, res) => {
 
     await event.save();
 
-    // Notify participants of update
-    const participantsWithTokens = await User.find({
-      _id: { $in: event.participants.map((p) => p.userId) },
-      pushToken: { $exists: true, $ne: null },
-    }).select("pushToken");
+    // Notify all participants (except host) about the update
+    const participantIds = event.participants
+      .map((p) => p.userId.toString())
+      .filter((id) => id !== userId);
 
-    for (const participant of participantsWithTokens) {
-      if (participant._id.toString() !== userId) {
-        try {
-          await sendNotification(
-            participant.pushToken,
-            "Event Updated",
-            `"${event.title}" has been updated by the host.`
-          );
-        } catch (notifError) {
-          console.error("Error sending notification:", notifError);
-        }
+    for (const participantId of participantIds) {
+      try {
+        await createNotification({
+          userId: participantId,
+          type: "event_updated",
+          title: "Event updated",
+          message: `"${event.title}" has been updated by the host`,
+          eventId: event._id,
+          eventName: event.title,
+        });
+      } catch (notifError) {
+        console.error("Error creating update notification:", notifError);
       }
     }
 
@@ -4217,23 +4392,23 @@ app.delete("/events/:eventId", async (req, res) => {
     event.status = "cancelled";
     await event.save();
 
-    // Notify participants
-    const participantsWithTokens = await User.find({
-      _id: { $in: event.participants.map((p) => p.userId) },
-      pushToken: { $exists: true, $ne: null },
-    }).select("pushToken");
+    // Notify all participants (except host) about cancellation
+    const participantIds = event.participants
+      .map((p) => p.userId.toString())
+      .filter((id) => id !== userId);
 
-    for (const participant of participantsWithTokens) {
-      if (participant._id.toString() !== userId) {
-        try {
-          await sendNotification(
-            participant.pushToken,
-            "Event Cancelled",
-            `"${event.title}" has been cancelled by the host.`
-          );
-        } catch (notifError) {
-          console.error("Error sending notification:", notifError);
-        }
+    for (const participantId of participantIds) {
+      try {
+        await createNotification({
+          userId: participantId,
+          type: "event_cancelled",
+          title: "Event cancelled",
+          message: `The event "${event.title}" has been cancelled`,
+          eventId: event._id,
+          eventName: event.title,
+        });
+      } catch (notifError) {
+        console.error("Error creating cancel notification:", notifError);
       }
     }
 
@@ -4559,19 +4734,20 @@ app.post("/events/:eventId/join", async (req, res) => {
 
     await event.save();
 
-    // Notify host
-    const hostUser = await User.findById(event.hostId).select("pushToken name");
-
-    if (hostUser && hostUser.pushToken) {
-      try {
-        await sendNotification(
-          hostUser.pushToken,
-          "New Participant",
-          `${joiningUser.name} joined your event "${event.title}"`
-        );
-      } catch (notifError) {
-        console.error("Error sending notification:", notifError);
-      }
+    // Create notification for host (stored in DB + push notification)
+    try {
+      await createNotification({
+        userId: event.hostId,
+        type: "event_joined",
+        title: "New participant joined",
+        message: `${joiningUser.name} joined your event "${event.title}"`,
+        eventId: event._id,
+        eventName: event.title,
+        actorId: userId,
+        actorName: joiningUser.name,
+      });
+    } catch (notifError) {
+      console.error("Error creating join notification:", notifError);
     }
 
     const updatedEvent = await Event.findById(eventId)
@@ -4971,6 +5147,52 @@ app.get("/events/tags/popular", async (req, res) => {
   }
 });
 
+// Admin endpoint to get all events
+app.get("/admin/events", async (req, res) => {
+  try {
+    const {
+      page = 1,
+      limit = 20,
+      status,
+      sortBy = "startTime",
+      sortOrder = -1,
+    } = req.query;
+
+    const query = {};
+    
+    // Filter by status if provided
+    if (status && status !== "all") {
+      query.status = status;
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const sortOptions = {};
+    sortOptions[sortBy] = parseInt(sortOrder);
+
+    const events = await Event.find(query)
+      .populate("hostId", "name profileImages")
+      .populate("participants.userId", "name profileImages")
+      .sort(sortOptions)
+      .skip(skip)
+      .limit(parseInt(limit));
+
+    const total = await Event.countDocuments(query);
+
+    res.status(200).json({
+      events,
+      total,
+      page: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit)),
+    });
+  } catch (error) {
+    console.error("Error fetching all events:", error);
+    res.status(500).json({
+      message: "Error fetching events",
+      error: error.message,
+    });
+  }
+});
+
 // Get event by ID (MUST be after specific routes like /events/nearby, /events/search, etc.)
 app.get("/events/:eventId", async (req, res) => {
   try {
@@ -4996,6 +5218,136 @@ app.get("/events/:eventId", async (req, res) => {
     console.error("Error fetching event:", error);
     res.status(500).json({
       message: "Error fetching event",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================================
+// NOTIFICATIONS ENDPOINTS
+// ============================================================
+
+// Get notifications for a user (paginated)
+app.get("/notifications/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { page = 1, limit = 20 } = req.query;
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Invalid user ID format" });
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const notifications = await Notification.find({ userId })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit))
+      .lean();
+
+    const total = await Notification.countDocuments({ userId });
+    const unreadCount = await Notification.countDocuments({
+      userId,
+      read: false,
+    });
+
+    res.status(200).json({
+      notifications,
+      total,
+      unreadCount,
+      page: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit)),
+    });
+  } catch (error) {
+    console.error("Error fetching notifications:", error);
+    res.status(500).json({
+      message: "Error fetching notifications",
+      error: error.message,
+    });
+  }
+});
+
+// Mark a single notification as read
+app.put("/notifications/:notificationId/read", async (req, res) => {
+  try {
+    const { notificationId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(notificationId)) {
+      return res.status(400).json({ message: "Invalid notification ID format" });
+    }
+
+    const notification = await Notification.findByIdAndUpdate(
+      notificationId,
+      { read: true },
+      { new: true }
+    );
+
+    if (!notification) {
+      return res.status(404).json({ message: "Notification not found" });
+    }
+
+    res.status(200).json({
+      message: "Notification marked as read",
+      notification,
+    });
+  } catch (error) {
+    console.error("Error marking notification as read:", error);
+    res.status(500).json({
+      message: "Error marking notification as read",
+      error: error.message,
+    });
+  }
+});
+
+// Mark all notifications as read for a user
+app.put("/notifications/:userId/read-all", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Invalid user ID format" });
+    }
+
+    const result = await Notification.updateMany(
+      { userId, read: false },
+      { read: true }
+    );
+
+    res.status(200).json({
+      message: `Marked ${result.modifiedCount} notifications as read`,
+      modifiedCount: result.modifiedCount,
+    });
+  } catch (error) {
+    console.error("Error marking all notifications as read:", error);
+    res.status(500).json({
+      message: "Error marking notifications as read",
+      error: error.message,
+    });
+  }
+});
+
+// Delete a notification
+app.delete("/notifications/:notificationId", async (req, res) => {
+  try {
+    const { notificationId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(notificationId)) {
+      return res.status(400).json({ message: "Invalid notification ID format" });
+    }
+
+    const notification = await Notification.findByIdAndDelete(notificationId);
+
+    if (!notification) {
+      return res.status(404).json({ message: "Notification not found" });
+    }
+
+    res.status(200).json({
+      message: "Notification deleted successfully",
+    });
+  } catch (error) {
+    console.error("Error deleting notification:", error);
+    res.status(500).json({
+      message: "Error deleting notification",
       error: error.message,
     });
   }
