@@ -4243,9 +4243,9 @@ app.post("/events", async (req, res) => {
     }
 
     // Validate capacity
-    if (capacity && (capacity < 1 || capacity > 6)) {
+    if (capacity && (capacity < 1 || capacity > 10)) {
       return res.status(400).json({
-        message: "Capacity must be between 1 and 6",
+        message: "Capacity must be between 1 and 10",
       });
     }
 
@@ -4402,7 +4402,7 @@ app.put("/events/:eventId", async (req, res) => {
     if (description !== undefined) event.description = description;
     if (startTime) event.startTime = new Date(startTime);
     if (endTime) event.endTime = new Date(endTime);
-    if (capacity && capacity >= 1 && capacity <= 6) event.capacity = capacity;
+    if (capacity && capacity >= 1 && capacity <= 10) event.capacity = capacity;
     if (tags) event.tags = tags;
     if (coverImage !== undefined) event.coverImage = coverImage;
 
