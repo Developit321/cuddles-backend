@@ -1767,6 +1767,17 @@ app.put("/push-notification-token/:userId", async (req, res) => {
     const { userId } = req.params;
     const { pushToken } = req.body;
 
+    console.log("🔔 [PUSH TOKEN API] ========================================");
+    console.log("🔔 [PUSH TOKEN API] Received request to save push token");
+    console.log("🔔 [PUSH TOKEN API] UserId:", userId);
+    console.log("🔔 [PUSH TOKEN API] Push Token:", pushToken);
+    console.log("🔔 [PUSH TOKEN API] ========================================");
+
+    if (!pushToken) {
+      console.log("🔔 [PUSH TOKEN API] ❌ No pushToken provided in request body");
+      return res.status(400).json({ message: "pushToken is required" });
+    }
+
     const user = await User.findByIdAndUpdate(
       userId,
       { pushToken: pushToken },
@@ -1774,15 +1785,21 @@ app.put("/push-notification-token/:userId", async (req, res) => {
     );
 
     if (!user) {
+      console.log("🔔 [PUSH TOKEN API] ❌ User not found:", userId);
       return res.status(404).json({ message: "user not found" });
     }
+
+    console.log("🔔 [PUSH TOKEN API] ✅ SUCCESS! Push token saved for user:", user.name);
+    console.log("🔔 [PUSH TOKEN API] Saved token:", user.pushToken);
+    
     return res
       .status(200)
-      .json({ message: "user pushToken updated successfully" });
+      .json({ message: "user pushToken updated successfully", savedToken: user.pushToken });
   } catch (error) {
+    console.error("🔔 [PUSH TOKEN API] ❌ ERROR:", error.message);
     res
       .status(500)
-      .json({ message: "Error updating users push token ", error });
+      .json({ message: "Error updating users push token ", error: error.message });
   }
 });
 
@@ -4226,9 +4243,9 @@ app.post("/events", async (req, res) => {
     }
 
     // Validate capacity
-    if (capacity && (capacity < 1 || capacity > 6)) {
+    if (capacity && (capacity < 1 || capacity > 10)) {
       return res.status(400).json({
-        message: "Capacity must be between 1 and 6",
+        message: "Capacity must be between 1 and 10",
       });
     }
 
@@ -4385,7 +4402,7 @@ app.put("/events/:eventId", async (req, res) => {
     if (description !== undefined) event.description = description;
     if (startTime) event.startTime = new Date(startTime);
     if (endTime) event.endTime = new Date(endTime);
-    if (capacity && capacity >= 1 && capacity <= 6) event.capacity = capacity;
+    if (capacity && capacity >= 1 && capacity <= 10) event.capacity = capacity;
     if (tags) event.tags = tags;
     if (coverImage !== undefined) event.coverImage = coverImage;
 
