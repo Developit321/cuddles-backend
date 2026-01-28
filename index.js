@@ -4283,69 +4283,80 @@ app.post("/events", async (req, res) => {
 
     await newEvent.save();
 
-    // Notify nearby users about the new event (within 50km)
+    // Populate host info for response (wrap in try-catch to ensure response is sent)
+    let populatedEvent;
     try {
-      const [eventLng, eventLat] = location.coordinates;
-      const maxDistanceMeters = 50000; // 50km
-
-      // Find nearby users with push tokens (exclude the host)
-      const nearbyUsers = await User.aggregate([
-        {
-          $geoNear: {
-            near: {
-              type: "Point",
-              coordinates: [eventLng, eventLat],
-            },
-            distanceField: "distance",
-            maxDistance: maxDistanceMeters,
-            spherical: true,
-            query: {
-              _id: { $ne: new mongoose.Types.ObjectId(hostId) },
-              pushToken: { $exists: true, $ne: null },
-            },
-          },
-        },
-        { $limit: 50 }, // Limit to 50 users
-        { $project: { _id: 1, name: 1 } },
-      ]);
-
-      console.log(
-        `[Event Nearby] Found ${nearbyUsers.length} users near new event "${title}"`
+      populatedEvent = await Event.findById(newEvent._id).populate(
+        "hostId",
+        "name profileImages"
       );
-
-      // Create notifications for nearby users
-      for (const nearbyUser of nearbyUsers) {
-        try {
-          await createNotification({
-            userId: nearbyUser._id,
-            type: "event_nearby",
-            title: "New event nearby",
-            message: `A new event "${title}" is happening near you`,
-            eventId: newEvent._id,
-            eventName: title,
-            actorId: hostId,
-            actorName: host.name,
-          });
-        } catch (notifError) {
-          console.error(
-            `Error creating nearby notification for user ${nearbyUser._id}:`,
-            notifError
-          );
-        }
-      }
-    } catch (nearbyError) {
-      console.error("Error notifying nearby users:", nearbyError);
+    } catch (populateError) {
+      console.error("Error populating event:", populateError);
+      // If populate fails, use the event without population
+      populatedEvent = newEvent;
     }
 
-    // Populate host info for response
-    const populatedEvent = await Event.findById(newEvent._id).populate(
-      "hostId",
-      "name profileImages"
-    );
-
+    // Send success response immediately after event is created
     res.status(201).json({
       message: "Event created successfully",
       event: populatedEvent,
+    });
+
+    // Notify nearby users about the new event (within 50km) - do this AFTER response is sent
+    // This way if notifications fail, it doesn't affect the success response
+    setImmediate(async () => {
+      try {
+        const [eventLng, eventLat] = location.coordinates;
+        const maxDistanceMeters = 50000; // 50km
+
+        // Find nearby users with push tokens (exclude the host)
+        const nearbyUsers = await User.aggregate([
+          {
+            $geoNear: {
+              near: {
+                type: "Point",
+                coordinates: [eventLng, eventLat],
+              },
+              distanceField: "distance",
+              maxDistance: maxDistanceMeters,
+              spherical: true,
+              query: {
+                _id: { $ne: new mongoose.Types.ObjectId(hostId) },
+                pushToken: { $exists: true, $ne: null },
+              },
+            },
+          },
+          { $limit: 50 }, // Limit to 50 users
+          { $project: { _id: 1, name: 1 } },
+        ]);
+
+        console.log(
+          `[Event Nearby] Found ${nearbyUsers.length} users near new event "${title}"`
+        );
+
+        // Create notifications for nearby users
+        for (const nearbyUser of nearbyUsers) {
+          try {
+            await createNotification({
+              userId: nearbyUser._id,
+              type: "event_nearby",
+              title: "New event nearby",
+              message: `A new event "${title}" is happening near you`,
+              eventId: newEvent._id,
+              eventName: title,
+              actorId: hostId,
+              actorName: host.name,
+            });
+          } catch (notifError) {
+            console.error(
+              `Error creating nearby notification for user ${nearbyUser._id}:`,
+              notifError
+            );
+          }
+        }
+      } catch (nearbyError) {
+        console.error("Error notifying nearby users:", nearbyError);
+      }
     });
   } catch (error) {
     console.error("Error creating event:", error);
