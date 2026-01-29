@@ -4109,30 +4109,40 @@ const updateEventStatus = async (event) => {
 };
 
 const cleanupExpiredEvents = async () => {
-  const cutoffDate = new Date(Date.now() - 24 * 60 * 60 * 1000); // 24 hours ago
-  const result = await Event.deleteMany({
-    $or: [
-      { endTime: { $exists: true, $lte: cutoffDate } },
-      {
-        endTime: { $exists: false },
-        startTime: { $lte: cutoffDate },
-      },
-    ],
-  });
-  if (result.deletedCount > 0) {
+  try {
+    const cutoffDate = new Date(Date.now() - 24 * 60 * 60 * 1000); // 24 hours ago
+    console.log(`[Event Cleanup] Starting cleanup at ${new Date().toISOString()}`);
+    console.log(`[Event Cleanup] Deleting events with startTime before: ${cutoffDate.toISOString()}`);
+    
+    // Delete events where the meetup time (startTime) was more than 24 hours ago
+    const result = await Event.deleteMany({
+      startTime: { $lte: cutoffDate }
+    });
+    
     console.log(
-      `[Event Cleanup] Removed ${
-        result.deletedCount
-      } event(s) older than ${cutoffDate.toISOString()}`
+      `[Event Cleanup] Cleanup completed. Removed ${result.deletedCount} event(s)`
     );
+    
+    return result;
+  } catch (error) {
+    console.error("[Event Cleanup] Error deleting old events:", error);
+    throw error;
   }
 };
 
 // Schedule cleanup to run every hour
-cron.schedule("0 * * * *", cleanupExpiredEvents);
-cleanupExpiredEvents().catch((error) =>
-  console.error("[Event Cleanup] Error deleting old events:", error)
-);
+cron.schedule("0 * * * *", () => {
+  console.log(`[Event Cleanup] Cron job triggered at ${new Date().toISOString()}`);
+  cleanupExpiredEvents().catch((error) => {
+    console.error("[Event Cleanup] Cron job error:", error);
+  });
+});
+
+// Run cleanup on startup
+console.log(`[Event Cleanup] Running initial cleanup on server startup`);
+cleanupExpiredEvents().catch((error) => {
+  console.error("[Event Cleanup] Initial cleanup error:", error);
+});
 
 // Send reminder notifications for events starting within 1 hour
 const sendEventReminders = async () => {
