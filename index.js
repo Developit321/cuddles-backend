@@ -4144,6 +4144,68 @@ cleanupExpiredEvents().catch((error) => {
   console.error("[Event Cleanup] Initial cleanup error:", error);
 });
 
+// Expire pending suggestions that have passed their expiresAt time
+const expireSuggestions = async () => {
+  try {
+    const now = new Date();
+    console.log(`[Suggestion Expiry] Starting expiry check at ${now.toISOString()}`);
+
+    // Find suggestions that have expired
+    const expiredSuggestions = await Event.find({
+      status: "suggested",
+      expiresAt: { $lte: now },
+    }).populate("hostId", "name pushToken");
+
+    if (expiredSuggestions.length === 0) {
+      return;
+    }
+
+    console.log(`[Suggestion Expiry] Found ${expiredSuggestions.length} expired suggestions`);
+
+    for (const suggestion of expiredSuggestions) {
+      try {
+        // Mark as cancelled
+        await Event.findByIdAndUpdate(suggestion._id, { status: "cancelled" });
+
+        // Notify the suggester that their suggestion expired
+        if (suggestion.hostId) {
+          await createNotification({
+            userId: suggestion.hostId._id,
+            type: "suggestion_expired",
+            title: "Suggestion Expired",
+            message: `Your activity suggestion "${suggestion.title}" has expired without a response`,
+            eventId: suggestion._id,
+            eventName: suggestion.title,
+          });
+        }
+
+        console.log(`[Suggestion Expiry] Expired suggestion: ${suggestion.title}`);
+      } catch (notifError) {
+        console.error(`[Suggestion Expiry] Error processing suggestion ${suggestion._id}:`, notifError);
+      }
+    }
+
+    console.log(`[Suggestion Expiry] Processed ${expiredSuggestions.length} expired suggestions`);
+  } catch (error) {
+    console.error("[Suggestion Expiry] Error expiring suggestions:", error);
+    throw error;
+  }
+};
+
+// Schedule suggestion expiry to run every 15 minutes
+cron.schedule("*/15 * * * *", () => {
+  console.log(`[Suggestion Expiry] Cron job triggered at ${new Date().toISOString()}`);
+  expireSuggestions().catch((error) => {
+    console.error("[Suggestion Expiry] Cron job error:", error);
+  });
+});
+
+// Run suggestion expiry on startup
+console.log(`[Suggestion Expiry] Running initial expiry check on server startup`);
+expireSuggestions().catch((error) => {
+  console.error("[Suggestion Expiry] Initial expiry error:", error);
+});
+
 // Send reminder notifications for events starting within 1 hour
 const sendEventReminders = async () => {
   try {
@@ -4229,6 +4291,9 @@ app.post("/events", async (req, res) => {
       endTime,
       capacity,
       tags,
+      status,
+      suggestedToUserId,
+      expiresAt,
     } = req.body;
 
     // Validate required fields
@@ -4265,6 +4330,18 @@ app.post("/events", async (req, res) => {
       return res.status(404).json({ message: "Host user not found" });
     }
 
+    // Check if this is a suggestion
+    const isSuggestion = status === "suggested" && suggestedToUserId;
+
+    // If it's a suggestion, validate the target user
+    let targetUser = null;
+    if (isSuggestion) {
+      targetUser = await User.findById(suggestedToUserId);
+      if (!targetUser) {
+        return res.status(404).json({ message: "Suggested user not found" });
+      }
+    }
+
     // Create the event
     const newEvent = new Event({
       hostId,
@@ -4281,14 +4358,17 @@ app.post("/events", async (req, res) => {
       endTime: endTime ? new Date(endTime) : null,
       capacity: capacity || 6,
       tags: tags || [],
-      participants: [
+      // For suggestions, don't add participants yet (wait for acceptance)
+      participants: isSuggestion ? [] : [
         {
           userId: hostId,
           status: "going",
           joinedAt: new Date(),
         },
       ],
-      status: "upcoming",
+      status: isSuggestion ? "suggested" : "upcoming",
+      suggestedToUserId: isSuggestion ? suggestedToUserId : undefined,
+      expiresAt: isSuggestion && expiresAt ? new Date(expiresAt) : undefined,
     });
 
     await newEvent.save();
@@ -4308,64 +4388,80 @@ app.post("/events", async (req, res) => {
 
     // Send success response immediately after event is created
     res.status(201).json({
-      message: "Event created successfully",
+      message: isSuggestion ? "Activity suggestion sent" : "Event created successfully",
       event: populatedEvent,
     });
 
-    // Notify nearby users about the new event (within 50km) - do this AFTER response is sent
-    // This way if notifications fail, it doesn't affect the success response
+    // Handle notifications after response is sent
     setImmediate(async () => {
       try {
-        const [eventLng, eventLat] = location.coordinates;
-        const maxDistanceMeters = 50000; // 50km
+        if (isSuggestion && targetUser) {
+          // Send notification to the suggested user
+          await createNotification({
+            userId: suggestedToUserId,
+            type: "activity_suggestion",
+            title: "Activity Suggestion",
+            message: `${host.name} wants to do "${title}" with you`,
+            eventId: newEvent._id,
+            eventName: title,
+            actorId: hostId,
+            actorName: host.name,
+            actorImage: host.profileImages?.[0],
+          });
+          console.log(`[Suggestion] Sent activity suggestion notification to ${targetUser.name}`);
+        } else {
+          // Regular event - notify nearby users (within 50km)
+          const [eventLng, eventLat] = location.coordinates;
+          const maxDistanceMeters = 50000; // 50km
 
-        // Find nearby users with push tokens (exclude the host)
-        const nearbyUsers = await User.aggregate([
-          {
-            $geoNear: {
-              near: {
-                type: "Point",
-                coordinates: [eventLng, eventLat],
-              },
-              distanceField: "distance",
-              maxDistance: maxDistanceMeters,
-              spherical: true,
-              query: {
-                _id: { $ne: new mongoose.Types.ObjectId(hostId) },
-                pushToken: { $exists: true, $ne: null },
+          // Find nearby users with push tokens (exclude the host)
+          const nearbyUsers = await User.aggregate([
+            {
+              $geoNear: {
+                near: {
+                  type: "Point",
+                  coordinates: [eventLng, eventLat],
+                },
+                distanceField: "distance",
+                maxDistance: maxDistanceMeters,
+                spherical: true,
+                query: {
+                  _id: { $ne: new mongoose.Types.ObjectId(hostId) },
+                  pushToken: { $exists: true, $ne: null },
+                },
               },
             },
-          },
-          { $limit: 50 }, // Limit to 50 users
-          { $project: { _id: 1, name: 1 } },
-        ]);
+            { $limit: 50 }, // Limit to 50 users
+            { $project: { _id: 1, name: 1 } },
+          ]);
 
-        console.log(
-          `[Event Nearby] Found ${nearbyUsers.length} users near new event "${title}"`
-        );
+          console.log(
+            `[Event Nearby] Found ${nearbyUsers.length} users near new event "${title}"`
+          );
 
-        // Create notifications for nearby users
-        for (const nearbyUser of nearbyUsers) {
-          try {
-            await createNotification({
-              userId: nearbyUser._id,
-              type: "event_nearby",
-              title: "New event nearby",
-              message: `A new event "${title}" is happening near you`,
-              eventId: newEvent._id,
-              eventName: title,
-              actorId: hostId,
-              actorName: host.name,
-            });
-          } catch (notifError) {
-            console.error(
-              `Error creating nearby notification for user ${nearbyUser._id}:`,
-              notifError
-            );
+          // Create notifications for nearby users
+          for (const nearbyUser of nearbyUsers) {
+            try {
+              await createNotification({
+                userId: nearbyUser._id,
+                type: "event_nearby",
+                title: "New event nearby",
+                message: `A new event "${title}" is happening near you`,
+                eventId: newEvent._id,
+                eventName: title,
+                actorId: hostId,
+                actorName: host.name,
+              });
+            } catch (notifError) {
+              console.error(
+                `Error creating nearby notification for user ${nearbyUser._id}:`,
+                notifError
+              );
+            }
           }
         }
-      } catch (nearbyError) {
-        console.error("Error notifying nearby users:", nearbyError);
+      } catch (notifyError) {
+        console.error("Error sending notifications:", notifyError);
       }
     });
   } catch (error) {
@@ -5461,6 +5557,314 @@ app.delete("/notifications/:notificationId", async (req, res) => {
     console.error("Error deleting notification:", error);
     res.status(500).json({
       message: "Error deleting notification",
+      error: error.message,
+    });
+  }
+});
+
+// ============================================
+// OPEN TAB - People Open to Activities
+// ============================================
+
+// Helper function to format active status
+const formatActiveStatus = (lastActiveAt) => {
+  if (!lastActiveAt) return "Active";
+  
+  const now = new Date();
+  const lastActive = new Date(lastActiveAt);
+  const diffMs = now - lastActive;
+  const diffMins = Math.floor(diffMs / (1000 * 60));
+  const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+  const diffMonths = Math.floor(diffDays / 30);
+  
+  if (diffMins < 5) return "Active now";
+  if (diffMins < 60) return `Active ${diffMins}m ago`;
+  if (diffHours < 24) return `Active ${diffHours}h ago`;
+  if (diffDays < 30) return `Active ${diffDays}d ago`;
+  return `Active ${diffMonths}mo ago`;
+};
+
+// GET /users/nearby/open - Fetch nearby users who are open to activities
+app.get("/users/nearby/open", async (req, res) => {
+  try {
+    const { 
+      latitude, 
+      longitude, 
+      radius = 50000, 
+      userId, 
+      limit = 10, 
+      skip = 0,
+      search = ""
+    } = req.query;
+
+    if (!latitude || !longitude) {
+      return res.status(400).json({
+        message: "Latitude and longitude are required",
+      });
+    }
+
+    const lat = parseFloat(latitude);
+    const lng = parseFloat(longitude);
+    const maxDistance = parseInt(radius);
+    const queryLimit = Math.min(parseInt(limit) || 10, 50); // Cap at 50
+    const querySkip = parseInt(skip) || 0;
+    const searchTerm = search.trim();
+
+    // Calculate date 90 days ago
+    const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+
+    // Build exclusion list (always exclude self + blocked users)
+    let excludeIds = [];
+    if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+      excludeIds.push(new mongoose.Types.ObjectId(userId));
+      // Get blocked users
+      const currentUser = await User.findById(userId).select("blockedBy");
+      if (currentUser?.blockedBy?.length > 0) {
+        excludeIds = excludeIds.concat(currentUser.blockedBy);
+      }
+    }
+
+    // Build the query conditions
+    const queryConditions = [
+      // Only show users with showInOpenTab true (or not set, defaulting to true)
+      {
+        $or: [
+          { showInOpenTab: { $exists: false } },
+          { showInOpenTab: true }
+        ]
+      },
+      // Must have been active in last 90 days
+      {
+        $or: [
+          { lastActiveAt: { $gte: ninetyDaysAgo } },
+          { updatedAt: { $gte: ninetyDaysAgo } } // Fallback for users without lastActiveAt
+        ]
+      },
+      // Must have valid location
+      { "location.coordinates": { $exists: true, $ne: [0, 0] } },
+      // Must have at least one interest
+      { interests: { $exists: true, $not: { $size: 0 } } },
+      // Exclude self and blocked users
+      ...(excludeIds.length > 0 ? [{ _id: { $nin: excludeIds } }] : []),
+    ];
+
+    // Add search filter if provided
+    if (searchTerm) {
+      queryConditions.push({
+        name: { $regex: searchTerm, $options: "i" }
+      });
+    }
+
+    const pipeline = [
+      {
+        $geoNear: {
+          near: { type: "Point", coordinates: [lng, lat] },
+          distanceField: "distance",
+          maxDistance: maxDistance,
+          spherical: true,
+          query: { $and: queryConditions },
+        },
+      },
+      {
+        $project: {
+          _id: 1,
+          name: 1,
+          profileImages: { $slice: ["$profileImages", 1] },
+          interests: { $slice: ["$interests", 3] },
+          distance: { $divide: ["$distance", 1000] }, // Convert to km
+          lastActiveAt: 1,
+          updatedAt: 1,
+        },
+      },
+      // Sort by recency first (most recent first), then by distance
+      {
+        $addFields: {
+          effectiveLastActive: {
+            $ifNull: ["$lastActiveAt", "$updatedAt"]
+          }
+        }
+      },
+      { $sort: { effectiveLastActive: -1, distance: 1 } },
+      { $skip: querySkip },
+      { $limit: queryLimit + 1 }, // Fetch one extra to check if there's more
+    ];
+
+    const users = await User.aggregate(pipeline);
+
+    // Check if there are more results
+    const hasMore = users.length > queryLimit;
+    if (hasMore) {
+      users.pop(); // Remove the extra item
+    }
+
+    // Format the response
+    const formattedUsers = users.map(user => ({
+      _id: user._id,
+      name: user.name,
+      profileImages: user.profileImages,
+      interests: user.interests,
+      distance: Math.round(user.distance * 10) / 10, // Round to 1 decimal
+      lastActiveAt: user.effectiveLastActive,
+      activeStatus: formatActiveStatus(user.effectiveLastActive),
+    }));
+
+    res.status(200).json({
+      users: formattedUsers,
+      count: formattedUsers.length,
+      hasMore,
+    });
+  } catch (error) {
+    console.error("Error fetching open users:", error);
+    res.status(500).json({
+      message: "Error fetching open users",
+      error: error.message,
+    });
+  }
+});
+
+// PUT /users/:userId/open-visibility - Update user's visibility in Open tab
+app.put("/users/:userId/open-visibility", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { showInOpenTab } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Invalid user ID format" });
+    }
+
+    if (typeof showInOpenTab !== "boolean") {
+      return res.status(400).json({ message: "showInOpenTab must be a boolean" });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { showInOpenTab },
+      { new: true }
+    ).select("showInOpenTab");
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.status(200).json({
+      message: `Visibility ${showInOpenTab ? "enabled" : "disabled"}`,
+      showInOpenTab: user.showInOpenTab,
+    });
+  } catch (error) {
+    console.error("Error updating open visibility:", error);
+    res.status(500).json({
+      message: "Error updating visibility",
+      error: error.message,
+    });
+  }
+});
+
+// POST /events/:eventId/respond-suggestion - Accept or decline an activity suggestion
+app.post("/events/:eventId/respond-suggestion", async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { userId, response } = req.body; // response: "accept" or "decline"
+
+    if (!mongoose.Types.ObjectId.isValid(eventId)) {
+      return res.status(400).json({ message: "Invalid event ID format" });
+    }
+
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Valid user ID is required" });
+    }
+
+    if (!["accept", "decline"].includes(response)) {
+      return res.status(400).json({ message: "Response must be 'accept' or 'decline'" });
+    }
+
+    // Find the event
+    const event = await Event.findById(eventId).populate("hostId", "name profileImages pushToken");
+
+    if (!event) {
+      return res.status(404).json({ message: "Activity not found" });
+    }
+
+    // Verify the event is a suggestion and this user is the recipient
+    if (event.status !== "suggested") {
+      return res.status(400).json({ message: "This activity is not a suggestion" });
+    }
+
+    if (event.suggestedToUserId?.toString() !== userId) {
+      return res.status(403).json({ message: "You are not authorized to respond to this suggestion" });
+    }
+
+    // Check if suggestion has expired
+    if (event.expiresAt && new Date(event.expiresAt) < new Date()) {
+      await Event.findByIdAndUpdate(eventId, { status: "cancelled" });
+      return res.status(400).json({ message: "This suggestion has expired" });
+    }
+
+    if (response === "accept") {
+      // Accept: Change status to upcoming, add responder as participant
+      await Event.findByIdAndUpdate(eventId, {
+        status: "upcoming",
+        $push: {
+          participants: {
+            userId: userId,
+            status: "going",
+            joinedAt: new Date(),
+          },
+        },
+      });
+
+      // Notify the suggester that their suggestion was accepted
+      const respondingUser = await User.findById(userId).select("name profileImages");
+      
+      await createNotification({
+        userId: event.hostId._id,
+        type: "suggestion_accepted",
+        title: "Suggestion Accepted!",
+        message: `${respondingUser.name} accepted your activity suggestion: ${event.title}`,
+        eventId: event._id,
+        eventName: event.title,
+        actorId: userId,
+        actorName: respondingUser.name,
+        actorImage: respondingUser.profileImages?.[0],
+      });
+
+      res.status(200).json({
+        message: "Suggestion accepted! Activity is now live.",
+        event: await Event.findById(eventId).populate("hostId", "name profileImages"),
+      });
+    } else {
+      // Decline: Silently mark as cancelled (no notification to suggester)
+      await Event.findByIdAndUpdate(eventId, { status: "cancelled" });
+
+      res.status(200).json({
+        message: "Suggestion declined",
+      });
+    }
+  } catch (error) {
+    console.error("Error responding to suggestion:", error);
+    res.status(500).json({
+      message: "Error responding to suggestion",
+      error: error.message,
+    });
+  }
+});
+
+// PUT /users/:userId/last-active - Update user's last active timestamp
+app.put("/users/:userId/last-active", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Invalid user ID format" });
+    }
+
+    await User.findByIdAndUpdate(userId, { lastActiveAt: new Date() });
+
+    res.status(200).json({ message: "Last active updated" });
+  } catch (error) {
+    console.error("Error updating last active:", error);
+    res.status(500).json({
+      message: "Error updating last active",
       error: error.message,
     });
   }
