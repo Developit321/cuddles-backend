@@ -5611,6 +5611,8 @@ app.get("/users/nearby/open", async (req, res) => {
     const querySkip = parseInt(skip) || 0;
     const searchTerm = search.trim();
 
+    console.log(`📍 [NEARBY/OPEN] Request: lat=${lat}, lng=${lng}, radius=${maxDistance}m, limit=${queryLimit}, skip=${querySkip}, search="${searchTerm}", userId=${userId || "none"}`);
+
     // Calculate date 90 days ago
     const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
 
@@ -5709,13 +5711,18 @@ app.get("/users/nearby/open", async (req, res) => {
       activeStatus: formatActiveStatus(user.effectiveLastActive),
     }));
 
+    console.log(`✅ [NEARBY/OPEN] Response: found ${formattedUsers.length} users, hasMore=${hasMore}`);
+    if (formattedUsers.length > 0) {
+      console.log(`   Users: ${formattedUsers.map(u => `${u.name} (${u.distance}km, ${u.activeStatus})`).join(", ")}`);
+    }
+
     res.status(200).json({
       users: formattedUsers,
       count: formattedUsers.length,
       hasMore,
     });
   } catch (error) {
-    console.error("Error fetching open users:", error);
+    console.error("❌ [NEARBY/OPEN] Error fetching open users:", error);
     res.status(500).json({
       message: "Error fetching open users",
       error: error.message,
