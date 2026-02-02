@@ -75,6 +75,10 @@ const eventSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
     },
+    suggestedToUserIds: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+    }],
     expiresAt: {
       type: Date,
     },
