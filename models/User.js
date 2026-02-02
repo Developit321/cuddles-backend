@@ -178,6 +178,10 @@ const userSchema = mongoose.Schema(
       type: Date,
       default: null,
     },
+    showInOpenTab: {
+      type: Boolean,
+      default: true,
+    },
   },
   { timestamps: true }
 ); // Add timestamps option here
@@ -190,6 +194,7 @@ userSchema.index({ gender: 1, age: 1 });
 userSchema.index({ priority: 1 });
 userSchema.index({ createdAt: -1 });
 userSchema.index({ updatedAt: -1 });
+userSchema.index({ lastActiveAt: -1 });
 const User = mongoose.model("User", userSchema);
 
 module.exports = User;

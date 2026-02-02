@@ -68,8 +68,15 @@ const eventSchema = new mongoose.Schema(
     ],
     status: {
       type: String,
-      enum: ["upcoming", "live", "full", "ended", "cancelled"],
+      enum: ["upcoming", "live", "full", "ended", "cancelled", "suggested"],
       default: "upcoming",
+    },
+    suggestedToUserId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+    },
+    expiresAt: {
+      type: Date,
     },
     tags: [
       {
