@@ -5611,8 +5611,6 @@ const formatActiveStatus = (lastActiveAt) => {
 app.get("/users/nearby/open", async (req, res) => {
   try {
     const { 
-      latitude, 
-      longitude, 
       radius = 50000, 
       userId, 
       limit = 10, 
@@ -5620,33 +5618,54 @@ app.get("/users/nearby/open", async (req, res) => {
       search = ""
     } = req.query;
 
-    if (!latitude || !longitude) {
+    // Require userId to get user's location from database
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
       return res.status(400).json({
-        message: "Latitude and longitude are required",
+        message: "User ID is required",
       });
     }
 
-    const lat = parseFloat(latitude);
-    const lng = parseFloat(longitude);
+    // Fetch user's location from database
+    const currentUser = await User.findById(userId).select("location blockedBy");
+    
+    if (!currentUser) {
+      return res.status(404).json({
+        message: "User not found",
+      });
+    }
+
+    // Check if user has valid location coordinates
+    const userCoords = currentUser?.location?.coordinates;
+    if (!userCoords || 
+        !Array.isArray(userCoords) || 
+        userCoords.length !== 2 || 
+        userCoords[0] === 0 && userCoords[1] === 0 ||
+        !userCoords[0] || !userCoords[1]) {
+      return res.status(400).json({
+        message: "User location not available. Please enable location services.",
+        users: [],
+        count: 0,
+        hasMore: false,
+      });
+    }
+
+    // MongoDB stores coordinates as [longitude, latitude]
+    const lng = userCoords[0];
+    const lat = userCoords[1];
     const maxDistance = parseInt(radius);
     const queryLimit = Math.min(parseInt(limit) || 10, 50); // Cap at 50
     const querySkip = parseInt(skip) || 0;
     const searchTerm = search.trim();
 
-    console.log(`📍 [NEARBY/OPEN] Request: lat=${lat}, lng=${lng}, radius=${maxDistance}m, limit=${queryLimit}, skip=${querySkip}, search="${searchTerm}", userId=${userId || "none"}`);
+    console.log(`📍 [NEARBY/OPEN] Request: lat=${lat}, lng=${lng}, radius=${maxDistance}m, limit=${queryLimit}, skip=${querySkip}, search="${searchTerm}", userId=${userId}`);
 
     // Calculate date 90 days ago
     const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
 
     // Build exclusion list (always exclude self + blocked users)
-    let excludeIds = [];
-    if (userId && mongoose.Types.ObjectId.isValid(userId)) {
-      excludeIds.push(new mongoose.Types.ObjectId(userId));
-      // Get blocked users
-      const currentUser = await User.findById(userId).select("blockedBy");
-      if (currentUser?.blockedBy?.length > 0) {
-        excludeIds = excludeIds.concat(currentUser.blockedBy);
-      }
+    let excludeIds = [new mongoose.Types.ObjectId(userId)];
+    if (currentUser?.blockedBy?.length > 0) {
+      excludeIds = excludeIds.concat(currentUser.blockedBy);
     }
 
     // Build the query conditions
