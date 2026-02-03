@@ -4293,6 +4293,7 @@ app.post("/events", async (req, res) => {
       tags,
       status,
       suggestedToUserId,
+      suggestedToUserIds, // Array for group invites
       expiresAt,
     } = req.body;
 
@@ -4330,16 +4331,24 @@ app.post("/events", async (req, res) => {
       return res.status(404).json({ message: "Host user not found" });
     }
 
-    // Check if this is a suggestion
-    const isSuggestion = status === "suggested" && suggestedToUserId;
+    // Check if this is a suggestion (single or group)
+    const isGroupSuggestion = status === "suggested" && Array.isArray(suggestedToUserIds) && suggestedToUserIds.length > 0;
+    const isSingleSuggestion = status === "suggested" && suggestedToUserId && !isGroupSuggestion;
+    const isSuggestion = isGroupSuggestion || isSingleSuggestion;
 
-    // If it's a suggestion, validate the target user
-    let targetUser = null;
-    if (isSuggestion) {
-      targetUser = await User.findById(suggestedToUserId);
+    // Validate target users for suggestions
+    let targetUsers = [];
+    if (isGroupSuggestion) {
+      targetUsers = await User.find({ _id: { $in: suggestedToUserIds } }).select("_id name profileImages");
+      if (targetUsers.length !== suggestedToUserIds.length) {
+        return res.status(404).json({ message: "One or more suggested users not found" });
+      }
+    } else if (isSingleSuggestion) {
+      const targetUser = await User.findById(suggestedToUserId);
       if (!targetUser) {
         return res.status(404).json({ message: "Suggested user not found" });
       }
+      targetUsers = [targetUser];
     }
 
     // Create the event
@@ -4367,7 +4376,8 @@ app.post("/events", async (req, res) => {
         },
       ],
       status: isSuggestion ? "suggested" : "upcoming",
-      suggestedToUserId: isSuggestion ? suggestedToUserId : undefined,
+      suggestedToUserId: isSingleSuggestion ? suggestedToUserId : undefined,
+      suggestedToUserIds: isGroupSuggestion ? suggestedToUserIds : undefined,
       expiresAt: isSuggestion && expiresAt ? new Date(expiresAt) : undefined,
     });
 
@@ -4387,28 +4397,40 @@ app.post("/events", async (req, res) => {
     }
 
     // Send success response immediately after event is created
+    const suggestionCount = targetUsers.length;
     res.status(201).json({
-      message: isSuggestion ? "Activity suggestion sent" : "Event created successfully",
+      message: isSuggestion 
+        ? (suggestionCount > 1 ? `Activity suggestion sent to ${suggestionCount} people` : "Activity suggestion sent")
+        : "Event created successfully",
       event: populatedEvent,
     });
 
     // Handle notifications after response is sent
     setImmediate(async () => {
       try {
-        if (isSuggestion && targetUser) {
-          // Send notification to the suggested user
-          await createNotification({
-            userId: suggestedToUserId,
-            type: "activity_suggestion",
-            title: "Activity Suggestion",
-            message: `${host.name} wants to do "${title}" with you`,
-            eventId: newEvent._id,
-            eventName: title,
-            actorId: hostId,
-            actorName: host.name,
-            actorImage: host.profileImages?.[0],
-          });
-          console.log(`[Suggestion] Sent activity suggestion notification to ${targetUser.name}`);
+        if (isSuggestion && targetUsers.length > 0) {
+          // Send notification to all suggested users
+          for (const targetUser of targetUsers) {
+            try {
+              await createNotification({
+                userId: targetUser._id,
+                type: "activity_suggestion",
+                title: "Activity Suggestion",
+                message: isGroupSuggestion 
+                  ? `${host.name} invited you and ${suggestionCount - 1} others to "${title}"`
+                  : `${host.name} wants to do "${title}" with you`,
+                eventId: newEvent._id,
+                eventName: title,
+                actorId: hostId,
+                actorName: host.name,
+                actorImage: host.profileImages?.[0],
+              });
+              console.log(`[Suggestion] Sent activity suggestion notification to ${targetUser.name}`);
+            } catch (notifError) {
+              console.error(`Error creating suggestion notification for user ${targetUser._id}:`, notifError);
+            }
+          }
+          console.log(`[Suggestion] Completed sending ${suggestionCount} suggestion notifications`);
         } else {
           // Regular event - notify nearby users (within 50km)
           const [eventLng, eventLat] = location.coordinates;
@@ -5589,8 +5611,6 @@ const formatActiveStatus = (lastActiveAt) => {
 app.get("/users/nearby/open", async (req, res) => {
   try {
     const { 
-      latitude, 
-      longitude, 
       radius = 50000, 
       userId, 
       limit = 10, 
@@ -5598,31 +5618,54 @@ app.get("/users/nearby/open", async (req, res) => {
       search = ""
     } = req.query;
 
-    if (!latitude || !longitude) {
+    // Require userId to get user's location from database
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
       return res.status(400).json({
-        message: "Latitude and longitude are required",
+        message: "User ID is required",
       });
     }
 
-    const lat = parseFloat(latitude);
-    const lng = parseFloat(longitude);
+    // Fetch user's location from database
+    const currentUser = await User.findById(userId).select("location blockedBy");
+    
+    if (!currentUser) {
+      return res.status(404).json({
+        message: "User not found",
+      });
+    }
+
+    // Check if user has valid location coordinates
+    const userCoords = currentUser?.location?.coordinates;
+    if (!userCoords || 
+        !Array.isArray(userCoords) || 
+        userCoords.length !== 2 || 
+        userCoords[0] === 0 && userCoords[1] === 0 ||
+        !userCoords[0] || !userCoords[1]) {
+      return res.status(400).json({
+        message: "User location not available. Please enable location services.",
+        users: [],
+        count: 0,
+        hasMore: false,
+      });
+    }
+
+    // MongoDB stores coordinates as [longitude, latitude]
+    const lng = userCoords[0];
+    const lat = userCoords[1];
     const maxDistance = parseInt(radius);
     const queryLimit = Math.min(parseInt(limit) || 10, 50); // Cap at 50
     const querySkip = parseInt(skip) || 0;
     const searchTerm = search.trim();
 
+    console.log(`📍 [NEARBY/OPEN] Request: lat=${lat}, lng=${lng}, radius=${maxDistance}m, limit=${queryLimit}, skip=${querySkip}, search="${searchTerm}", userId=${userId}`);
+
     // Calculate date 90 days ago
     const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
 
     // Build exclusion list (always exclude self + blocked users)
-    let excludeIds = [];
-    if (userId && mongoose.Types.ObjectId.isValid(userId)) {
-      excludeIds.push(new mongoose.Types.ObjectId(userId));
-      // Get blocked users
-      const currentUser = await User.findById(userId).select("blockedBy");
-      if (currentUser?.blockedBy?.length > 0) {
-        excludeIds = excludeIds.concat(currentUser.blockedBy);
-      }
+    let excludeIds = [new mongoose.Types.ObjectId(userId)];
+    if (currentUser?.blockedBy?.length > 0) {
+      excludeIds = excludeIds.concat(currentUser.blockedBy);
     }
 
     // Build the query conditions
@@ -5709,13 +5752,18 @@ app.get("/users/nearby/open", async (req, res) => {
       activeStatus: formatActiveStatus(user.effectiveLastActive),
     }));
 
+    console.log(`✅ [NEARBY/OPEN] Response: found ${formattedUsers.length} users, hasMore=${hasMore}`);
+    if (formattedUsers.length > 0) {
+      console.log(`   Users: ${formattedUsers.map(u => `${u.name} (${u.distance}km, ${u.activeStatus})`).join(", ")}`);
+    }
+
     res.status(200).json({
       users: formattedUsers,
       count: formattedUsers.length,
       hasMore,
     });
   } catch (error) {
-    console.error("Error fetching open users:", error);
+    console.error("❌ [NEARBY/OPEN] Error fetching open users:", error);
     res.status(500).json({
       message: "Error fetching open users",
       error: error.message,
@@ -5785,14 +5833,20 @@ app.post("/events/:eventId/respond-suggestion", async (req, res) => {
       return res.status(404).json({ message: "Activity not found" });
     }
 
-    // Verify the event is a suggestion and this user is the recipient
+    // Verify the event is a suggestion and this user is a recipient
     if (event.status !== "suggested") {
       return res.status(400).json({ message: "This activity is not a suggestion" });
     }
 
-    if (event.suggestedToUserId?.toString() !== userId) {
+    // Check if user is authorized (single suggestion or group invite)
+    const isSingleRecipient = event.suggestedToUserId?.toString() === userId;
+    const isGroupRecipient = event.suggestedToUserIds?.some(id => id.toString() === userId);
+    
+    if (!isSingleRecipient && !isGroupRecipient) {
       return res.status(403).json({ message: "You are not authorized to respond to this suggestion" });
     }
+
+    const isGroupInvite = event.suggestedToUserIds && event.suggestedToUserIds.length > 0;
 
     // Check if suggestion has expired
     if (event.expiresAt && new Date(event.expiresAt) < new Date()) {
@@ -5801,15 +5855,36 @@ app.post("/events/:eventId/respond-suggestion", async (req, res) => {
     }
 
     if (response === "accept") {
-      // Accept: Change status to upcoming, add responder as participant
+      // Check if user already joined (prevent duplicate joins for group invites)
+      const alreadyJoined = event.participants.some(p => p.userId?.toString() === userId);
+      if (alreadyJoined) {
+        return res.status(400).json({ message: "You have already accepted this activity" });
+      }
+
+      // Build the update
+      const participantsToAdd = [];
+      
+      // For first acceptance, add the host as participant too
+      const isFirstAcceptance = event.participants.length === 0;
+      if (isFirstAcceptance) {
+        participantsToAdd.push({
+          userId: event.hostId._id,
+          status: "going",
+          joinedAt: new Date(),
+        });
+      }
+      
+      // Add the responding user
+      participantsToAdd.push({
+        userId: userId,
+        status: "going",
+        joinedAt: new Date(),
+      });
+
       await Event.findByIdAndUpdate(eventId, {
         status: "upcoming",
         $push: {
-          participants: {
-            userId: userId,
-            status: "going",
-            joinedAt: new Date(),
-          },
+          participants: { $each: participantsToAdd },
         },
       });
 
@@ -5820,7 +5895,9 @@ app.post("/events/:eventId/respond-suggestion", async (req, res) => {
         userId: event.hostId._id,
         type: "suggestion_accepted",
         title: "Suggestion Accepted!",
-        message: `${respondingUser.name} accepted your activity suggestion: ${event.title}`,
+        message: isGroupInvite 
+          ? `${respondingUser.name} joined your group activity: ${event.title}`
+          : `${respondingUser.name} accepted your activity suggestion: ${event.title}`,
         eventId: event._id,
         eventName: event.title,
         actorId: userId,
@@ -5833,12 +5910,32 @@ app.post("/events/:eventId/respond-suggestion", async (req, res) => {
         event: await Event.findById(eventId).populate("hostId", "name profileImages"),
       });
     } else {
-      // Decline: Silently mark as cancelled (no notification to suggester)
-      await Event.findByIdAndUpdate(eventId, { status: "cancelled" });
+      // Decline: For group invites, just remove this user from the invite list
+      // For single invites, cancel the event
+      if (isGroupInvite) {
+        // Remove user from suggestedToUserIds
+        await Event.findByIdAndUpdate(eventId, {
+          $pull: { suggestedToUserIds: new mongoose.Types.ObjectId(userId) },
+        });
+        
+        // Check if all users have declined (no one left in the list)
+        const updatedEvent = await Event.findById(eventId);
+        if (updatedEvent.suggestedToUserIds.length === 0 && updatedEvent.participants.length === 0) {
+          // No one accepted and everyone declined - cancel the event
+          await Event.findByIdAndUpdate(eventId, { status: "cancelled" });
+        }
+        
+        res.status(200).json({
+          message: "Invitation declined",
+        });
+      } else {
+        // Single invite - cancel the event
+        await Event.findByIdAndUpdate(eventId, { status: "cancelled" });
 
-      res.status(200).json({
-        message: "Suggestion declined",
-      });
+        res.status(200).json({
+          message: "Suggestion declined",
+        });
+      }
     }
   } catch (error) {
     console.error("Error responding to suggestion:", error);
