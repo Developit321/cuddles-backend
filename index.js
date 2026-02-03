@@ -5625,22 +5625,26 @@ app.get("/users/nearby/open", async (req, res) => {
       });
     }
 
-    // Fetch user's location from database
-    const currentUser = await User.findById(userId).select("location blockedBy");
+    // Fetch user's location from database (IGNORE any client-sent lat/lng)
+    const currentUser = await User.findById(userId).select("location blockedBy name");
     
     if (!currentUser) {
+      console.log(`❌ [NEARBY/OPEN] User not found: ${userId}`);
       return res.status(404).json({
         message: "User not found",
       });
     }
+
+    console.log(`👤 [NEARBY/OPEN] User: ${currentUser.name}, stored location: ${JSON.stringify(currentUser?.location?.coordinates)}`);
 
     // Check if user has valid location coordinates
     const userCoords = currentUser?.location?.coordinates;
     if (!userCoords || 
         !Array.isArray(userCoords) || 
         userCoords.length !== 2 || 
-        userCoords[0] === 0 && userCoords[1] === 0 ||
+        (userCoords[0] === 0 && userCoords[1] === 0) ||
         !userCoords[0] || !userCoords[1]) {
+      console.log(`❌ [NEARBY/OPEN] Invalid location for user ${currentUser.name}: ${JSON.stringify(userCoords)}`);
       return res.status(400).json({
         message: "User location not available. Please enable location services.",
         users: [],
@@ -5652,6 +5656,8 @@ app.get("/users/nearby/open", async (req, res) => {
     // MongoDB stores coordinates as [longitude, latitude]
     const lng = userCoords[0];
     const lat = userCoords[1];
+    
+    console.log(`📍 [NEARBY/OPEN] Using DB coordinates for ${currentUser.name}: lat=${lat}, lng=${lng}`);
     const maxDistance = parseInt(radius);
     const queryLimit = Math.min(parseInt(limit) || 10, 50); // Cap at 50
     const querySkip = parseInt(skip) || 0;
@@ -5688,6 +5694,8 @@ app.get("/users/nearby/open", async (req, res) => {
       { "location.coordinates": { $exists: true, $ne: [0, 0] } },
       // Must have at least one interest
       { interests: { $exists: true, $not: { $size: 0 } } },
+      // Must have at least one profile image
+      { profileImages: { $exists: true, $not: { $size: 0 } } },
       // Exclude self and blocked users
       ...(excludeIds.length > 0 ? [{ _id: { $nin: excludeIds } }] : []),
     ];
@@ -5805,6 +5813,47 @@ app.put("/users/:userId/open-visibility", async (req, res) => {
       message: "Error updating visibility",
       error: error.message,
     });
+  }
+});
+
+// GET /users/:userId/debug-location - Debug endpoint to check user's stored location
+app.get("/users/:userId/debug-location", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Invalid user ID format" });
+    }
+
+    const user = await User.findById(userId).select("name location updatedAt");
+    
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const coords = user?.location?.coordinates;
+    const lng = coords?.[0];
+    const lat = coords?.[1];
+
+    // Check if coords look like San Francisco (for debugging)
+    const isSanFrancisco = lat && lng && 
+      Math.abs(lat - 37.7749) < 0.5 && 
+      Math.abs(lng - (-122.4194)) < 0.5;
+
+    res.status(200).json({
+      userId,
+      name: user.name,
+      location: user.location,
+      coordinates: { latitude: lat, longitude: lng },
+      isSanFrancisco,
+      lastUpdated: user.updatedAt,
+      message: isSanFrancisco 
+        ? "⚠️ Location appears to be San Francisco - may need to update from real device" 
+        : "✅ Location looks valid",
+    });
+  } catch (error) {
+    console.error("Error checking user location:", error);
+    res.status(500).json({ message: "Error checking location", error: error.message });
   }
 });
 
