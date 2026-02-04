@@ -132,8 +132,8 @@ mongoose
     console.log("Error connecting to the Database", error);
   });
 
-http.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
+http.listen(port, "0.0.0.0", () => {
+  console.log(`Server is running on port ${port} and accessible from network`);
 });
 
 module.exports = mongoose;
@@ -1216,6 +1216,10 @@ app.get("/profiles", async (req, res) => {
         : 50;
     const maxDistanceMeters = parsedMaxDistanceKm * 1000;
 
+    // Filter out stale accounts (inactive for 60+ days)
+    const staleAccountThreshold = new Date();
+    staleAccountThreshold.setDate(staleAccountThreshold.getDate() - 60);
+
     // Input validation
     if (!mongoose.Types.ObjectId.isValid(userId) || !gender) {
       return res
@@ -1251,25 +1255,32 @@ app.get("/profiles", async (req, res) => {
       mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : id
     );
 
-    // Base query criteria
+    // Determine gender filter
+    const genderFilter =
+      gender === "both"
+        ? currentUser.gender === "male"
+          ? "female"
+          : "male"
+        : gender;
+
+    // Base query criteria - optimized filters for better performance
     const baseMatch = {
       _id: { $nin: excludedObjectIds },
-      gender:
-        gender === "both"
-          ? currentUser.gender === "male"
-            ? "female"
-            : "male"
-          : gender,
+      gender: genderFilter,
       age: {
         $gte: minAge.toString(),
         $lte: maxAge.toString(),
       },
-      profileImages: { $exists: true, $not: { $size: 0 } },
-      $or: [{ anonymous: { $exists: false } }, { anonymous: false }],
-      $and: [
-        {
-          $or: [{ flagged: { $exists: false } }, { flagged: { $ne: true } }],
-        },
+      profileImages: { $exists: true, $ne: [] },  // Faster than $not: { $size: 0 }
+      anonymous: { $ne: true },                    // Simpler than $or with $exists
+      flagged: { $ne: true },                      // Simpler than $and/$or with $exists
+      // Filter out stale accounts using lastActiveAt or updatedAt as fallback
+      $or: [
+        { lastActiveAt: { $gte: staleAccountThreshold } },
+        { 
+          lastActiveAt: { $exists: false },
+          updatedAt: { $gte: staleAccountThreshold }
+        }
       ],
     };
 
@@ -1280,10 +1291,30 @@ app.get("/profiles", async (req, res) => {
       };
     }
 
+    // Projection to limit returned fields for better performance
+    const profileProjection = {
+      _id: 1,
+      name: 1,
+      age: 1,
+      gender: 1,
+      profileImages: 1,
+      description: 1,
+      interests: 1,
+      verified: 1,
+      location: 1,
+      occupation: 1,
+      university: 1,
+      preferences: 1,
+      availability: 1,
+      expectations: 1,
+      lookingFor: 1,
+      distance: 1,
+    };
+
     let profiles = [];
     let hasLocation = false;
 
-    // Function to get profiles with country filter
+    // Function to get profiles with country filter - optimized with $facet
     const getProfilesWithCountry = async (countryFilter = true) => {
       const query = { ...baseMatch };
       if (countryFilter && userCountry) {
@@ -1316,6 +1347,7 @@ app.get("/profiles", async (req, res) => {
                 key: "location",
               },
             },
+            { $project: profileProjection },
             { $limit: 20 },
           ]).option({ maxTimeMS: 5000 });
 
@@ -1331,66 +1363,68 @@ app.get("/profiles", async (req, res) => {
         }
       }
 
-      // If we don't have enough profiles, get priority users from same country/filter
+      // If we don't have enough profiles, use $facet to get both priority and newest in one query
       if (countryProfiles.length < 20) {
-        const existingProfileIds = new Set(
-          countryProfiles.map((p) => p._id.toString())
+        const existingProfileIds = countryProfiles.map((p) => 
+          mongoose.Types.ObjectId.isValid(p._id) ? new mongoose.Types.ObjectId(p._id) : p._id
         );
         const neededProfiles = 20 - countryProfiles.length;
         console.log(
-          `🎯 Attempting to find ${neededProfiles} priority profiles${
+          `🎯 Attempting to find ${neededProfiles} additional profiles${
             countryFilter ? ` in ${userCountry}` : ""
-          }`
+          } using $facet`
         );
 
-        const priorityProfiles = await User.find({
-          _id: { $nin: [...excludedObjectIds, ...existingProfileIds] },
-          priority: 1,
-          ...query,
-        })
-          .limit(neededProfiles)
-          .lean();
+        // Combine priority and random sample queries using $facet for single DB round-trip
+        const facetResults = await User.aggregate([
+          {
+            $match: {
+              _id: { $nin: [...excludedObjectIds, ...existingProfileIds] },
+              ...query,
+            },
+          },
+          {
+            $facet: {
+              priorityUsers: [
+                { $match: { priority: 1 } },
+                { $project: profileProjection },
+                { $limit: neededProfiles },
+              ],
+              randomUsers: [
+                { $sample: { size: neededProfiles } },  // Use $sample for better variety
+                { $project: profileProjection },
+              ],
+            },
+          },
+        ]).option({ maxTimeMS: 5000 });
 
-        countryProfiles.push(...priorityProfiles);
-        console.log(
-          `⭐ Found ${priorityProfiles.length} priority profiles${
-            countryFilter ? ` in ${userCountry}` : ""
-          }`
-        );
-        console.log(
-          `📊 Total profiles after priority: ${countryProfiles.length}`
-        );
-      }
+        if (facetResults.length > 0) {
+          const { priorityUsers = [], randomUsers = [] } = facetResults[0];
+          
+          // Add priority users first
+          const priorityIds = new Set();
+          priorityUsers.forEach((p) => {
+            const idStr = p._id.toString();
+            if (!existingProfileIds.some((id) => id.toString() === idStr)) {
+              countryProfiles.push(p);
+              priorityIds.add(idStr);
+            }
+          });
+          console.log(`⭐ Found ${priorityUsers.length} priority profiles`);
 
-      // If still need more profiles, get newest users from same country/filter
-      if (countryProfiles.length < 20) {
-        const existingProfileIds = new Set(
-          countryProfiles.map((p) => p._id.toString())
-        );
-        const neededProfiles = 20 - countryProfiles.length;
-        console.log(
-          `🆕 Attempting to find ${neededProfiles} newest profiles${
-            countryFilter ? ` in ${userCountry}` : ""
-          }`
-        );
+          // Add random users that aren't already included (using $sample for variety)
+          const stillNeeded = 20 - countryProfiles.length;
+          if (stillNeeded > 0) {
+            const existingIds = new Set(countryProfiles.map((p) => p._id.toString()));
+            const uniqueRandom = randomUsers.filter(
+              (p) => !existingIds.has(p._id.toString())
+            );
+            countryProfiles.push(...uniqueRandom.slice(0, stillNeeded));
+            console.log(`🎲 Added ${Math.min(uniqueRandom.length, stillNeeded)} random profiles`);
+          }
+        }
 
-        const newestProfiles = await User.find({
-          _id: { $nin: [...excludedObjectIds, ...existingProfileIds] },
-          ...query,
-        })
-          .sort({ createdAt: -1 })
-          .limit(neededProfiles)
-          .lean();
-
-        countryProfiles.push(...newestProfiles);
-        console.log(
-          `📅 Found ${newestProfiles.length} newest profiles${
-            countryFilter ? ` in ${userCountry}` : ""
-          }`
-        );
-        console.log(
-          `📊 Total profiles after newest: ${countryProfiles.length}`
-        );
+        console.log(`📊 Total profiles after $facet: ${countryProfiles.length}`);
       }
 
       return countryProfiles;
@@ -1423,8 +1457,12 @@ app.get("/profiles", async (req, res) => {
       console.log(`📊 Final total profiles: ${profiles.length}`);
     }
 
-    // Apply in-memory shuffle for randomness
-    const shuffledProfiles = profiles.sort(() => Math.random() - 0.5);
+    // Apply Fisher-Yates shuffle for proper randomness (in-place)
+    for (let i = profiles.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [profiles[i], profiles[j]] = [profiles[j], profiles[i]];
+    }
+    const shuffledProfiles = profiles;
 
     // Calculate distances if location is provided
     if (hasLocation && shuffledProfiles.length > 0) {
@@ -1530,28 +1568,111 @@ app.get("/recievedLikes/:userId/info", async (req, res) => {
   try {
     const { userId } = req.params;
 
-    // Retrieve the current user along with their crushes
-    const currentUser = await User.findById(userId).populate("crushes", "_id");
+    // Retrieve the current user with their interests for mutual matching
+    const currentUser = await User.findById(userId)
+      .select("recievedLikes profileDislikes interests location")
+      .lean();
 
     if (!currentUser) {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Extract the IDs of the current user's crushes
+    // Extract the IDs of the current user's disliked profiles
     const deslikedProfileId = (currentUser.profileDislikes || []).map(
-      (profileDeslike) => profileDeslike._id
+      (profileDeslike) => profileDeslike.toString()
     );
 
-    // Find users in the recievedLikes array but exclude users that are in crushes
+    // Find users in the recievedLikes array but exclude disliked profiles
     const recievedLikesArray = await User.find({
-      _id: { $in: currentUser.recievedLikes, $nin: deslikedProfileId }, // Filter out crushes
+      _id: { $in: currentUser.recievedLikes, $nin: deslikedProfileId },
+    }).select(
+      "_id name age gender profileImages location interests verified lastActiveAt updatedAt"
+    ).lean();
+
+    // Add mutual interests and format response for premium features
+    const formattedLikes = recievedLikesArray.map((user) => {
+      const userInterests = user.interests || [];
+      const currentUserInterests = currentUser.interests || [];
+      const mutualInterests = userInterests.filter(
+        (interest) => currentUserInterests.includes(interest)
+      );
+      
+      return {
+        ...user,
+        mutualInterests,
+        mutualInterestsCount: mutualInterests.length,
+      };
     });
 
-    // Return the filtered received likes
-    return res.status(200).json(recievedLikesArray);
+    // Return the formatted received likes
+    return res.status(200).json(formattedLikes);
   } catch (error) {
     console.error("Error fetching received likes:", error);
     res.status(500).json({ message: "Failed to retrieve the received likes" });
+  }
+});
+
+// Super Wave - Premium feature to get noticed by nearby users
+// Also triggers the like functionality (adds to recievedLikes and crushes)
+app.post("/super-wave", async (req, res) => {
+  try {
+    const { senderId, receiverId } = req.body;
+
+    if (!senderId || !receiverId) {
+      return res.status(400).json({ message: "senderId and receiverId are required" });
+    }
+
+    const sender = await User.findById(senderId).select("name profileImages crushes").lean();
+    const receiver = await User.findById(receiverId).select("pushToken recievedLikes").lean();
+
+    if (!sender || !receiver) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // Check if already liked to avoid duplicates
+    const alreadyLiked = receiver.recievedLikes?.some(
+      (id) => id.toString() === senderId.toString()
+    );
+
+    if (!alreadyLiked) {
+      // Add sender to receiver's recievedLikes (like functionality)
+      await User.findByIdAndUpdate(receiverId, {
+        $addToSet: { recievedLikes: senderId },
+      });
+
+      // Add receiver to sender's crushes
+      await User.findByIdAndUpdate(senderId, {
+        $addToSet: { crushes: receiverId },
+      });
+
+      // Create profile_like notification (so it shows in their Likes screen)
+      await createNotification({
+        userId: receiverId,
+        type: "profile_like",
+        title: "Someone likes you!",
+        message: `${sender.name || "Someone"} sent you a Super Wave and likes your profile`,
+        actorId: senderId,
+        actorName: sender.name,
+        actorImage: sender.profileImages?.[0] || null,
+      });
+    }
+
+    // Create super_wave notification (separate wave notification)
+    await createNotification({
+      userId: receiverId,
+      type: "super_wave",
+      title: "Someone waved at you!",
+      message: `${sender.name || "Someone"} sent you a Super Wave`,
+      actorId: senderId,
+      actorName: sender.name,
+      actorImage: sender.profileImages?.[0] || null,
+    });
+
+    console.log(`Super Wave sent from ${senderId} to ${receiverId}${alreadyLiked ? ' (already liked)' : ' (like added)'}`);
+    res.status(200).json({ message: "Super Wave sent successfully" });
+  } catch (error) {
+    console.error("Error sending super wave:", error);
+    res.status(500).json({ message: "Failed to send Super Wave" });
   }
 });
 
@@ -1886,8 +2007,8 @@ app.post("/user/:userId/update-location", async (req, res) => {
 
 app.get("/nearby-users", async (req, res) => {
   try {
-    const { longitude, latitude, maxDistance } = req.query;
-    console.log(longitude, latitude, maxDistance);
+    const { longitude, latitude, maxDistance, userId, limit } = req.query;
+    console.log(longitude, latitude, maxDistance, userId, limit);
 
     if (!longitude || !latitude || !maxDistance) {
       return res
@@ -1909,6 +2030,45 @@ app.get("/nearby-users", async (req, res) => {
       `Searching for users within ${parsedMaxDistance}m of [${parsedLong}, ${parsedLat}]`
     );
 
+    // Fetch user data upfront (like /profiles endpoint) - optimized for performance
+    let excludedIds = [];
+    let genderFilter = null;
+    
+    if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+      const currentUser = await User.findById(userId)
+        .select("gender blockedBy")
+        .lean();
+      
+      if (currentUser) {
+        // Exclude current user
+        excludedIds.push(new mongoose.Types.ObjectId(userId));
+        
+        // Exclude users who have blocked the current user
+        if (currentUser.blockedBy?.length > 0) {
+          excludedIds = excludedIds.concat(
+            currentUser.blockedBy.map(id => new mongoose.Types.ObjectId(id))
+          );
+        }
+        
+        // iOS Cuddles specific: Filter by opposite gender (dating app)
+        if (currentUser.gender === "male") {
+          genderFilter = "female";
+        } else if (currentUser.gender === "female") {
+          genderFilter = "male";
+        }
+      }
+    }
+
+    // Optimized query filter - all exclusions included upfront (no $lookup needed)
+    const queryFilter = {
+      profileImages: { $exists: true, $ne: [] },
+      "location.coordinates": { $exists: true, $ne: [0, 0] },
+      flagged: { $ne: true },
+      ...(excludedIds.length > 0 && { _id: { $nin: excludedIds } }),
+      ...(genderFilter && { gender: genderFilter }), // iOS Cuddles: opposite gender only
+    };
+
+    // Simple aggregation pipeline - no expensive $lookup
     const nearbyUsers = await User.aggregate([
       {
         $geoNear: {
@@ -1917,12 +2077,9 @@ app.get("/nearby-users", async (req, res) => {
             coordinates: [parsedLong, parsedLat],
           },
           distanceField: "distance",
-          maxDistance: parsedMaxDistance, // Use the actual parameter instead of hardcoded value
+          maxDistance: parsedMaxDistance,
           spherical: true,
-          query: {
-            profileImages: { $exists: true, $not: { $size: 0 } }, // Has profile images
-            "location.coordinates": { $exists: true, $not: { $size: 0 } }, // Has location data
-          },
+          query: queryFilter,
           distanceMultiplier: 0.001, // Convert to kilometers
         },
       },
@@ -1931,27 +2088,24 @@ app.get("/nearby-users", async (req, res) => {
           _id: 1,
           name: 1,
           age: 1,
-          location: 1,
-          profileImages: 1,
-          pushToken: 1,
+          gender: 1,
+          profileImages: { $slice: ["$profileImages", 1] }, // Only first image
           distance: 1,
           verified: 1,
+          description: 1,
         },
       },
       {
-        $limit: 50, // Limit results to prevent overwhelming the frontend
+        $limit: Math.min(parseInt(limit) || 20, 50), // Default 20, max 50
       },
-    ]);
+    ]).option({ maxTimeMS: 5000 });
 
     console.log(`Found ${nearbyUsers.length} nearby users`);
 
-    if (nearbyUsers.length === 0) {
-      return res
-        .status(200)
-        .json({ message: "No users found nearby", users: [] });
-    }
-
-    res.status(200).json({ message: "Nearby users found", users: nearbyUsers });
+    res.status(200).json({ 
+      message: nearbyUsers.length > 0 ? "Nearby users found" : "No users found nearby",
+      users: nearbyUsers 
+    });
   } catch (error) {
     console.error("Error finding nearby users:", error);
     res

@@ -178,6 +178,10 @@ const userSchema = mongoose.Schema(
       type: Date,
       default: null,
     },
+    lastActiveAt: {
+      type: Date,
+      default: null,
+    },
     showInOpenTab: {
       type: Boolean,
       default: true,
@@ -195,6 +199,15 @@ userSchema.index({ priority: 1 });
 userSchema.index({ createdAt: -1 });
 userSchema.index({ updatedAt: -1 });
 userSchema.index({ lastActiveAt: -1 });
+
+// Compound indexes for optimized profile and nearby-users queries
+userSchema.index({ "location.country": 1, gender: 1, flagged: 1 });
+userSchema.index({ flagged: 1, anonymous: 1 });
+userSchema.index({ lastActiveAt: -1, flagged: 1, anonymous: 1 });
+
+// Index for nearby-users query optimization (supports $geoNear filter)
+userSchema.index({ flagged: 1, profileImages: 1 });
+
 const User = mongoose.model("User", userSchema);
 
 module.exports = User;
