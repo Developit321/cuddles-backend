@@ -49,7 +49,15 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   return R * c; // Distance in kilometers
 }
 
+// Check if a string looks like a valid Expo push token (API-only; app may not send token)
+const isValidExpoPushToken = (token) => {
+  if (!token || typeof token !== "string") return false;
+  const t = token.trim();
+  return t.length > 0 && (t.startsWith("ExponentPushToken[") || t.startsWith("ExpoPushToken["));
+};
+
 // Helper function to create and send notifications
+// In-app notification is always saved; push is best-effort only (no token or invalid token = no push, no failure)
 const createNotification = async ({
   userId,
   type,
@@ -62,7 +70,7 @@ const createNotification = async ({
   actorImage,
 }) => {
   try {
-    // 1. Save to database
+    // 1. Save to database (in-app notification) – always attempt
     const notification = new Notification({
       userId,
       type,
@@ -76,17 +84,20 @@ const createNotification = async ({
     });
     await notification.save();
 
-    // 2. Send push notification if user has token
-    const user = await User.findById(userId).select("pushToken");
-    if (user?.pushToken) {
+    // 2. Send push only if user has a valid Expo push token (optional; never fail the request)
+    const user = await User.findById(userId).select("pushToken").lean();
+    const token = user?.pushToken;
+    if (isValidExpoPushToken(token)) {
       try {
-        await sendNotification(user.pushToken, title, message);
+        await sendNotification(token, title, message);
       } catch (pushError) {
         console.error(
-          `[Notification] Failed to send push notification to user ${userId}:`,
-          pushError
+          `[Notification] Failed to send push to user ${userId}:`,
+          pushError?.message || pushError
         );
       }
+    } else if (token) {
+      console.log(`[Notification] User ${userId} has no valid Expo push token, skipping push`);
     }
 
     console.log(
@@ -1543,7 +1554,7 @@ app.post("/likeprofile", async (req, res) => {
       await createNotification({
         userId: selectedUserId,
         type: "profile_like",
-        title: "Someone likes you!",
+        title: "Someone wants to connect",
         message: `${currentUser.name || "A user"} wants to connect with you`,
         actorId: currentUserId,
         actorName: currentUser.name,
@@ -1645,28 +1656,36 @@ app.post("/super-wave", async (req, res) => {
         $addToSet: { crushes: receiverId },
       });
 
-      // Create profile_like notification (so it shows in their Likes screen)
+      // Create profile_like notification (in-app only if no push token; never fail the wave)
+      try {
+        await createNotification({
+          userId: receiverId,
+          type: "profile_like",
+          title: "Someone wants to connect",
+          message: `${sender.name || "Someone"} sent you a Super Wave and likes your profile`,
+          actorId: senderId,
+          actorName: sender.name,
+          actorImage: sender.profileImages?.[0] || null,
+        });
+      } catch (notifErr) {
+        console.error("[Super Wave] profile_like notification failed (wave still succeeded):", notifErr?.message || notifErr);
+      }
+    }
+
+    // Create super_wave notification (in-app only if no push token; never fail the wave)
+    try {
       await createNotification({
         userId: receiverId,
-        type: "profile_like",
-        title: "Someone likes you!",
-        message: `${sender.name || "Someone"} sent you a Super Wave and likes your profile`,
+        type: "super_wave",
+        title: "Someone waved at you!",
+        message: `${sender.name || "Someone"} sent you a Super Wave`,
         actorId: senderId,
         actorName: sender.name,
         actorImage: sender.profileImages?.[0] || null,
       });
+    } catch (notifErr) {
+      console.error("[Super Wave] super_wave notification failed (wave still succeeded):", notifErr?.message || notifErr);
     }
-
-    // Create super_wave notification (separate wave notification)
-    await createNotification({
-      userId: receiverId,
-      type: "super_wave",
-      title: "Someone waved at you!",
-      message: `${sender.name || "Someone"} sent you a Super Wave`,
-      actorId: senderId,
-      actorName: sender.name,
-      actorImage: sender.profileImages?.[0] || null,
-    });
 
     console.log(`Super Wave sent from ${senderId} to ${receiverId}${alreadyLiked ? ' (already liked)' : ' (like added)'}`);
     res.status(200).json({ message: "Super Wave sent successfully" });
