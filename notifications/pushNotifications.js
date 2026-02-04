@@ -1,4 +1,17 @@
 const sendNotification = async (expoPushToken, title, body) => {
+  // Skip sending if no token or invalid format - never throw so callers (e.g. wave) don't fail
+  const isValidToken =
+    expoPushToken &&
+    typeof expoPushToken === "string" &&
+    (expoPushToken.startsWith("ExponentPushToken[") || expoPushToken.startsWith("ExpoPushToken[")) &&
+    expoPushToken.endsWith("]");
+  if (!isValidToken) {
+    console.log(
+      "[Push Notification] Skipping send: no valid Expo push token (missing or invalid format)"
+    );
+    return null;
+  }
+
   const message = {
     to: expoPushToken,
     sound: "default",
