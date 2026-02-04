@@ -1554,7 +1554,7 @@ app.post("/likeprofile", async (req, res) => {
       await createNotification({
         userId: selectedUserId,
         type: "profile_like",
-        title: "Someone likes you!",
+        title: "Someone wants to connect",
         message: `${currentUser.name || "A user"} wants to connect with you`,
         actorId: currentUserId,
         actorName: currentUser.name,
@@ -1661,7 +1661,7 @@ app.post("/super-wave", async (req, res) => {
         await createNotification({
           userId: receiverId,
           type: "profile_like",
-          title: "Someone likes you!",
+          title: "Someone wants to connect",
           message: `${sender.name || "Someone"} sent you a Super Wave and likes your profile`,
           actorId: senderId,
           actorName: sender.name,
