@@ -16,6 +16,7 @@ const notificationSchema = new mongoose.Schema({
       "event_cancelled",
       "event_updated",
       "profile_like",
+      "super_wave",
       "activity_suggestion",
       "suggestion_accepted",
       "suggestion_declined",
