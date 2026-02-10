@@ -104,6 +104,11 @@ const userSchema = mongoose.Schema(
     pushToken: {
       type: String,
     },
+    platform: {
+      type: String,
+      enum: ["ios", "android", "unknown"],
+      default: "unknown",
+    },
     interests: {
       type: [String],
       default: [],

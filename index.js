@@ -556,9 +556,15 @@ io.on("connection", (socket) => {
 // Register endpoint
 app.post("/register", async (req, res) => {
   try {
-    const { name, email, password, age } = req.body;
+    const { name, email, password, age, platform } = req.body;
 
     console.log(name, email, age);
+
+    // Validate and normalize platform
+    const validPlatforms = ["ios", "android", "unknown"];
+    const normalizedPlatform = platform && validPlatforms.includes(platform.toLowerCase()) 
+      ? platform.toLowerCase() 
+      : "unknown";
 
     // Validate required fields for all users
     if (!name || !email || !age) {
@@ -609,6 +615,7 @@ app.post("/register", async (req, res) => {
       email: normalizedEmail,
       password: hashedPassword, // Will be null if no password is provided
       age,
+      platform: normalizedPlatform,
     });
 
     // Generate a verification token
@@ -1940,6 +1947,23 @@ app.put("/push-notification-token/:userId", async (req, res) => {
     res
       .status(500)
       .json({ message: "Error updating users push token ", error: error.message });
+  }
+});
+
+// Migration endpoint: Set all users without platform field to "unknown"
+app.post("/admin/migrate-user-platforms", async (req, res) => {
+  try {
+    const result = await User.updateMany(
+      { platform: { $exists: false } },
+      { $set: { platform: "unknown" } }
+    );
+    res.json({ 
+      message: "Migration completed", 
+      updated: result.modifiedCount 
+    });
+  } catch (error) {
+    console.error("Error migrating user platforms:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
