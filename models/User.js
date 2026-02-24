@@ -191,6 +191,10 @@ const userSchema = mongoose.Schema(
       type: Boolean,
       default: true,
     },
+    instagramUrl: {
+      type: String,
+      default: "",
+    },
   },
   { timestamps: true }
 ); // Add timestamps option here

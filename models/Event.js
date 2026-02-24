@@ -87,6 +87,11 @@ const eventSchema = new mongoose.Schema(
         type: String,
       },
     ],
+    audience: {
+      type: String,
+      enum: ["everyone", "women_only", "men_only"],
+      default: "everyone",
+    },
     checkInRadius: {
       type: Number,
       default: 100, // meters
