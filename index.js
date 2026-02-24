@@ -2103,10 +2103,12 @@ app.get("/nearby-users", async (req, res) => {
     }
 
     // Optimized query filter - all exclusions included upfront (no $lookup needed)
+    // Never show iOS platform users on find people nearby (iOS app shows only android/unknown)
     const queryFilter = {
       profileImages: { $exists: true, $ne: [] },
       "location.coordinates": { $exists: true, $ne: [0, 0] },
       flagged: { $ne: true },
+      platform: { $ne: "ios" },
       ...(excludedIds.length > 0 && { _id: { $nin: excludedIds } }),
       ...(genderFilter && { gender: genderFilter }), // iOS Cuddles: opposite gender only
     };
