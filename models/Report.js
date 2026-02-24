@@ -9,7 +9,14 @@ const reportSchema = new mongoose.Schema({
   reportedUserId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "User",
-    required: true,
+  },
+  reportedEventId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Event",
+  },
+  reason: {
+    type: String,
+    enum: ["fake_profile", "harassment", "scam", "offensive_content", "no_show", "other"],
   },
   message: {
     type: String,

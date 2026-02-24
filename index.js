@@ -13,6 +13,7 @@ const Message = require("./models/message");
 const Event = require("./models/Event");
 const EventMessage = require("./models/EventMessage");
 const Notification = require("./models/Notification");
+const Rating = require("./models/Rating");
 const jwt = require("jsonwebtoken");
 const cloudinary = require("cloudinary");
 const app = express();
@@ -883,6 +884,26 @@ app.put("/users/:userId/description", async (req, res) => {
       .json({ message: "user description updated Succesfully" });
   } catch (error) {
     res.status(500).json({ message: "error updating the users description" });
+  }
+});
+
+// Update Instagram URL
+app.put("/users/:userId/instagram", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { instagramUrl } = req.body;
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { instagramUrl: instagramUrl || "" },
+      { new: true }
+    );
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    return res.status(200).json({ message: "Instagram updated successfully" });
+  } catch (error) {
+    res.status(500).json({ message: "Error updating Instagram" });
   }
 });
 
@@ -2472,30 +2493,54 @@ app.post("/blockUser", async (req, res) => {
 });
 
 app.post("/report", async (req, res) => {
-  const { reporterId, reportedUserId, message } = req.body;
+  const { reporterId, reportedUserId, reportedEventId, reason, message } = req.body;
 
-  if (!reporterId || !reportedUserId || !message) {
-    return res.status(400).json({ error: "All fields are required." });
+  if (!reporterId || !message) {
+    return res.status(400).json({ error: "reporterId and message are required." });
+  }
+
+  if (!reportedUserId && !reportedEventId) {
+    return res.status(400).json({ error: "reportedUserId or reportedEventId is required." });
   }
 
   try {
-    // Check if users exist
     const reporter = await User.findById(reporterId);
-    const reportedUser = await User.findById(reportedUserId);
-    if (!reporter || !reportedUser) {
-      return res.status(404).json({ error: "User not found." });
+    if (!reporter) {
+      return res.status(404).json({ error: "Reporter not found." });
     }
 
-    // Save report to database
-    const report = new Report({ reporterId, reportedUserId, message });
+    if (reportedUserId) {
+      const reportedUser = await User.findById(reportedUserId);
+      if (!reportedUser) {
+        return res.status(404).json({ error: "Reported user not found." });
+      }
+    }
+
+    if (reportedEventId) {
+      const reportedEvent = await Event.findById(reportedEventId);
+      if (!reportedEvent) {
+        return res.status(404).json({ error: "Reported event not found." });
+      }
+    }
+
+    const reportData = { reporterId, message };
+    if (reportedUserId) reportData.reportedUserId = reportedUserId;
+    if (reportedEventId) reportData.reportedEventId = reportedEventId;
+    if (reason) reportData.reason = reason;
+
+    const report = new Report(reportData);
     await report.save();
 
-    // Send report email
+    const target = reportedUserId
+      ? `user with ID ${reportedUserId}`
+      : `event with ID ${reportedEventId}`;
+    const reasonText = reason ? `\nReason: ${reason}` : "";
+
     await transporter.sendMail({
       from: "cuddlesquery@gmail.com",
       to: "cuddlesquery@gmail.com",
-      subject: "New User Report",
-      text: `User with ID ${reporterId} reported user with ID ${reportedUserId}.\n\nMessage: ${message}`,
+      subject: "New Report",
+      text: `User with ID ${reporterId} reported ${target}.${reasonText}\n\nMessage: ${message}`,
     });
 
     res.status(201).json({ message: "Report submitted successfully." });
@@ -3740,13 +3785,19 @@ app.post(
 
       console.log("selfieUrl", selfieUrl);
       if (selfieUrl) {
+        const updateData = {
+          "profileVerification.selfieUrl": selfieUrl,
+          "profileVerification.status": "pending",
+          "profileVerification.submittedAt": new Date(),
+        };
+
+        if (req.body.instagramUrl) {
+          updateData.instagramUrl = req.body.instagramUrl;
+        }
+
         const user = await User.findByIdAndUpdate(
           userId,
-          {
-            "profileVerification.selfieUrl": selfieUrl,
-            "profileVerification.status": "pending",
-            "profileVerification.submittedAt": new Date(),
-          },
+          updateData,
           { new: true }
         );
 
@@ -3782,6 +3833,7 @@ app.get("/users/:userId/verification-status", async (req, res) => {
       verificationStatus: user.profileVerification?.status || "not_submitted",
       selfieUrl: user.profileVerification?.selfieUrl || null,
       submittedAt: user.profileVerification?.submittedAt || null,
+      instagramUrl: user.instagramUrl || "",
     });
   } catch (error) {
     console.error("Error checking verification status:", error);
@@ -4494,6 +4546,7 @@ app.post("/events", async (req, res) => {
       suggestedToUserId,
       suggestedToUserIds, // Array for group invites
       expiresAt,
+      audience,
     } = req.body;
 
     // Validate required fields
@@ -4530,6 +4583,14 @@ app.post("/events", async (req, res) => {
       return res.status(404).json({ message: "Host user not found" });
     }
 
+    // Validate host gender matches audience restriction
+    if (audience === "women_only" && host.gender !== "female") {
+      return res.status(400).json({ message: "Only women can create women-only events" });
+    }
+    if (audience === "men_only" && host.gender !== "male") {
+      return res.status(400).json({ message: "Only men can create men-only events" });
+    }
+
     // Check if this is a suggestion (single or group)
     const isGroupSuggestion = status === "suggested" && Array.isArray(suggestedToUserIds) && suggestedToUserIds.length > 0;
     const isSingleSuggestion = status === "suggested" && suggestedToUserId && !isGroupSuggestion;
@@ -4538,7 +4599,7 @@ app.post("/events", async (req, res) => {
     // Validate target users for suggestions
     let targetUsers = [];
     if (isGroupSuggestion) {
-      targetUsers = await User.find({ _id: { $in: suggestedToUserIds } }).select("_id name profileImages");
+      targetUsers = await User.find({ _id: { $in: suggestedToUserIds } }).select("_id name gender profileImages");
       if (targetUsers.length !== suggestedToUserIds.length) {
         return res.status(404).json({ message: "One or more suggested users not found" });
       }
@@ -4548,6 +4609,20 @@ app.post("/events", async (req, res) => {
         return res.status(404).json({ message: "Suggested user not found" });
       }
       targetUsers = [targetUser];
+    }
+
+    // Validate suggested users' genders match the audience
+    if (isSuggestion && audience && audience !== "everyone") {
+      const genderMap = { women_only: "female", men_only: "male" };
+      const requiredGender = genderMap[audience];
+      if (requiredGender) {
+        const mismatch = targetUsers.find(u => u.gender !== requiredGender);
+        if (mismatch) {
+          return res.status(400).json({
+            message: `Can't suggest a ${audience === "women_only" ? "women-only" : "men-only"} event to ${mismatch.name}`,
+          });
+        }
+      }
     }
 
     // Create the event
@@ -4566,6 +4641,7 @@ app.post("/events", async (req, res) => {
       endTime: endTime ? new Date(endTime) : null,
       capacity: capacity || 6,
       tags: tags || [],
+      audience: audience || "everyone",
       // For suggestions, don't add participants yet (wait for acceptance)
       participants: isSuggestion ? [] : [
         {
@@ -4635,6 +4711,11 @@ app.post("/events", async (req, res) => {
           const [eventLng, eventLat] = location.coordinates;
           const maxDistanceMeters = 50000; // 50km
 
+          // Filter by gender when event has audience restriction
+          const audienceQuery = {};
+          if (newEvent.audience === "women_only") audienceQuery.gender = "female";
+          else if (newEvent.audience === "men_only") audienceQuery.gender = "male";
+
           // Find nearby users with push tokens (exclude the host)
           const nearbyUsers = await User.aggregate([
             {
@@ -4649,10 +4730,11 @@ app.post("/events", async (req, res) => {
                 query: {
                   _id: { $ne: new mongoose.Types.ObjectId(hostId) },
                   pushToken: { $exists: true, $ne: null },
+                  ...audienceQuery,
                 },
               },
             },
-            { $limit: 50 }, // Limit to 50 users
+            { $limit: 50 },
             { $project: { _id: 1, name: 1 } },
           ]);
 
@@ -4710,6 +4792,7 @@ app.put("/events/:eventId", async (req, res) => {
       capacity,
       tags,
       coverImage,
+      audience,
     } = req.body;
 
     if (!mongoose.Types.ObjectId.isValid(eventId)) {
@@ -4735,6 +4818,31 @@ app.put("/events/:eventId", async (req, res) => {
         .json({ message: "Cannot update ended or cancelled events" });
     }
 
+    // Validate audience change against host gender and participant genders
+    if (audience && audience !== event.audience) {
+      const host = await User.findById(userId).select("gender");
+      if (audience === "women_only" && host.gender !== "female") {
+        return res.status(400).json({ message: "Only women can host women-only events" });
+      }
+      if (audience === "men_only" && host.gender !== "male") {
+        return res.status(400).json({ message: "Only men can host men-only events" });
+      }
+
+      const genderMap = { women_only: "female", men_only: "male" };
+      const requiredGender = genderMap[audience];
+      if (requiredGender && event.participants.length > 0) {
+        await event.populate("participants.userId", "gender");
+        const mismatch = event.participants.some(
+          (p) => p.userId?.gender !== requiredGender
+        );
+        if (mismatch) {
+          return res.status(400).json({
+            message: "Can't change audience — some participants don't match this gender group",
+          });
+        }
+      }
+    }
+
     // Update allowed fields
     if (title) event.title = title;
     if (description !== undefined) event.description = description;
@@ -4743,6 +4851,9 @@ app.put("/events/:eventId", async (req, res) => {
     if (capacity && capacity >= 1 && capacity <= 10) event.capacity = capacity;
     if (tags) event.tags = tags;
     if (coverImage !== undefined) event.coverImage = coverImage;
+    if (audience && ["everyone", "women_only", "men_only"].includes(audience)) {
+      event.audience = audience;
+    }
 
     await event.save();
 
@@ -4855,7 +4966,7 @@ app.delete("/events/:eventId", async (req, res) => {
 // Get nearby events
 app.get("/events/nearby", async (req, res) => {
   try {
-    const { latitude, longitude, radius = 50000, userId } = req.query;
+    const { latitude, longitude, radius = 50000, userId, gender } = req.query;
 
     if (!latitude || !longitude) {
       return res.status(400).json({
@@ -4871,13 +4982,25 @@ app.get("/events/nearby", async (req, res) => {
       return res.status(400).json({ message: "Invalid coordinates format" });
     }
 
-    // Get blocked users list if userId provided
+    // Get blocked users list and user gender if userId provided
     let blockedUserIds = [];
+    let userGender = gender || null;
     if (userId && mongoose.Types.ObjectId.isValid(userId)) {
-      const currentUser = await User.findById(userId).select("blockedBy");
+      const currentUser = await User.findById(userId).select("blockedBy gender");
       if (currentUser) {
         blockedUserIds = currentUser.blockedBy.map((id) => id.toString());
+        if (!userGender) userGender = currentUser.gender;
       }
+    }
+
+    // Build audience filter based on user gender
+    const audienceFilter = [];
+    audienceFilter.push({ audience: { $exists: false } });
+    audienceFilter.push({ audience: "everyone" });
+    if (userGender === "female") {
+      audienceFilter.push({ audience: "women_only" });
+    } else if (userGender === "male") {
+      audienceFilter.push({ audience: "men_only" });
     }
 
     const nearbyEvents = await Event.aggregate([
@@ -4895,6 +5018,7 @@ app.get("/events/nearby", async (req, res) => {
             hostId: {
               $nin: blockedUserIds.map((id) => new mongoose.Types.ObjectId(id)),
             },
+            $or: audienceFilter,
           },
           distanceMultiplier: 0.001, // Convert to km
         },
@@ -4955,6 +5079,7 @@ app.get("/events/search", async (req, res) => {
       latitude,
       longitude,
       userId,
+      gender,
       page = 1,
       limit = 20,
     } = req.query;
@@ -4978,12 +5103,29 @@ app.get("/events/search", async (req, res) => {
       query.tags = { $in: tagArray };
     }
 
-    // Exclude blocked users
+    // Exclude blocked users and apply audience filter
+    let userGender = gender || null;
     if (userId && mongoose.Types.ObjectId.isValid(userId)) {
-      const currentUser = await User.findById(userId).select("blockedBy");
-      if (currentUser && currentUser.blockedBy.length > 0) {
-        query.hostId = { $nin: currentUser.blockedBy };
+      const currentUser = await User.findById(userId).select("blockedBy gender");
+      if (currentUser) {
+        if (currentUser.blockedBy.length > 0) {
+          query.hostId = { $nin: currentUser.blockedBy };
+        }
+        if (!userGender) userGender = currentUser.gender;
       }
+    }
+
+    // Audience filter
+    const audienceFilter = [{ audience: { $exists: false } }, { audience: "everyone" }];
+    if (userGender === "female") {
+      audienceFilter.push({ audience: "women_only" });
+    } else if (userGender === "male") {
+      audienceFilter.push({ audience: "men_only" });
+    }
+    query.$and = [{ $or: audienceFilter }];
+    if (query.$or) {
+      query.$and.push({ $or: query.$or });
+      delete query.$or;
     }
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -5107,7 +5249,7 @@ app.post("/events/:eventId/join", async (req, res) => {
       return res.status(400).json({ message: "Invalid ID format" });
     }
 
-    const joiningUser = await User.findById(userId).select("name");
+    const joiningUser = await User.findById(userId).select("name gender");
     if (!joiningUser) {
       return res.status(404).json({ message: "User not found" });
     }
@@ -5115,6 +5257,14 @@ app.post("/events/:eventId/join", async (req, res) => {
     const event = await Event.findById(eventId);
     if (!event) {
       return res.status(404).json({ message: "Event not found" });
+    }
+
+    // Check audience restriction
+    if (event.audience && event.audience !== "everyone") {
+      const genderMap = { women_only: "female", men_only: "male" };
+      if (joiningUser.gender !== genderMap[event.audience]) {
+        return res.status(403).json({ message: "This event is restricted" });
+      }
     }
 
     // Update event status first
@@ -5633,8 +5783,8 @@ app.get("/events/:eventId", async (req, res) => {
     }
 
     let event = await Event.findById(eventId)
-      .populate("hostId", "name profileImages")
-      .populate("participants.userId", "name profileImages");
+      .populate("hostId", "name profileImages gender")
+      .populate("participants.userId", "name profileImages gender");
 
     if (!event) {
       return res.status(404).json({ message: "Event not found" });
@@ -6191,6 +6341,193 @@ app.post("/events/:eventId/respond-suggestion", async (req, res) => {
       message: "Error responding to suggestion",
       error: error.message,
     });
+  }
+});
+
+// POST /ratings - Submit a host rating
+app.post("/ratings", async (req, res) => {
+  try {
+    const { eventId, raterId, hostId, stars, tags } = req.body;
+
+    if (!eventId || !raterId || !hostId || !stars) {
+      return res.status(400).json({ message: "eventId, raterId, hostId, and stars are required" });
+    }
+
+    if (stars < 1 || stars > 5) {
+      return res.status(400).json({ message: "Stars must be between 1 and 5" });
+    }
+
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    if (event.status !== "ended") {
+      return res.status(400).json({ message: "Can only rate after the event has ended" });
+    }
+
+    if (event.hostId.toString() !== hostId) {
+      return res.status(400).json({ message: "hostId does not match the event host" });
+    }
+
+    const wasParticipant = event.participants.some(
+      (p) => p.userId.toString() === raterId
+    );
+    if (!wasParticipant) {
+      return res.status(403).json({ message: "Only participants can rate the host" });
+    }
+
+    if (raterId === hostId) {
+      return res.status(400).json({ message: "Cannot rate yourself" });
+    }
+
+    const rating = new Rating({
+      eventId,
+      raterId,
+      hostId,
+      stars,
+      tags: tags || [],
+    });
+
+    await rating.save();
+    res.status(201).json({ message: "Rating submitted", rating });
+  } catch (error) {
+    if (error.code === 11000) {
+      return res.status(400).json({ message: "You have already rated the host for this event" });
+    }
+    console.error("Error submitting rating:", error);
+    res.status(500).json({ message: "Error submitting rating", error: error.message });
+  }
+});
+
+// GET /ratings/user/:userId - Get aggregate ratings for a user as host
+app.get("/ratings/user/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Invalid user ID" });
+    }
+
+    const result = await Rating.aggregate([
+      { $match: { hostId: new mongoose.Types.ObjectId(userId) } },
+      {
+        $group: {
+          _id: null,
+          averageRating: { $avg: "$stars" },
+          totalRatings: { $sum: 1 },
+          allTags: { $push: "$tags" },
+        },
+      },
+    ]);
+
+    if (!result.length) {
+      return res.status(200).json({ averageRating: 0, totalRatings: 0, tagCounts: {} });
+    }
+
+    const flatTags = result[0].allTags.flat();
+    const tagCounts = {};
+    for (const tag of flatTags) {
+      tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+    }
+
+    res.status(200).json({
+      averageRating: Math.round(result[0].averageRating * 10) / 10,
+      totalRatings: result[0].totalRatings,
+      tagCounts,
+    });
+  } catch (error) {
+    console.error("Error fetching ratings:", error);
+    res.status(500).json({ message: "Error fetching ratings", error: error.message });
+  }
+});
+
+// GET /ratings/check/:eventId/:userId - Check if user has rated for an event
+app.get("/ratings/check/:eventId/:userId", async (req, res) => {
+  try {
+    const { eventId, userId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(eventId) || !mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Invalid ID format" });
+    }
+
+    const existing = await Rating.findOne({ eventId, raterId: userId });
+    res.status(200).json({ hasRated: !!existing });
+  } catch (error) {
+    console.error("Error checking rating:", error);
+    res.status(500).json({ message: "Error checking rating", error: error.message });
+  }
+});
+
+// GET /users/:userId/stats - Get event attendance/hosting stats
+app.get("/users/:userId/stats", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Invalid user ID" });
+    }
+
+    const uid = new mongoose.Types.ObjectId(userId);
+
+    const [attendedResult, hostedResult] = await Promise.all([
+      Event.countDocuments({
+        "participants.userId": uid,
+        status: "ended",
+      }),
+      Event.countDocuments({
+        hostId: uid,
+        status: "ended",
+      }),
+    ]);
+
+    res.status(200).json({
+      eventsAttended: attendedResult,
+      eventsHosted: hostedResult,
+    });
+  } catch (error) {
+    console.error("Error fetching user stats:", error);
+    res.status(500).json({ message: "Error fetching user stats", error: error.message });
+  }
+});
+
+// POST /unblockUser - Remove a user from blocked list
+app.post("/unblockUser", async (req, res) => {
+  try {
+    const { currentUserId, selectedUserId } = req.body;
+
+    if (!currentUserId || !selectedUserId) {
+      return res.status(400).json({ message: "currentUserId and selectedUserId are required" });
+    }
+
+    await User.findByIdAndUpdate(selectedUserId, {
+      $pull: { blockedBy: currentUserId },
+    });
+
+    res.status(200).json({ message: "User unblocked successfully" });
+  } catch (error) {
+    console.error("Error unblocking user:", error);
+    res.status(500).json({ message: "Error unblocking user", error: error.message });
+  }
+});
+
+// GET /users/:userId/blocked - Get list of users blocked by this user
+app.get("/users/:userId/blocked", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Invalid user ID" });
+    }
+
+    const blockedUsers = await User.find({
+      blockedBy: userId,
+    }).select("_id name profileImages");
+
+    res.status(200).json({ blockedUsers });
+  } catch (error) {
+    console.error("Error fetching blocked users:", error);
+    res.status(500).json({ message: "Error fetching blocked users", error: error.message });
   }
 });
 
