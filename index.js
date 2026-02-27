@@ -4748,8 +4748,8 @@ app.post("/events", async (req, res) => {
               await createNotification({
                 userId: nearbyUser._id,
                 type: "event_nearby",
-                title: "New event nearby",
-                message: `A new event "${title}" is happening near you`,
+                title: "New activity nearby",
+                message: `A new table "${title}" is happening near you`,
                 eventId: newEvent._id,
                 eventName: title,
                 actorId: hostId,
