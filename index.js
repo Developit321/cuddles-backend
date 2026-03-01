@@ -4361,19 +4361,35 @@ const updateEventStatus = async (event) => {
 
 const cleanupExpiredEvents = async () => {
   try {
-    const cutoffDate = new Date(Date.now() - 24 * 60 * 60 * 1000); // 24 hours ago
+    const cutoffDate = new Date(Date.now() - 6 * 60 * 60 * 1000); // 6 hours ago
     console.log(`[Event Cleanup] Starting cleanup at ${new Date().toISOString()}`);
     console.log(`[Event Cleanup] Deleting events with startTime before: ${cutoffDate.toISOString()}`);
-    
-    // Delete events where the meetup time (startTime) was more than 24 hours ago
+
+    const eventsToDelete = await Event.find({ startTime: { $lte: cutoffDate } }).select("participants");
+    for (const event of eventsToDelete) {
+      const toCredit = (event.participants || []).filter(
+        (p) => p && (p.status === "going" || p.status === "checked_in") && p.userId
+      );
+      for (const p of toCredit) {
+        const uid = p.userId._id || p.userId;
+        if (uid) {
+          try {
+            await User.findByIdAndUpdate(uid, { $inc: { eventsAttended: 1 } });
+          } catch (err) {
+            console.error("[Event Cleanup] Error incrementing eventsAttended for user:", uid, err);
+          }
+        }
+      }
+    }
+
     const result = await Event.deleteMany({
       startTime: { $lte: cutoffDate }
     });
-    
+
     console.log(
       `[Event Cleanup] Cleanup completed. Removed ${result.deletedCount} event(s)`
     );
-    
+
     return result;
   } catch (error) {
     console.error("[Event Cleanup] Error deleting old events:", error);
@@ -4657,6 +4673,10 @@ app.post("/events", async (req, res) => {
     });
 
     await newEvent.save();
+
+    if (!isSuggestion) {
+      await User.findByIdAndUpdate(hostId, { $inc: { eventsHosted: 1 } });
+    }
 
     // Populate host info for response (wrap in try-catch to ensure response is sent)
     let populatedEvent;
@@ -5454,12 +5474,19 @@ app.post("/events/:eventId/check-in", async (req, res) => {
 
     // Find participant
     const participantIndex = event.participants.findIndex(
-      (p) => p.userId.toString() === userId
+      (p) => (p.userId && p.userId.toString()) === userId
     );
     if (participantIndex === -1) {
       return res
         .status(404)
         .json({ message: "You are not a participant of this event" });
+    }
+
+    // Validate event location
+    if (!event.location || !event.location.coordinates || event.location.coordinates.length < 2) {
+      return res.status(400).json({
+        message: "Event location is invalid; check-in is not available.",
+      });
     }
 
     // Calculate distance using existing helper
@@ -5469,13 +5496,18 @@ app.post("/events/:eventId/check-in", async (req, res) => {
     const eventLng = event.location.coordinates[0];
 
     const distance = calculateDistance(userLat, userLng, eventLat, eventLng);
-    const distanceInMeters = distance * 1000;
-
-    if (distanceInMeters > event.checkInRadius) {
+    if (distance == null || Number.isNaN(distance)) {
       return res.status(400).json({
-        message: `You must be within ${
-          event.checkInRadius
-        }m of the event location to check in. You are ${Math.round(
+        message: "Invalid location for check-in. Please ensure location is enabled.",
+      });
+    }
+
+    const distanceInMeters = distance * 1000;
+    const checkInRadius = event.checkInRadius ?? 100;
+
+    if (distanceInMeters > checkInRadius) {
+      return res.status(400).json({
+        message: `You must be within ${checkInRadius}m of the event location to check in. You are ${Math.round(
           distanceInMeters
         )}m away.`,
       });
@@ -6459,7 +6491,7 @@ app.get("/ratings/check/:eventId/:userId", async (req, res) => {
   }
 });
 
-// GET /users/:userId/stats - Get event attendance/hosting stats
+// GET /users/:userId/stats - Get event attendance/hosting stats (from persisted User fields)
 app.get("/users/:userId/stats", async (req, res) => {
   try {
     const { userId } = req.params;
@@ -6468,22 +6500,14 @@ app.get("/users/:userId/stats", async (req, res) => {
       return res.status(400).json({ message: "Invalid user ID" });
     }
 
-    const uid = new mongoose.Types.ObjectId(userId);
-
-    const [attendedResult, hostedResult] = await Promise.all([
-      Event.countDocuments({
-        "participants.userId": uid,
-        status: "ended",
-      }),
-      Event.countDocuments({
-        hostId: uid,
-        status: "ended",
-      }),
-    ]);
+    const user = await User.findById(userId).select("eventsHosted eventsAttended");
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
 
     res.status(200).json({
-      eventsAttended: attendedResult,
-      eventsHosted: hostedResult,
+      eventsAttended: user.eventsAttended ?? 0,
+      eventsHosted: user.eventsHosted ?? 0,
     });
   } catch (error) {
     console.error("Error fetching user stats:", error);

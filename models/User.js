@@ -195,6 +195,14 @@ const userSchema = mongoose.Schema(
       type: String,
       default: "",
     },
+    eventsHosted: {
+      type: Number,
+      default: 0,
+    },
+    eventsAttended: {
+      type: Number,
+      default: 0,
+    },
   },
   { timestamps: true }
 ); // Add timestamps option here
