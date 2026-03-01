@@ -4341,6 +4341,12 @@ const updateEventStatus = async (event) => {
     newStatus = "ended";
   }
 
+  // Auto-end events 4 hours after startTime (even without endTime)
+  const fourHoursAfterStart = new Date(event.startTime.getTime() + 4 * 60 * 60 * 1000);
+  if (now >= fourHoursAfterStart && newStatus !== "ended") {
+    newStatus = "ended";
+  }
+
   // Check if event is full
   const goingCount = event.participants.filter(
     (p) => p.status === "going" || p.status === "checked_in"
@@ -4545,6 +4551,59 @@ sendEventReminders().catch((error) =>
   console.error("[Event Reminder] Error on startup:", error)
 );
 
+// Send rating reminders 4 hours after startTime (2 hours before deletion)
+const sendRatingReminders = async () => {
+  try {
+    const now = new Date();
+    const fourHoursAgo = new Date(now.getTime() - 4 * 60 * 60 * 1000);
+
+    const endedEvents = await Event.find({
+      startTime: { $lte: fourHoursAgo },
+      status: "ended",
+      ratingReminderSent: { $ne: true },
+    }).populate("participants.userId", "name pushToken");
+
+    if (endedEvents.length === 0) return;
+
+    console.log(`[Rating Reminder] Found ${endedEvents.length} events needing rating reminders`);
+
+    for (const event of endedEvents) {
+      const hostId = (event.hostId._id || event.hostId).toString();
+
+      for (const participant of event.participants) {
+        const pUserId = participant.userId?._id || participant.userId;
+        if (!pUserId) continue;
+        if (pUserId.toString() === hostId) continue;
+        if (participant.status !== "going" && participant.status !== "checked_in") continue;
+
+        try {
+          await createNotification({
+            userId: pUserId,
+            type: "rate_host",
+            title: "How was your host?",
+            message: `Rate your host for "${event.title}" before it's too late`,
+            eventId: event._id,
+            eventName: event.title,
+          });
+        } catch (notifError) {
+          console.error(`[Rating Reminder] Error notifying user ${pUserId}:`, notifError);
+        }
+      }
+
+      event.ratingReminderSent = true;
+      await event.save();
+      console.log(`[Rating Reminder] Sent reminders for "${event.title}"`);
+    }
+  } catch (error) {
+    console.error("[Rating Reminder] Error:", error);
+  }
+};
+
+cron.schedule("*/30 * * * *", sendRatingReminders);
+sendRatingReminders().catch((error) =>
+  console.error("[Rating Reminder] Error on startup:", error)
+);
+
 // Create new event
 app.post("/events", async (req, res) => {
   try {
@@ -4597,6 +4656,13 @@ app.post("/events", async (req, res) => {
     const host = await User.findById(hostId);
     if (!host) {
       return res.status(404).json({ message: "Host user not found" });
+    }
+
+    if (!host.profileImages || host.profileImages.length === 0) {
+      return res.status(400).json({
+        message: "profile_incomplete",
+        detail: "You need a profile photo before creating an activity",
+      });
     }
 
     // Validate host gender matches audience restriction
@@ -5269,9 +5335,16 @@ app.post("/events/:eventId/join", async (req, res) => {
       return res.status(400).json({ message: "Invalid ID format" });
     }
 
-    const joiningUser = await User.findById(userId).select("name gender");
+    const joiningUser = await User.findById(userId).select("name gender profileImages");
     if (!joiningUser) {
       return res.status(404).json({ message: "User not found" });
+    }
+
+    if (!joiningUser.profileImages || joiningUser.profileImages.length === 0) {
+      return res.status(400).json({
+        message: "profile_incomplete",
+        detail: "You need a profile photo before joining an activity",
+      });
     }
 
     const event = await Event.findById(eventId);

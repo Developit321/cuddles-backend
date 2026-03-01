@@ -100,6 +100,10 @@ const eventSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    ratingReminderSent: {
+      type: Boolean,
+      default: false,
+    },
   },
   { timestamps: true }
 );
