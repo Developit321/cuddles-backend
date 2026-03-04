@@ -14,6 +14,7 @@ const Event = require("./models/Event");
 const EventMessage = require("./models/EventMessage");
 const Notification = require("./models/Notification");
 const Rating = require("./models/Rating");
+const SuperFlirt = require("./models/SuperFlirt");
 const jwt = require("jsonwebtoken");
 const cloudinary = require("cloudinary");
 const app = express();
@@ -1643,8 +1644,44 @@ app.get("/recievedLikes/:userId/info", async (req, res) => {
       };
     });
 
-    // Return the formatted received likes
-    return res.status(200).json(formattedLikes);
+    // Fetch pending Super Flirts for this user
+    const pendingSuperFlirts = await SuperFlirt.find({
+      receiverId: userId,
+      status: "pending",
+    }).lean();
+
+    const superFlirtSenderIds = pendingSuperFlirts.map((sf) => sf.senderId);
+    const superFlirtSenders = await User.find({
+      _id: { $in: superFlirtSenderIds },
+    })
+      .select("_id name age gender profileImages location verified")
+      .lean();
+
+    const senderMap = {};
+    superFlirtSenders.forEach((s) => {
+      senderMap[s._id.toString()] = s;
+    });
+
+    const superFlirtsFormatted = pendingSuperFlirts.map((sf) => {
+      const sender = senderMap[sf.senderId.toString()] || {};
+      return {
+        superFlirtId: sf._id,
+        senderId: sf.senderId,
+        name: sender.name || "Unknown",
+        photo: sender.profileImages?.[0] || null,
+        age: sender.age,
+        gender: sender.gender,
+        location: sender.location,
+        verified: sender.verified,
+        message: sf.message,
+        createdAt: sf.createdAt,
+      };
+    });
+
+    return res.status(200).json({
+      likes: formattedLikes,
+      super_flirts: superFlirtsFormatted,
+    });
   } catch (error) {
     console.error("Error fetching received likes:", error);
     res.status(500).json({ message: "Failed to retrieve the received likes" });
@@ -1720,6 +1757,177 @@ app.post("/super-wave", async (req, res) => {
   } catch (error) {
     console.error("Error sending super wave:", error);
     res.status(500).json({ message: "Failed to send Super Wave" });
+  }
+});
+
+// Super Flirt - send a personalised message with a like
+app.post("/super-flirts", async (req, res) => {
+  try {
+    const { senderId, receiverId, message } = req.body;
+
+    if (!senderId || !receiverId) {
+      return res.status(400).json({ message: "senderId and receiverId are required" });
+    }
+
+    if (!message || typeof message !== "string" || message.trim().length === 0) {
+      return res.status(400).json({ message: "message is required and cannot be empty" });
+    }
+
+    if (message.length > 150) {
+      return res.status(400).json({ message: "message must be 150 characters or fewer" });
+    }
+
+    const sender = await User.findById(senderId).select("name profileImages crushes").lean();
+    const receiver = await User.findById(receiverId).select("pushToken recievedLikes").lean();
+
+    if (!sender || !receiver) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const superFlirt = new SuperFlirt({
+      senderId,
+      receiverId,
+      message: message.trim(),
+    });
+    await superFlirt.save();
+
+    const alreadyLiked = receiver.recievedLikes?.some(
+      (id) => id.toString() === senderId.toString()
+    );
+
+    if (!alreadyLiked) {
+      await User.findByIdAndUpdate(receiverId, {
+        $addToSet: { recievedLikes: senderId },
+      });
+      await User.findByIdAndUpdate(senderId, {
+        $addToSet: { crushes: receiverId },
+      });
+    }
+
+    try {
+      await createNotification({
+        userId: receiverId,
+        type: "super_flirt",
+        title: "Someone sent you a Super Flirt",
+        message: `${sender.name || "Someone"} sent you a Super Flirt — see who`,
+        actorId: senderId,
+        actorName: sender.name,
+        actorImage: sender.profileImages?.[0] || null,
+      });
+    } catch (notifErr) {
+      console.error("[Super Flirt] notification failed:", notifErr?.message || notifErr);
+    }
+
+    console.log(`Super Flirt sent from ${senderId} to ${receiverId}`);
+    res.status(200).json({ message: "Super Flirt sent successfully", superFlirtId: superFlirt._id });
+  } catch (error) {
+    console.error("Error sending super flirt:", error);
+    res.status(500).json({ message: "Failed to send Super Flirt" });
+  }
+});
+
+// Super Flirt - match back
+app.post("/super-flirts/:id/match", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { currentUserId } = req.body;
+
+    if (!currentUserId) {
+      return res.status(400).json({ message: "currentUserId is required" });
+    }
+
+    const superFlirt = await SuperFlirt.findById(id);
+    if (!superFlirt) {
+      return res.status(404).json({ message: "Super Flirt not found" });
+    }
+
+    if (superFlirt.receiverId.toString() !== currentUserId.toString()) {
+      return res.status(403).json({ message: "Not authorized to match this Super Flirt" });
+    }
+
+    if (superFlirt.status !== "pending") {
+      return res.status(400).json({ message: "Super Flirt has already been actioned" });
+    }
+
+    superFlirt.status = "matched";
+    await superFlirt.save();
+
+    const senderId = superFlirt.senderId.toString();
+
+    // Create match — same logic as POST /create-match
+    await User.findByIdAndUpdate(currentUserId, {
+      $push: { Matches: senderId },
+      $pull: { recievedLikes: senderId },
+    });
+    await User.findByIdAndUpdate(senderId, {
+      $push: { Matches: currentUserId },
+      $pull: { recievedLikes: currentUserId },
+    });
+
+    // Write the Super Flirt message as the opening chat message
+    const openerMessage = new Chat({
+      senderId: senderId,
+      receiverId: currentUserId,
+      message: superFlirt.message,
+      type: "super_flirt_opener",
+      timestamp: new Date(),
+    });
+    await openerMessage.save();
+
+    // Send match push notification to the original sender
+    const senderUser = await User.findById(senderId).select("pushToken").lean();
+    if (senderUser?.pushToken) {
+      try {
+        await sendNotification(senderUser.pushToken, "You have a new match!", "Someone matched with your Super Flirt! Start chatting now.");
+      } catch (pushErr) {
+        console.error("[Super Flirt Match] push notification failed:", pushErr?.message || pushErr);
+      }
+    }
+
+    console.log(`Super Flirt ${id} matched by ${currentUserId}`);
+    res.status(200).json({ message: "Matched successfully", senderId });
+  } catch (error) {
+    console.error("Error matching super flirt:", error);
+    res.status(500).json({ message: "Failed to match Super Flirt" });
+  }
+});
+
+// Super Flirt - pass
+app.post("/super-flirts/:id/pass", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { currentUserId } = req.body;
+
+    if (!currentUserId) {
+      return res.status(400).json({ message: "currentUserId is required" });
+    }
+
+    const superFlirt = await SuperFlirt.findById(id);
+    if (!superFlirt) {
+      return res.status(404).json({ message: "Super Flirt not found" });
+    }
+
+    if (superFlirt.receiverId.toString() !== currentUserId.toString()) {
+      return res.status(403).json({ message: "Not authorized to pass this Super Flirt" });
+    }
+
+    if (superFlirt.status !== "pending") {
+      return res.status(400).json({ message: "Super Flirt has already been actioned" });
+    }
+
+    superFlirt.status = "passed";
+    await superFlirt.save();
+
+    // Remove sender from receiver's recievedLikes
+    await User.findByIdAndUpdate(currentUserId, {
+      $pull: { recievedLikes: superFlirt.senderId },
+    });
+
+    console.log(`Super Flirt ${id} passed by ${currentUserId}`);
+    res.status(200).json({ message: "Super Flirt passed" });
+  } catch (error) {
+    console.error("Error passing super flirt:", error);
+    res.status(500).json({ message: "Failed to pass Super Flirt" });
   }
 });
 
@@ -4518,8 +4726,8 @@ const sendEventReminders = async () => {
           await createNotification({
             userId: participant.userId._id || participant.userId,
             type: "event_reminder",
-            title: "Event starting soon",
-            message: `Your event "${event.title}" starts in ${timeString}`,
+            title: "Activity starting soon",
+            message: `Your activity "${event.title}" starts in ${timeString}`,
             eventId: event._id,
             eventName: event.title,
           });

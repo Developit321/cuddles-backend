@@ -17,7 +17,7 @@ const chatSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ["text", "image"],
+    enum: ["text", "image", "super_flirt_opener"],
     default: "text",
   },
   image: {
