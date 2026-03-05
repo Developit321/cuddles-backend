@@ -158,6 +158,11 @@ const userSchema = mongoose.Schema(
       answeredAt: { type: Date },
     },
     priority: { type: Number, default: 0 },
+    preferredLanguage: {
+      type: String,
+      enum: ["en", "es", "ja", "de", "fr"],
+      default: "en",
+    },
     boostCredits: {
       remaining: { type: Number, default: 0 },
       resetAt: { type: Date, default: null },

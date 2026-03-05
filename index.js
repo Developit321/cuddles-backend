@@ -27,8 +27,16 @@ const http = require("http").createServer(app);
 const io = require("socket.io")(http); // Pass the HTTP server instance
 const bcrypt = require("bcryptjs");
 const { sendNotification } = require("./notifications/pushNotifications");
+const notificationStrings = require("./notifications/notificationStrings");
 const { ObjectId } = require("mongodb");
 const { updateUserCountry } = require("./Controllers/userController");
+
+// Returns the notification strings for the given language, falling back to English
+const getStrings = (lang) => notificationStrings[lang] || notificationStrings["en"];
+
+// Replaces {token} placeholders in a string with values from a params object
+const interpolate = (str, params = {}) =>
+  Object.entries(params).reduce((s, [k, v]) => s.replace(new RegExp(`\\{${k}\\}`, "g"), v), str);
 
 // Map to store user socket connections
 const userSockets = new Map();
@@ -1826,7 +1834,7 @@ app.post("/super-flirts", async (req, res) => {
     }
 
     const sender = await User.findById(senderId).select("name profileImages crushes").lean();
-    const receiver = await User.findById(receiverId).select("pushToken recievedLikes").lean();
+    const receiver = await User.findById(receiverId).select("pushToken preferredLanguage recievedLikes").lean();
 
     if (!sender || !receiver) {
       return res.status(404).json({ message: "User not found" });
@@ -1853,15 +1861,23 @@ app.post("/super-flirts", async (req, res) => {
     }
 
     try {
+      const sfStrings = getStrings(receiver.preferredLanguage).superFlirtReceived;
+      const sfTitle = interpolate(sfStrings.title, { name: sender.name || "Someone" });
+      const sfBody = interpolate(sfStrings.body, { name: sender.name || "Someone" });
+
       await createNotification({
         userId: receiverId,
         type: "super_flirt",
-        title: "Someone sent you a Super Flirt",
-        message: `${sender.name || "Someone"} sent you a Super Flirt — see who`,
+        title: sfTitle,
+        message: sfBody,
         actorId: senderId,
         actorName: sender.name,
         actorImage: sender.profileImages?.[0] || null,
       });
+
+      if (receiver.pushToken) {
+        await sendNotification(receiver.pushToken, sfTitle, sfBody);
+      }
     } catch (notifErr) {
       console.error("[Super Flirt] notification failed:", notifErr?.message || notifErr);
     }
@@ -1923,10 +1939,11 @@ app.post("/super-flirts/:id/match", async (req, res) => {
     await openerMessage.save();
 
     // Send match push notification to the original sender
-    const senderUser = await User.findById(senderId).select("pushToken").lean();
+    const senderUser = await User.findById(senderId).select("pushToken preferredLanguage").lean();
     if (senderUser?.pushToken) {
       try {
-        await sendNotification(senderUser.pushToken, "You have a new match!", "Someone matched with your Super Flirt! Start chatting now.");
+        const sfMatch = getStrings(senderUser.preferredLanguage).superFlirtMatched;
+        await sendNotification(senderUser.pushToken, sfMatch.title, sfMatch.body);
       } catch (pushErr) {
         console.error("[Super Flirt Match] push notification failed:", pushErr?.message || pushErr);
       }
@@ -2028,7 +2045,7 @@ app.post("/boosts/activate", async (req, res) => {
       return res.status(409).json({ message: "You already have an active Priority Boost", expires_at: existingActive.expiresAt });
     }
 
-    const user = await User.findById(userId).select("boostCredits pushToken name").lean();
+    const user = await User.findById(userId).select("boostCredits pushToken preferredLanguage name").lean();
     if (!user) return res.status(404).json({ message: "User not found" });
 
     const creditsRemaining = user.boostCredits?.remaining ?? 0;
@@ -2052,13 +2069,10 @@ app.post("/boosts/activate", async (req, res) => {
     });
 
     // Immediate activation push notification
+    const boostActivatedStr = getStrings(user.preferredLanguage).boostActivated;
     if (user.pushToken) {
       try {
-        await sendNotification(
-          user.pushToken,
-          "Priority Boost is live 🔥",
-          "You're showing up first for everyone near you — go get those matches."
-        );
+        await sendNotification(user.pushToken, boostActivatedStr.title, boostActivatedStr.body);
       } catch (notifErr) {
         console.error("[Boost] Activation notification failed:", notifErr?.message);
       }
@@ -2069,8 +2083,8 @@ app.post("/boosts/activate", async (req, res) => {
       await createNotification({
         userId,
         type: "boost_activated",
-        title: "Priority Boost is live 🔥",
-        message: "You're showing up first for everyone near you — go get those matches.",
+        title: boostActivatedStr.title,
+        message: boostActivatedStr.body,
       });
     } catch (notifErr) {
       console.error("[Boost] In-app notification failed:", notifErr?.message);
@@ -2102,17 +2116,15 @@ app.post("/boosts/reset-credits", async (req, res) => {
       userId,
       { boostCredits: { remaining: BOOST_CREDITS_PER_CYCLE, resetAt } },
       { new: true }
-    ).select("pushToken");
+    ).select("pushToken preferredLanguage");
 
     if (!user) return res.status(404).json({ message: "User not found" });
 
+    const boostResetStr = getStrings(user.preferredLanguage).boostCreditsReset;
+
     if (user.pushToken) {
       try {
-        await sendNotification(
-          user.pushToken,
-          "Your 4 Priority Boosts are back",
-          "First one's on us — tap to activate."
-        );
+        await sendNotification(user.pushToken, boostResetStr.title, boostResetStr.body);
       } catch (notifErr) {
         console.error("[Boost] Credits reset notification failed:", notifErr?.message);
       }
@@ -2122,8 +2134,8 @@ app.post("/boosts/reset-credits", async (req, res) => {
       await createNotification({
         userId,
         type: "boost_credits_reset",
-        title: "Your 4 Priority Boosts are back",
-        message: "First one's on us — tap to activate.",
+        title: boostResetStr.title,
+        message: boostResetStr.body,
       });
     } catch (notifErr) {
       console.error("[Boost] Credits reset in-app notification failed:", notifErr?.message);
@@ -2157,14 +2169,13 @@ app.post("/create-match", async (req, res) => {
 
     // Fetch the selected user's expo push token
     const selectedUser = await User.findById(selectedUserId).select(
-      "pushToken"
+      "pushToken preferredLanguage"
     );
 
     // Only send notification if the expoPushToken is available
     if (selectedUser && selectedUser.pushToken) {
-      const title = "You have a new match!";
-      const body = "You and someone else have matched! Check it out.";
-      await sendNotification(selectedUser.pushToken, title, body);
+      const s = getStrings(selectedUser.preferredLanguage).newMatch;
+      await sendNotification(selectedUser.pushToken, s.title, s.body);
     }
     res.sendStatus(200);
     console.log("new match ");
@@ -2349,24 +2360,28 @@ app.post("/messages/save", async (req, res) => {
 app.put("/push-notification-token/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
-    const { pushToken } = req.body;
+    const { pushToken, language } = req.body;
 
     console.log("🔔 [PUSH TOKEN API] ========================================");
     console.log("🔔 [PUSH TOKEN API] Received request to save push token");
     console.log("🔔 [PUSH TOKEN API] UserId:", userId);
     console.log("🔔 [PUSH TOKEN API] Push Token:", pushToken);
+    console.log("🔔 [PUSH TOKEN API] Language:", language || "(not provided)");
     console.log("🔔 [PUSH TOKEN API] ========================================");
 
-    if (!pushToken) {
-      console.log("🔔 [PUSH TOKEN API] ❌ No pushToken provided in request body");
-      return res.status(400).json({ message: "pushToken is required" });
+    if (!pushToken && !language) {
+      console.log("🔔 [PUSH TOKEN API] ❌ No pushToken or language provided in request body");
+      return res.status(400).json({ message: "pushToken or language is required" });
     }
 
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { pushToken: pushToken },
-      { new: true }
-    );
+    const supportedLanguages = ["en", "es", "ja", "de", "fr"];
+    const updateData = {};
+    if (pushToken) updateData.pushToken = pushToken;
+    if (language && supportedLanguages.includes(language)) {
+      updateData.preferredLanguage = language;
+    }
+
+    const user = await User.findByIdAndUpdate(userId, updateData, { new: true });
 
     if (!user) {
       console.log("🔔 [PUSH TOKEN API] ❌ User not found:", userId);
@@ -5031,16 +5046,13 @@ cron.schedule("*/5 * * * *", async () => {
       status: "active",
       activatedAt: { $lte: warningThreshold },
       warningNotifSent: false,
-    }).populate("userId", "pushToken");
+    }).populate("userId", "pushToken preferredLanguage");
 
     for (const boost of needWarning) {
       if (boost.userId?.pushToken) {
         try {
-          await sendNotification(
-            boost.userId.pushToken,
-            "6 hours left on your Boost",
-            "6 hours left on your Priority Boost — make the most of it while you're hot."
-          );
+          const warnStr = getStrings(boost.userId.preferredLanguage).boostWarning;
+          await sendNotification(boost.userId.pushToken, warnStr.title, warnStr.body);
         } catch (e) {
           console.error("[Boost Cron] Warning notif failed:", e?.message);
         }
@@ -5054,7 +5066,7 @@ cron.schedule("*/5 * * * *", async () => {
       status: "active",
       expiresAt: { $lte: now },
       expiryNotifSent: false,
-    }).populate("userId", "pushToken boostCredits coordinates");
+    }).populate("userId", "pushToken preferredLanguage boostCredits coordinates");
 
     for (const boost of expired) {
       // Coverage % calculation: impressionCount / distinct active users in same radius
@@ -5088,13 +5100,17 @@ cron.schedule("*/5 * * * *", async () => {
       // Reset priority
       await User.findByIdAndUpdate(boost.userId._id, { priority: 0 });
 
+      const expiredStr = getStrings(boost.userId?.preferredLanguage).boostExpired;
+      const expiredTitle = expiredStr.title;
+      const expiredBody = interpolate(expiredStr.body, {
+        coverage,
+        count: creditsLeft,
+        s: creditsLeft !== 1 ? "s" : "",
+      });
+
       if (boost.userId?.pushToken) {
         try {
-          await sendNotification(
-            boost.userId.pushToken,
-            "Your Priority Boost has ended",
-            `You reached ${coverage}% of active users nearby — nice. ${creditsLeft} Boost${creditsLeft !== 1 ? "s" : ""} left this month.`
-          );
+          await sendNotification(boost.userId.pushToken, expiredTitle, expiredBody);
         } catch (e) {
           console.error("[Boost Cron] Expiry notif failed:", e?.message);
         }
@@ -5104,8 +5120,8 @@ cron.schedule("*/5 * * * *", async () => {
         await createNotification({
           userId: boost.userId._id,
           type: "boost_expired",
-          title: "Your Priority Boost has ended",
-          message: `You reached ${coverage}% of active users nearby. ${creditsLeft} Boost${creditsLeft !== 1 ? "s" : ""} left this month.`,
+          title: expiredTitle,
+          message: expiredBody,
         });
       } catch (e) {
         console.error("[Boost Cron] Expiry in-app notif failed:", e?.message);
@@ -6113,16 +6129,17 @@ app.post("/events/:eventId/check-in", async (req, res) => {
           .map((p) => p.userId),
       },
       pushToken: { $exists: true, $ne: null },
-    }).select("pushToken");
+    }).select("pushToken preferredLanguage");
 
     const checkedInUser = await User.findById(userId).select("name");
 
     for (const participant of otherParticipants) {
       try {
+        const ciStr = getStrings(participant.preferredLanguage).eventCheckin;
         await sendNotification(
           participant.pushToken,
-          "Participant Checked In",
-          `${checkedInUser.name} has arrived at "${event.title}"`
+          interpolate(ciStr.title, { name: checkedInUser.name, eventTitle: event.title }),
+          interpolate(ciStr.body, { name: checkedInUser.name, eventTitle: event.title })
         );
       } catch (notifError) {
         console.error("Error sending notification:", notifError);
@@ -6255,13 +6272,14 @@ app.delete("/events/:eventId/participants/:participantId", async (req, res) => {
     await event.save();
 
     // Notify removed participant
-    const removedUser = await User.findById(participantId).select("pushToken");
+    const removedUser = await User.findById(participantId).select("pushToken preferredLanguage");
     if (removedUser && removedUser.pushToken) {
       try {
+        const removeStr = getStrings(removedUser.preferredLanguage).eventRemoved;
         await sendNotification(
           removedUser.pushToken,
-          "Removed from Event",
-          `You have been removed from "${event.title}"`
+          interpolate(removeStr.title, { eventTitle: event.title }),
+          interpolate(removeStr.body, { eventTitle: event.title })
         );
       } catch (notifError) {
         console.error("Error sending notification:", notifError);
