@@ -15,6 +15,7 @@ const EventMessage = require("./models/EventMessage");
 const Notification = require("./models/Notification");
 const Rating = require("./models/Rating");
 const SuperFlirt = require("./models/SuperFlirt");
+const Boost = require("./models/Boost");
 const jwt = require("jsonwebtoken");
 const cloudinary = require("cloudinary");
 const app = express();
@@ -1242,7 +1243,6 @@ app.get("/profiles", async (req, res) => {
     const {
       userId,
       gender,
-      lookingFor,
       minAge = "21",
       maxAge = "100",
       longitude,
@@ -1323,13 +1323,6 @@ app.get("/profiles", async (req, res) => {
         }
       ],
     };
-
-    // Add lookingFor filter if provided
-    if (lookingFor) {
-      baseMatch.lookingFor = {
-        $in: Array.isArray(lookingFor) ? lookingFor : [lookingFor],
-      };
-    }
 
     // Projection to limit returned fields for better performance
     const profileProjection = {
@@ -1470,31 +1463,58 @@ app.get("/profiles", async (req, res) => {
       return countryProfiles;
     };
 
-    // First try to get profiles from the same country
     if (userCountry) {
-      console.log(`\n🔍 Starting profile search for user in ${userCountry}`);
+      // Country is known — only show profiles from the same country, never backfill with other countries
+      console.log(`\n🔍 Starting profile search for user in ${userCountry} (strict, no cross-country)`);
       profiles = await getProfilesWithCountry(true);
-    }
+      console.log(`📊 Found ${profiles.length} same-country profiles for ${userCountry}`);
+    } else {
+      // Country not yet resolved — use distance-based query with no country filter
+      console.log(`\n⚠️ User has no country set, falling back to distance-based search only`);
+      const query = { ...baseMatch };
+      if (longitude && latitude) {
+        try {
+          profiles = await User.aggregate([
+            {
+              $geoNear: {
+                near: {
+                  type: "Point",
+                  coordinates: [parseFloat(longitude), parseFloat(latitude)],
+                },
+                distanceField: "distance",
+                maxDistance: maxDistanceMeters,
+                spherical: true,
+                query: query,
+                distanceMultiplier: 0.001,
+                key: "location",
+              },
+            },
+            { $project: profileProjection },
+            { $limit: 20 },
+          ]).option({ maxTimeMS: 5000 });
+          hasLocation = true;
+        } catch (error) {
+          console.error("Error in geo query for user without country:", error);
+        }
+      }
 
-    // If we don't have enough profiles from the same country, get profiles from other countries
-    if (profiles.length < 20) {
-      console.log(
-        `\n⚠️ Not enough profiles from ${userCountry} (found ${profiles.length}), searching in other countries`
-      );
-      const otherCountryProfiles = await getProfilesWithCountry(false);
+      // If geo returned nothing, do a basic query as last resort
+      if (profiles.length === 0) {
+        profiles = await User.find(query)
+          .select(Object.keys(profileProjection).join(" "))
+          .limit(20)
+          .lean();
+      }
+      console.log(`📊 Found ${profiles.length} profiles via distance fallback`);
 
-      // Filter out profiles we already have
-      const existingProfileIds = new Set(profiles.map((p) => p._id.toString()));
-      const newProfiles = otherCountryProfiles.filter(
-        (p) => !existingProfileIds.has(p._id.toString())
-      );
-
-      const addedProfiles = newProfiles.slice(0, 20 - profiles.length);
-      profiles.push(...addedProfiles);
-      console.log(
-        `➕ Added ${addedProfiles.length} profiles from other countries`
-      );
-      console.log(`📊 Final total profiles: ${profiles.length}`);
+      // Attempt to resolve and save the user's country for future requests
+      if (longitude && latitude) {
+        try {
+          updateUserCountry(userId);
+        } catch (countryErr) {
+          console.error("Failed to resolve user country in background:", countryErr?.message);
+        }
+      }
     }
 
     // Apply Fisher-Yates shuffle for proper randomness (in-place)
@@ -1519,6 +1539,20 @@ app.get("/profiles", async (req, res) => {
           );
         }
       });
+    }
+
+    // Boost impression tracking: increment impressionCount for any active-boosted profiles shown
+    if (shuffledProfiles.length > 0) {
+      try {
+        const now = new Date();
+        const boostedIds = shuffledProfiles.map((p) => p._id?.toString()).filter(Boolean);
+        await Boost.updateMany(
+          { userId: { $in: boostedIds }, status: "active", expiresAt: { $gt: now } },
+          { $inc: { impressionCount: 1 } }
+        );
+      } catch (impressionErr) {
+        console.error("[Boost] Impression tracking error:", impressionErr?.message);
+      }
     }
 
     return res.status(200).json({
@@ -1761,6 +1795,8 @@ app.post("/super-wave", async (req, res) => {
 });
 
 // Super Flirt - send a personalised message with a like
+const SUPER_FLIRT_DAILY_CAP = 5;
+
 app.post("/super-flirts", async (req, res) => {
   try {
     const { senderId, receiverId, message } = req.body;
@@ -1775,6 +1811,18 @@ app.post("/super-flirts", async (req, res) => {
 
     if (message.length > 150) {
       return res.status(400).json({ message: "message must be 150 characters or fewer" });
+    }
+
+    const now = new Date();
+    const startOfTodayUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+    const sentToday = await SuperFlirt.countDocuments({
+      senderId,
+      createdAt: { $gte: startOfTodayUTC },
+    });
+    if (sentToday >= SUPER_FLIRT_DAILY_CAP) {
+      return res.status(429).json({
+        message: `Daily Super Flirt limit reached (${SUPER_FLIRT_DAILY_CAP} per day). Try again tomorrow.`,
+      });
     }
 
     const sender = await User.findById(senderId).select("name profileImages crushes").lean();
@@ -1930,6 +1978,166 @@ app.post("/super-flirts/:id/pass", async (req, res) => {
     res.status(500).json({ message: "Failed to pass Super Flirt" });
   }
 });
+
+// ─── Priority Boost endpoints ────────────────────────────────────────────────
+
+const BOOST_CREDITS_PER_CYCLE = 4;
+const BOOST_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// GET /boosts/status?userId=...
+app.get("/boosts/status", async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Valid userId is required" });
+    }
+
+    const user = await User.findById(userId).select("boostCredits").lean();
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const activeBoost = await Boost.findOne({ userId, status: "active" }).lean();
+
+    res.status(200).json({
+      active: !!activeBoost,
+      expires_at: activeBoost ? activeBoost.expiresAt : null,
+      credits_remaining: user.boostCredits?.remaining ?? 0,
+      credits_reset_at: user.boostCredits?.resetAt ?? null,
+      total_credits_this_cycle: BOOST_CREDITS_PER_CYCLE,
+    });
+  } catch (error) {
+    console.error("Error fetching boost status:", error);
+    res.status(500).json({ message: "Failed to fetch boost status" });
+  }
+});
+
+// POST /boosts/activate  { userId, hasAccess }
+app.post("/boosts/activate", async (req, res) => {
+  try {
+    const { userId, hasAccess } = req.body;
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Valid userId is required" });
+    }
+
+    if (!hasAccess) {
+      return res.status(403).json({ message: "Priority Boost requires a Flirt Gold subscription" });
+    }
+
+    // Enforce one active boost at a time
+    const existingActive = await Boost.findOne({ userId, status: "active" });
+    if (existingActive) {
+      return res.status(409).json({ message: "You already have an active Priority Boost", expires_at: existingActive.expiresAt });
+    }
+
+    const user = await User.findById(userId).select("boostCredits pushToken name").lean();
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const creditsRemaining = user.boostCredits?.remaining ?? 0;
+    if (creditsRemaining <= 0) {
+      return res.status(403).json({
+        message: "No Boost credits remaining this month",
+        credits_reset_at: user.boostCredits?.resetAt ?? null,
+      });
+    }
+
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + BOOST_DURATION_MS);
+
+    const boost = new Boost({ userId, activatedAt: now, expiresAt });
+    await boost.save();
+
+    // Set priority = 1 so this user appears first in discovery
+    await User.findByIdAndUpdate(userId, {
+      priority: 1,
+      $inc: { "boostCredits.remaining": -1 },
+    });
+
+    // Immediate activation push notification
+    if (user.pushToken) {
+      try {
+        await sendNotification(
+          user.pushToken,
+          "Priority Boost is live 🔥",
+          "You're showing up first for everyone near you — go get those matches."
+        );
+      } catch (notifErr) {
+        console.error("[Boost] Activation notification failed:", notifErr?.message);
+      }
+    }
+
+    // Store in-app notification
+    try {
+      await createNotification({
+        userId,
+        type: "boost_activated",
+        title: "Priority Boost is live 🔥",
+        message: "You're showing up first for everyone near you — go get those matches.",
+      });
+    } catch (notifErr) {
+      console.error("[Boost] In-app notification failed:", notifErr?.message);
+    }
+
+    console.log(`[Boost] Activated for user ${userId}, expires ${expiresAt.toISOString()}`);
+    res.status(200).json({
+      message: "Priority Boost activated",
+      boost_id: boost._id,
+      expires_at: expiresAt,
+      credits_remaining: creditsRemaining - 1,
+    });
+  } catch (error) {
+    console.error("Error activating boost:", error);
+    res.status(500).json({ message: "Failed to activate Priority Boost" });
+  }
+});
+
+// POST /boosts/reset-credits  { userId }  — called client-side after Gold subscription purchase/renewal
+app.post("/boosts/reset-credits", async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ message: "Valid userId is required" });
+    }
+
+    const resetAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { boostCredits: { remaining: BOOST_CREDITS_PER_CYCLE, resetAt } },
+      { new: true }
+    ).select("pushToken");
+
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    if (user.pushToken) {
+      try {
+        await sendNotification(
+          user.pushToken,
+          "Your 4 Priority Boosts are back",
+          "First one's on us — tap to activate."
+        );
+      } catch (notifErr) {
+        console.error("[Boost] Credits reset notification failed:", notifErr?.message);
+      }
+    }
+
+    try {
+      await createNotification({
+        userId,
+        type: "boost_credits_reset",
+        title: "Your 4 Priority Boosts are back",
+        message: "First one's on us — tap to activate.",
+      });
+    } catch (notifErr) {
+      console.error("[Boost] Credits reset in-app notification failed:", notifErr?.message);
+    }
+
+    console.log(`[Boost] Credits reset for user ${userId}`);
+    res.status(200).json({ message: "Boost credits reset", credits_remaining: BOOST_CREDITS_PER_CYCLE, credits_reset_at: resetAt });
+  } catch (error) {
+    console.error("Error resetting boost credits:", error);
+    res.status(500).json({ message: "Failed to reset boost credits" });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 app.post("/create-match", async (req, res) => {
   try {
@@ -4811,6 +5019,105 @@ cron.schedule("*/30 * * * *", sendRatingReminders);
 sendRatingReminders().catch((error) =>
   console.error("[Rating Reminder] Error on startup:", error)
 );
+
+// ─── Priority Boost cron — runs every 5 minutes ──────────────────────────────
+cron.schedule("*/5 * * * *", async () => {
+  try {
+    const now = new Date();
+    const warningThreshold = new Date(now.getTime() - 18 * 60 * 60 * 1000);
+
+    // T+18h: send 6-hour warning to boosts that have been active for 18h
+    const needWarning = await Boost.find({
+      status: "active",
+      activatedAt: { $lte: warningThreshold },
+      warningNotifSent: false,
+    }).populate("userId", "pushToken");
+
+    for (const boost of needWarning) {
+      if (boost.userId?.pushToken) {
+        try {
+          await sendNotification(
+            boost.userId.pushToken,
+            "6 hours left on your Boost",
+            "6 hours left on your Priority Boost — make the most of it while you're hot."
+          );
+        } catch (e) {
+          console.error("[Boost Cron] Warning notif failed:", e?.message);
+        }
+      }
+      boost.warningNotifSent = true;
+      await boost.save();
+    }
+
+    // T+24h: expire boosts and send expiry notification
+    const expired = await Boost.find({
+      status: "active",
+      expiresAt: { $lte: now },
+      expiryNotifSent: false,
+    }).populate("userId", "pushToken boostCredits coordinates");
+
+    for (const boost of expired) {
+      // Coverage % calculation: impressionCount / distinct active users in same radius
+      let coverage = 0;
+      try {
+        const userDoc = await User.findById(boost.userId._id).select("coordinates").lean();
+        const coords = userDoc?.coordinates?.coordinates;
+        let activeUsersInRadius = 1;
+        if (coords && coords.length === 2) {
+          activeUsersInRadius = await User.countDocuments({
+            _id: { $ne: boost.userId._id },
+            coordinates: {
+              $geoWithin: {
+                $centerSphere: [coords, 50 / 6378.1],
+              },
+            },
+            updatedAt: { $gte: new Date(boost.activatedAt.getTime() - 24 * 60 * 60 * 1000) },
+          });
+        }
+        coverage = Math.min(95, Math.round((boost.impressionCount / Math.max(1, activeUsersInRadius)) * 100));
+      } catch (e) {
+        console.error("[Boost Cron] Coverage calc failed:", e?.message);
+      }
+
+      const creditsLeft = boost.userId?.boostCredits?.remaining ?? 0;
+
+      boost.status = "expired";
+      boost.expiryNotifSent = true;
+      await boost.save();
+
+      // Reset priority
+      await User.findByIdAndUpdate(boost.userId._id, { priority: 0 });
+
+      if (boost.userId?.pushToken) {
+        try {
+          await sendNotification(
+            boost.userId.pushToken,
+            "Your Priority Boost has ended",
+            `You reached ${coverage}% of active users nearby — nice. ${creditsLeft} Boost${creditsLeft !== 1 ? "s" : ""} left this month.`
+          );
+        } catch (e) {
+          console.error("[Boost Cron] Expiry notif failed:", e?.message);
+        }
+      }
+
+      try {
+        await createNotification({
+          userId: boost.userId._id,
+          type: "boost_expired",
+          title: "Your Priority Boost has ended",
+          message: `You reached ${coverage}% of active users nearby. ${creditsLeft} Boost${creditsLeft !== 1 ? "s" : ""} left this month.`,
+        });
+      } catch (e) {
+        console.error("[Boost Cron] Expiry in-app notif failed:", e?.message);
+      }
+
+      console.log(`[Boost Cron] Expired boost ${boost._id} for user ${boost.userId._id}, coverage ${coverage}%`);
+    }
+  } catch (error) {
+    console.error("[Boost Cron] Error:", error);
+  }
+});
+// ─────────────────────────────────────────────────────────────────────────────
 
 // Create new event
 app.post("/events", async (req, res) => {

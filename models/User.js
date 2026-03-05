@@ -158,6 +158,10 @@ const userSchema = mongoose.Schema(
       answeredAt: { type: Date },
     },
     priority: { type: Number, default: 0 },
+    boostCredits: {
+      remaining: { type: Number, default: 0 },
+      resetAt: { type: Date, default: null },
+    },
     availability: {
       type: [String],
       enum: ["morning", "afternoon", "evening"],
