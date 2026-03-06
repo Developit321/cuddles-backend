@@ -104,6 +104,10 @@ const eventSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    sixtyPercentNotifSent: {
+      type: Boolean,
+      default: false,
+    },
   },
   { timestamps: true }
 );
