@@ -26,8 +26,13 @@ const Chat = require("./models/message");
 const http = require("http").createServer(app);
 const io = require("socket.io")(http); // Pass the HTTP server instance
 const bcrypt = require("bcryptjs");
-const { sendNotification } = require("./notifications/pushNotifications");
+const { sendNotification, sendNotificationBatch } = require("./notifications/pushNotifications");
+const { getQueue, enqueueNearbyEvent, enqueueNearby60Fill } = require("./queues/nearbyNotifications");
 const notificationStrings = require("./notifications/notificationStrings");
+const {
+  shouldSendNotification,
+  getCategoryForType,
+} = require("./notifications/notificationCaps");
 const { ObjectId } = require("mongodb");
 const { updateUserCountry } = require("./Controllers/userController");
 
@@ -69,6 +74,8 @@ const isValidExpoPushToken = (token) => {
 
 // Helper function to create and send notifications
 // In-app notification is always saved; push is best-effort only (no token or invalid token = no push, no failure)
+// category is optional; when set, used for cap tracking (see createNotificationWithCaps).
+// Event notifications are triggered from here (crons, POST /events, joins, etc.); caps and copy live in api/notifications/.
 const createNotification = async ({
   userId,
   type,
@@ -79,6 +86,8 @@ const createNotification = async ({
   actorId,
   actorName,
   actorImage,
+  category,
+  skipPush,
 }) => {
   try {
     // 1. Save to database (in-app notification) – always attempt
@@ -92,23 +101,26 @@ const createNotification = async ({
       actorId,
       actorName,
       actorImage,
+      ...(category != null && { category }),
     });
     await notification.save();
 
-    // 2. Send push only if user has a valid Expo push token (optional; never fail the request)
-    const user = await User.findById(userId).select("pushToken").lean();
-    const token = user?.pushToken;
-    if (isValidExpoPushToken(token)) {
-      try {
-        await sendNotification(token, title, message);
-      } catch (pushError) {
-        console.error(
-          `[Notification] Failed to send push to user ${userId}:`,
-          pushError?.message || pushError
-        );
+    // 2. Send push unless skipPush (e.g. worker will batch-send later)
+    if (!skipPush) {
+      const user = await User.findById(userId).select("pushToken").lean();
+      const token = user?.pushToken;
+      if (isValidExpoPushToken(token)) {
+        try {
+          await sendNotification(token, title, message);
+        } catch (pushError) {
+          console.error(
+            `[Notification] Failed to send push to user ${userId}:`,
+            pushError?.message || pushError
+          );
+        }
+      } else if (token) {
+        console.log(`[Notification] User ${userId} has no valid Expo push token, skipping push`);
       }
-    } else if (token) {
-      console.log(`[Notification] User ${userId} has no valid Expo push token, skipping push`);
     }
 
     console.log(
@@ -120,6 +132,148 @@ const createNotification = async ({
     throw error;
   }
 };
+
+// Cap-aware wrapper: checks FOMO/re_engagement limits before creating + sending. Use at API/cron boundaries.
+// skipPush: when true, only save in-app notification (worker batches push later).
+const createNotificationWithCaps = async (payload) => {
+  const { userId, type } = payload;
+  const category = getCategoryForType(type);
+  if (category === "transactional" || category === "discovery" || category === "post_experience") {
+    return createNotification({ ...payload, category });
+  }
+  const { allowed, reason } = await shouldSendNotification(userId, category);
+  if (!allowed) {
+    console.log(`[Notification] Skipping ${type} for user ${userId}: ${reason || "cap"}`);
+    return null;
+  }
+  return createNotification({ ...payload, category });
+};
+
+const NEARBY_NOTIFY_LIMIT = 100;
+
+// Register nearby-notifications queue worker when Redis is available
+const nearbyQueue = getQueue();
+if (nearbyQueue) {
+  nearbyQueue.process(1, async (job) => {
+    const { type, eventId } = job.data || {};
+    if (type === "event_nearby") {
+      const event = await Event.findById(eventId).populate("hostId", "name").lean();
+      if (!event) {
+        console.warn("[Nearby Queue] event_nearby: event not found", eventId);
+        return;
+      }
+      const hostId = event.hostId?._id || event.hostId;
+      const hostName = (event.hostId && event.hostId.name) || "Someone";
+      const [lng, lat] = event.location?.coordinates || [];
+      if (lng == null || lat == null) return;
+      const audienceQuery = {};
+      if (event.audience === "women_only") audienceQuery.gender = "female";
+      else if (event.audience === "men_only") audienceQuery.gender = "male";
+      const nearbyUsers = await User.aggregate([
+        {
+          $geoNear: {
+            near: { type: "Point", coordinates: [lng, lat] },
+            distanceField: "distance",
+            maxDistance: 50000,
+            spherical: true,
+            query: {
+              _id: { $ne: new mongoose.Types.ObjectId(hostId) },
+              pushToken: { $exists: true, $ne: null },
+              ...audienceQuery,
+            },
+          },
+        },
+        { $limit: NEARBY_NOTIFY_LIMIT },
+        { $project: { _id: 1, pushToken: 1 } },
+      ]);
+      const eventNearbyStr = getStrings("en").eventNearby;
+      const spotsOpen = Math.max(0, (event.capacity || 6) - 1);
+      const title = interpolate(eventNearbyStr.title, {});
+      const body = interpolate(eventNearbyStr.body, { name: hostName, activity: event.title || "", spotsOpen: String(spotsOpen) });
+      const messages = [];
+      for (const u of nearbyUsers) {
+        const { allowed } = await shouldSendNotification(u._id, "discovery");
+        if (!allowed) continue;
+        await createNotificationWithCaps({
+          userId: u._id,
+          type: "event_nearby",
+          title,
+          message: body,
+          eventId: event._id,
+          eventName: event.title,
+          actorId: hostId,
+          actorName: hostName,
+          skipPush: true,
+        });
+        if (u.pushToken) messages.push({ to: u.pushToken, title, body });
+      }
+      await sendNotificationBatch(messages);
+      console.log(`[Nearby Queue] event_nearby: sent ${messages.length} notifications for event ${eventId}`);
+    } else if (type === "event_nearby_60") {
+      const event = await Event.findById(eventId).lean();
+      if (!event) {
+        console.warn("[Nearby Queue] event_nearby_60: event not found", eventId);
+        return;
+      }
+      const host = await User.findById(event.hostId).select("name").lean();
+      const hostName = host?.name || "Someone";
+      const participantIds = (event.participants || []).map((p) => (p.userId && p.userId._id ? p.userId._id : p.userId));
+      const excludeIds = [event.hostId, ...participantIds].filter(Boolean).map((id) => (id && id._id ? id._id : id));
+      const [lng, lat] = event.location?.coordinates || [];
+      if (lng == null || lat == null || excludeIds.length === 0) {
+        await Event.updateOne({ _id: eventId }, { sixtyPercentNotifSent: true });
+        return;
+      }
+      const audienceQuery = {};
+      if (event.audience === "women_only") audienceQuery.gender = "female";
+      else if (event.audience === "men_only") audienceQuery.gender = "male";
+      const nearbyNotJoined = await User.aggregate([
+        {
+          $geoNear: {
+            near: { type: "Point", coordinates: [lng, lat] },
+            distanceField: "distance",
+            maxDistance: 50000,
+            spherical: true,
+            query: {
+              _id: { $nin: excludeIds.map((id) => new mongoose.Types.ObjectId(id)) },
+              pushToken: { $exists: true, $ne: null },
+              ...audienceQuery,
+            },
+          },
+        },
+        { $limit: NEARBY_NOTIFY_LIMIT },
+        { $project: { _id: 1, pushToken: 1, preferredLanguage: 1 } },
+      ]);
+      const fillStrEn = getStrings("en").tableFillingFast;
+      const messages = [];
+      for (const u of nearbyNotJoined) {
+        const { allowed } = await shouldSendNotification(u._id, "fomo");
+        if (!allowed) continue;
+        const str = (u.preferredLanguage && getStrings(u.preferredLanguage).tableFillingFast) ? getStrings(u.preferredLanguage).tableFillingFast : fillStrEn;
+        const notifTitle = interpolate(str.title, { name: hostName, activity: event.title || "" });
+        const notifBody = str.body || "";
+        await createNotificationWithCaps({
+          userId: u._id,
+          type: "table_filling_fast",
+          title: notifTitle,
+          message: notifBody,
+          eventId: event._id,
+          eventName: event.title,
+          actorId: event.hostId,
+          actorName: hostName,
+          skipPush: true,
+        });
+        if (u.pushToken) messages.push({ to: u.pushToken, title: notifTitle, body: notifBody });
+      }
+      await sendNotificationBatch(messages);
+      await Event.updateOne({ _id: eventId }, { sixtyPercentNotifSent: true });
+      console.log(`[Nearby Queue] event_nearby_60: sent ${messages.length} notifications for event ${eventId}`);
+    } else {
+      console.warn("[Nearby Queue] Unknown job type:", type);
+    }
+  });
+  console.log("[Nearby Queue] Worker registered for nearby-notifications");
+}
 
 app.use(cors());
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -1622,7 +1776,7 @@ app.post("/likeprofile", async (req, res) => {
 
     // Create persistent notification for the profile like
     try {
-      await createNotification({
+      await createNotificationWithCaps({
         userId: selectedUserId,
         type: "profile_like",
         title: "Someone wants to connect",
@@ -1765,7 +1919,7 @@ app.post("/super-wave", async (req, res) => {
 
       // Create profile_like notification (in-app only if no push token; never fail the wave)
       try {
-        await createNotification({
+        await createNotificationWithCaps({
           userId: receiverId,
           type: "profile_like",
           title: "Someone wants to connect",
@@ -1781,7 +1935,7 @@ app.post("/super-wave", async (req, res) => {
 
     // Create super_wave notification (in-app only if no push token; never fail the wave)
     try {
-      await createNotification({
+      await createNotificationWithCaps({
         userId: receiverId,
         type: "super_wave",
         title: "Someone waved at you!",
@@ -1865,7 +2019,7 @@ app.post("/super-flirts", async (req, res) => {
       const sfTitle = interpolate(sfStrings.title, { name: sender.name || "Someone" });
       const sfBody = interpolate(sfStrings.body, { name: sender.name || "Someone" });
 
-      await createNotification({
+      await createNotificationWithCaps({
         userId: receiverId,
         type: "super_flirt",
         title: sfTitle,
@@ -2080,7 +2234,7 @@ app.post("/boosts/activate", async (req, res) => {
 
     // Store in-app notification
     try {
-      await createNotification({
+      await createNotificationWithCaps({
         userId,
         type: "boost_activated",
         title: boostActivatedStr.title,
@@ -2131,7 +2285,7 @@ app.post("/boosts/reset-credits", async (req, res) => {
     }
 
     try {
-      await createNotification({
+      await createNotificationWithCaps({
         userId,
         type: "boost_credits_reset",
         title: boostResetStr.title,
@@ -4873,7 +5027,7 @@ const expireSuggestions = async () => {
 
         // Notify the suggester that their suggestion expired
         if (suggestion.hostId) {
-          await createNotification({
+          await createNotificationWithCaps({
             userId: suggestion.hostId._id,
             type: "suggestion_expired",
             title: "Suggestion Expired",
@@ -4921,7 +5075,7 @@ const sendEventReminders = async () => {
       startTime: { $gte: now, $lte: oneHourFromNow },
       status: "upcoming",
       reminderSent: { $ne: true },
-    }).populate("participants.userId", "name");
+    }).populate("participants.userId", "name preferredLanguage");
 
     if (upcomingEvents.length === 0) {
       return;
@@ -4943,14 +5097,19 @@ const sendEventReminders = async () => {
           ? `${minutesUntilStart} minutes`
           : "soon";
 
+      const eventReminderStr = getStrings("en").eventReminder;
       // Send reminder to all participants
       for (const participant of event.participants) {
         try {
-          await createNotification({
+          const lang = participant.userId?.preferredLanguage;
+          const str = (lang && getStrings(lang).eventReminder) ? getStrings(lang).eventReminder : eventReminderStr;
+          const title = str.title;
+          const message = interpolate(str.body, { eventTitle: event.title, timeString });
+          await createNotificationWithCaps({
             userId: participant.userId._id || participant.userId,
             type: "event_reminder",
-            title: "Activity starting soon",
-            message: `Your activity "${event.title}" starts in ${timeString}`,
+            title,
+            message,
             eventId: event._id,
             eventName: event.title,
           });
@@ -4982,23 +5141,29 @@ sendEventReminders().catch((error) =>
   console.error("[Event Reminder] Error on startup:", error)
 );
 
-// Send rating reminders 4 hours after startTime (2 hours before deletion)
+// Send rating reminders: 2 hours after table ends (plan); if no endTime, fallback to 4h after startTime
 const sendRatingReminders = async () => {
   try {
     const now = new Date();
+    const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000);
     const fourHoursAgo = new Date(now.getTime() - 4 * 60 * 60 * 1000);
 
     const endedEvents = await Event.find({
-      startTime: { $lte: fourHoursAgo },
       status: "ended",
       ratingReminderSent: { $ne: true },
-    }).populate("participants.userId", "name pushToken");
+    }).populate("participants.userId", "name pushToken preferredLanguage").populate("hostId", "name");
 
-    if (endedEvents.length === 0) return;
+    const readyForReminder = endedEvents.filter((e) => {
+      if (e.endTime && e.endTime.getTime() <= twoHoursAgo.getTime()) return true;
+      if (!e.endTime && e.startTime && e.startTime.getTime() <= fourHoursAgo.getTime()) return true;
+      return false;
+    });
 
-    console.log(`[Rating Reminder] Found ${endedEvents.length} events needing rating reminders`);
+    if (readyForReminder.length === 0) return;
 
-    for (const event of endedEvents) {
+    console.log(`[Rating Reminder] Found ${readyForReminder.length} events needing rating reminders`);
+
+    for (const event of readyForReminder) {
       const hostId = (event.hostId._id || event.hostId).toString();
 
       for (const participant of event.participants) {
@@ -5008,11 +5173,16 @@ const sendRatingReminders = async () => {
         if (participant.status !== "going" && participant.status !== "checked_in") continue;
 
         try {
-          await createNotification({
+          const hostName = event.hostId?.name || "your host";
+          const lang = participant.userId?.preferredLanguage;
+          const str = (lang && getStrings(lang).rateHost) ? getStrings(lang).rateHost : getStrings("en").rateHost;
+          const title = str.title;
+          const message = interpolate(str.body, { hostName });
+          await createNotificationWithCaps({
             userId: pUserId,
             type: "rate_host",
-            title: "How was your host?",
-            message: `Rate your host for "${event.title}" before it's too late`,
+            title,
+            message,
             eventId: event._id,
             eventName: event.title,
           });
@@ -5117,7 +5287,7 @@ cron.schedule("*/5 * * * *", async () => {
       }
 
       try {
-        await createNotification({
+        await createNotificationWithCaps({
           userId: boost.userId._id,
           type: "boost_expired",
           title: expiredTitle,
@@ -5304,7 +5474,7 @@ app.post("/events", async (req, res) => {
           // Send notification to all suggested users
           for (const targetUser of targetUsers) {
             try {
-              await createNotification({
+              await createNotificationWithCaps({
                 userId: targetUser._id,
                 type: "activity_suggestion",
                 title: "Activity Suggestion",
@@ -5325,58 +5495,56 @@ app.post("/events", async (req, res) => {
           console.log(`[Suggestion] Completed sending ${suggestionCount} suggestion notifications`);
         } else {
           // Regular event - notify nearby users (within 50km)
-          const [eventLng, eventLat] = location.coordinates;
-          const maxDistanceMeters = 50000; // 50km
-
-          // Filter by gender when event has audience restriction
-          const audienceQuery = {};
-          if (newEvent.audience === "women_only") audienceQuery.gender = "female";
-          else if (newEvent.audience === "men_only") audienceQuery.gender = "male";
-
-          // Find nearby users with push tokens (exclude the host)
-          const nearbyUsers = await User.aggregate([
-            {
-              $geoNear: {
-                near: {
-                  type: "Point",
-                  coordinates: [eventLng, eventLat],
-                },
-                distanceField: "distance",
-                maxDistance: maxDistanceMeters,
-                spherical: true,
-                query: {
-                  _id: { $ne: new mongoose.Types.ObjectId(hostId) },
-                  pushToken: { $exists: true, $ne: null },
-                  ...audienceQuery,
+          if (process.env.REDIS_URL && getQueue()) {
+            enqueueNearbyEvent(newEvent._id);
+            console.log(`[Event Nearby] Enqueued event_nearby for event ${newEvent._id}`);
+          } else {
+            const [eventLng, eventLat] = location.coordinates;
+            const maxDistanceMeters = 50000; // 50km
+            const audienceQuery = {};
+            if (newEvent.audience === "women_only") audienceQuery.gender = "female";
+            else if (newEvent.audience === "men_only") audienceQuery.gender = "male";
+            const nearbyUsers = await User.aggregate([
+              {
+                $geoNear: {
+                  near: { type: "Point", coordinates: [eventLng, eventLat] },
+                  distanceField: "distance",
+                  maxDistance: maxDistanceMeters,
+                  spherical: true,
+                  query: {
+                    _id: { $ne: new mongoose.Types.ObjectId(hostId) },
+                    pushToken: { $exists: true, $ne: null },
+                    ...audienceQuery,
+                  },
                 },
               },
-            },
-            { $limit: 50 },
-            { $project: { _id: 1, name: 1 } },
-          ]);
-
-          console.log(
-            `[Event Nearby] Found ${nearbyUsers.length} users near new event "${title}"`
-          );
-
-          // Create notifications for nearby users
-          for (const nearbyUser of nearbyUsers) {
-            try {
-              await createNotification({
-                userId: nearbyUser._id,
-                type: "event_nearby",
-                title: "New activity nearby",
-                message: `A new table "${title}" is happening near you`,
-                eventId: newEvent._id,
-                eventName: title,
-                actorId: hostId,
-                actorName: host.name,
-              });
-            } catch (notifError) {
-              console.error(
-                `Error creating nearby notification for user ${nearbyUser._id}:`,
-                notifError
-              );
+              { $limit: NEARBY_NOTIFY_LIMIT },
+              { $project: { _id: 1, name: 1 } },
+            ]);
+            console.log(`[Event Nearby] Found ${nearbyUsers.length} users near new event "${title}"`);
+            const eventNearbyStr = getStrings("en").eventNearby;
+            const spotsOpen = Math.max(0, (newEvent.capacity || 6) - 1);
+            for (const nearbyUser of nearbyUsers) {
+              try {
+                const notifTitle = interpolate(eventNearbyStr.title, {});
+                const notifBody = interpolate(eventNearbyStr.body, {
+                  name: host.name,
+                  activity: title,
+                  spotsOpen: String(spotsOpen),
+                });
+                await createNotificationWithCaps({
+                  userId: nearbyUser._id,
+                  type: "event_nearby",
+                  title: notifTitle,
+                  message: notifBody,
+                  eventId: newEvent._id,
+                  eventName: title,
+                  actorId: hostId,
+                  actorName: host.name,
+                });
+              } catch (notifError) {
+                console.error(`Error creating nearby notification for user ${nearbyUser._id}:`, notifError);
+              }
             }
           }
         }
@@ -5481,7 +5649,7 @@ app.put("/events/:eventId", async (req, res) => {
 
     for (const participantId of participantIds) {
       try {
-        await createNotification({
+        await createNotificationWithCaps({
           userId: participantId,
           type: "event_updated",
           title: "Event updated",
@@ -5542,7 +5710,7 @@ app.delete("/events/:eventId", async (req, res) => {
     // Notify all participants (except host) about cancellation before deleting
     for (const participantId of participantIds) {
       try {
-        await createNotification({
+        await createNotificationWithCaps({
           userId: participantId,
           type: "event_cancelled",
           title: "Event cancelled",
@@ -5916,7 +6084,7 @@ app.post("/events/:eventId/join", async (req, res) => {
     }
 
     // Check if user is blocked by host
-    const host = await User.findById(event.hostId).select("blockedBy");
+    const host = await User.findById(event.hostId).select("blockedBy preferredLanguage");
     if (host && host.blockedBy.includes(userId)) {
       return res.status(403).json({ message: "You cannot join this event" });
     }
@@ -5939,12 +6107,17 @@ app.post("/events/:eventId/join", async (req, res) => {
     await event.save();
 
     // Create notification for host (stored in DB + push notification)
+    const isFirstJoin = goingCount === 2;
     try {
-      await createNotification({
+      const hostLang = host?.preferredLanguage;
+      const str = (hostLang && getStrings(hostLang).firstJoin) ? getStrings(hostLang).firstJoin : getStrings("en").firstJoin;
+      const title = isFirstJoin ? interpolate(str.title, {}) : "New participant joined";
+      const message = isFirstJoin ? interpolate(str.body, { name: joiningUser.name }) : `${joiningUser.name} joined your event "${event.title}"`;
+      await createNotificationWithCaps({
         userId: event.hostId,
         type: "event_joined",
-        title: "New participant joined",
-        message: `${joiningUser.name} joined your event "${event.title}"`,
+        title,
+        message,
         eventId: event._id,
         eventName: event.title,
         actorId: userId,
@@ -5952,6 +6125,91 @@ app.post("/events/:eventId/join", async (req, res) => {
       });
     } catch (notifError) {
       console.error("Error creating join notification:", notifError);
+    }
+
+    // When event first reaches 60% capacity: notify host + nearby users who haven't joined (plan: table heating up / filling fast)
+    const atSixtyPercent = event.capacity > 0 && goingCount / event.capacity >= 0.6;
+    if (atSixtyPercent && !event.sixtyPercentNotifSent) {
+      try {
+        const hostForNotif = await User.findById(event.hostId).select("name preferredLanguage").lean();
+        const taken = goingCount;
+        const total = event.capacity;
+        const left = Math.max(0, total - taken);
+
+        // Host: "Your table is heating up"
+        const hostStr = (hostForNotif?.preferredLanguage && getStrings(hostForNotif.preferredLanguage).table60Full)
+          ? getStrings(hostForNotif.preferredLanguage).table60Full
+          : getStrings("en").table60Full;
+        await createNotificationWithCaps({
+          userId: event.hostId,
+          type: "table_60_full",
+          title: hostStr.title,
+          message: interpolate(hostStr.body, { taken: String(taken), total: String(total), left: String(left) }),
+          eventId: event._id,
+          eventName: event.title,
+        });
+
+        // Nearby users who have NOT joined: "Name's activity is filling up fast" (FOMO cap applies)
+        const useQueue = process.env.REDIS_URL && getQueue();
+        if (useQueue) {
+          enqueueNearby60Fill(event._id);
+          console.log(`[60% fill] Enqueued event_nearby_60 for event ${event._id}; worker will set sixtyPercentNotifSent`);
+        } else {
+          const [eventLng, eventLat] = event.location?.coordinates || [];
+          const participantIds = event.participants.map((p) => p.userId);
+          const excludeIds = [event.hostId, ...participantIds].map((id) => (id && id._id ? id._id : id));
+          if (eventLng != null && eventLat != null && excludeIds.length > 0) {
+            const audienceQuery = {};
+            if (event.audience === "women_only") audienceQuery.gender = "female";
+            else if (event.audience === "men_only") audienceQuery.gender = "male";
+            const nearbyNotJoined = await User.aggregate([
+              {
+                $geoNear: {
+                  near: { type: "Point", coordinates: [eventLng, eventLat] },
+                  distanceField: "distance",
+                  maxDistance: 50000,
+                  spherical: true,
+                  query: {
+                    _id: { $nin: excludeIds },
+                    pushToken: { $exists: true, $ne: null },
+                    ...audienceQuery,
+                  },
+                },
+              },
+              { $limit: NEARBY_NOTIFY_LIMIT },
+              { $project: { _id: 1, preferredLanguage: 1 } },
+            ]);
+            const fillStrEn = getStrings("en").tableFillingFast;
+            const hostName = hostForNotif?.name || "Someone";
+            for (const u of nearbyNotJoined) {
+              try {
+                const str = (u.preferredLanguage && getStrings(u.preferredLanguage).tableFillingFast)
+                  ? getStrings(u.preferredLanguage).tableFillingFast
+                  : fillStrEn;
+                const title = interpolate(str.title, { name: hostName, activity: event.title });
+                const message = str.body;
+                await createNotificationWithCaps({
+                  userId: u._id,
+                  type: "table_filling_fast",
+                  title,
+                  message,
+                  eventId: event._id,
+                  eventName: event.title,
+                  actorId: event.hostId,
+                  actorName: hostName,
+                });
+              } catch (e) {
+                console.error("[60% fill] Nearby notif failed for user", u._id, e?.message);
+              }
+            }
+            console.log(`[60% fill] Notified host + ${nearbyNotJoined.length} nearby users for "${event.title}"`);
+          }
+          event.sixtyPercentNotifSent = true;
+          await event.save();
+        }
+      } catch (err) {
+        console.error("[60% fill] Error sending 60% notifications:", err?.message || err);
+      }
     }
 
     const updatedEvent = await Event.findById(eventId)
@@ -6121,26 +6379,31 @@ app.post("/events/:eventId/check-in", async (req, res) => {
     event.participants[participantIndex].status = "checked_in";
     await event.save();
 
-    // Notify other participants
+    // Notify other participants (in-app + push)
+    const otherParticipantIds = event.participants
+      .filter((p) => p.userId.toString() !== userId)
+      .map((p) => p.userId);
     const otherParticipants = await User.find({
-      _id: {
-        $in: event.participants
-          .filter((p) => p.userId.toString() !== userId)
-          .map((p) => p.userId),
-      },
-      pushToken: { $exists: true, $ne: null },
-    }).select("pushToken preferredLanguage");
+      _id: { $in: otherParticipantIds },
+    }).select("_id preferredLanguage");
 
     const checkedInUser = await User.findById(userId).select("name");
 
     for (const participant of otherParticipants) {
       try {
-        const ciStr = getStrings(participant.preferredLanguage).eventCheckin;
-        await sendNotification(
-          participant.pushToken,
-          interpolate(ciStr.title, { name: checkedInUser.name, eventTitle: event.title }),
-          interpolate(ciStr.body, { name: checkedInUser.name, eventTitle: event.title })
-        );
+        const ciStr = getStrings(participant.preferredLanguage).eventCheckin || getStrings("en").eventCheckin;
+        const title = interpolate(ciStr.title, { name: checkedInUser.name, eventTitle: event.title });
+        const message = interpolate(ciStr.body, { name: checkedInUser.name, eventTitle: event.title });
+        await createNotificationWithCaps({
+          userId: participant._id,
+          type: "event_checkin",
+          title,
+          message,
+          eventId: event._id,
+          eventName: event.title,
+          actorId: userId,
+          actorName: checkedInUser.name,
+        });
       } catch (notifError) {
         console.error("Error sending notification:", notifError);
       }
@@ -6271,19 +6534,23 @@ app.delete("/events/:eventId/participants/:participantId", async (req, res) => {
 
     await event.save();
 
-    // Notify removed participant
-    const removedUser = await User.findById(participantId).select("pushToken preferredLanguage");
-    if (removedUser && removedUser.pushToken) {
-      try {
-        const removeStr = getStrings(removedUser.preferredLanguage).eventRemoved;
-        await sendNotification(
-          removedUser.pushToken,
-          interpolate(removeStr.title, { eventTitle: event.title }),
-          interpolate(removeStr.body, { eventTitle: event.title })
-        );
-      } catch (notifError) {
-        console.error("Error sending notification:", notifError);
-      }
+    // Notify removed participant (in-app + push)
+    try {
+      const removedUser = await User.findById(participantId).select("preferredLanguage").lean();
+      const lang = removedUser?.preferredLanguage;
+      const removeStr = (lang && getStrings(lang).eventRemoved) ? getStrings(lang).eventRemoved : getStrings("en").eventRemoved;
+      const title = interpolate(removeStr.title, { eventTitle: event.title });
+      const message = interpolate(removeStr.body, { eventTitle: event.title });
+      await createNotificationWithCaps({
+        userId: participantId,
+        type: "event_removed",
+        title,
+        message,
+        eventId: event._id,
+        eventName: event.title,
+      });
+    } catch (notifError) {
+      console.error("Error sending notification:", notifError);
     }
 
     res.status(200).json({ message: "Participant removed successfully" });
@@ -6927,7 +7194,7 @@ app.post("/events/:eventId/respond-suggestion", async (req, res) => {
       // Notify the suggester that their suggestion was accepted
       const respondingUser = await User.findById(userId).select("name profileImages");
       
-      await createNotification({
+      await createNotificationWithCaps({
         userId: event.hostId._id,
         type: "suggestion_accepted",
         title: "Suggestion Accepted!",
@@ -7028,6 +7295,48 @@ app.post("/ratings", async (req, res) => {
     });
 
     await rating.save();
+
+    // Positive rating: send "Glad you had fun" to guest (plan G12)
+    if (stars >= 4) {
+      try {
+        const rater = await User.findById(raterId).select("preferredLanguage").lean();
+        const lang = rater?.preferredLanguage;
+        const str = (lang && getStrings(lang).afterRating) ? getStrings(lang).afterRating : getStrings("en").afterRating;
+        await createNotificationWithCaps({
+          userId: raterId,
+          type: "after_rating",
+          title: str.title,
+          message: str.body,
+          eventId,
+          eventName: event.title,
+        });
+      } catch (notifErr) {
+        console.error("[Rating] after_rating notification failed:", notifErr?.message);
+      }
+    }
+
+    // Host 3rd rating milestone: send "Your reputation is building" (plan H7)
+    const hostRatingCount = await Rating.countDocuments({ hostId });
+    if (hostRatingCount === 3) {
+      try {
+        const hostUser = await User.findById(hostId).select("preferredLanguage").lean();
+        const lang = hostUser?.preferredLanguage;
+        const str = (lang && getStrings(lang).hostThirdRating) ? getStrings(lang).hostThirdRating : getStrings("en").hostThirdRating;
+        const title = interpolate(str.title, {});
+        const message = interpolate(str.body, { x: "3" });
+        await createNotificationWithCaps({
+          userId: hostId,
+          type: "host_third_rating",
+          title,
+          message,
+          eventId,
+          eventName: event.title,
+        });
+      } catch (notifErr) {
+        console.error("[Rating] host_third_rating notification failed:", notifErr?.message);
+      }
+    }
+
     res.status(201).json({ message: "Rating submitted", rating });
   } catch (error) {
     if (error.code === 11000) {

@@ -71,18 +71,4 @@ router.post("/update-missing-countries", async (req, res) => {
   }
 });
 
-// API route to test cron job
-router.get("/test-cron", async (req, res) => {
-  try {
-    await sendDailyReminders();
-    res
-      .status(200)
-      .json({ message: "Daily reminders triggered successfully!" });
-  } catch (error) {
-    res
-      .status(500)
-      .json({ message: "Error triggering daily reminders", error });
-  }
-});
-
 module.exports = router;

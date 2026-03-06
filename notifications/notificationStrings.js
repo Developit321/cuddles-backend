@@ -8,6 +8,11 @@
  *   {coverage} - boost coverage %
  *   {count}    - numeric count
  *   {s}        - plural suffix (pass "" or "s")
+ *   {activity} - activity/event type name
+ *   {spotsOpen} - number of spots open (e.g. "8")
+ *   {hostName}  - host's name (e.g. for rate prompt)
+ *   {x}         - numeric count (e.g. seats taken, tables attended)
+ *   {timeString} - e.g. "1 hour" or "15 minutes"
  */
 
 module.exports = {
@@ -52,6 +57,79 @@ module.exports = {
       title: "{name}",
       body: "{message}",
     },
+    // Invitable / table notifications (see api/notificationplan.md)
+    eventNearby: {
+      title: "Someone near you just made plans",
+      body: "{name} is hosting {activity} nearby — {spotsOpen} spots open. Pull up a chair.",
+    },
+    firstJoin: {
+      title: "Someone's in!",
+      body: "{name} just pulled up a chair. Your table is getting started 🪑",
+    },
+    table60Full: {
+      title: "Your table is heating up 🔥",
+      body: "{taken} out of {total} seats are taken — only {left} spots left.",
+    },
+    tableFull: {
+      title: "Full house!",
+      body: "Your table is packed. See who's coming and get ready.",
+    },
+    hostReengage48h: {
+      title: "People had a great time.",
+      body: "Ready to host again? Your next table is one tap away.",
+    },
+    hostInactive2w: {
+      title: "Your crew is waiting.",
+      body: "What are you planning next? Create a table and see who shows up.",
+    },
+    tableFillingFast: {
+      title: "{name}'s {activity} is filling up fast",
+      body: "Grab a chair before it's gone.",
+    },
+    weekendNudge: {
+      title: "Nothing on your weekend yet.",
+      body: "There's a table for that. See what's happening near you.",
+    },
+    firstTableEver: {
+      title: "That was your first table 🎉",
+      body: "There are more like it waiting. What do you want to do next?",
+    },
+    personMetHosting: {
+      title: "{name} is hosting something",
+      body: "They're planning {activity} near you — you've met before. You in?",
+    },
+    tableBlowingUp: {
+      title: "This table is blowing up",
+      body: "{x} people joined in under 30 minutes. A few spots left — move fast.",
+    },
+    topHostCreated: {
+      title: "A top host just made plans",
+      body: "{name} (⭐️ 4.9) is hosting {activity} near you. They always show up.",
+    },
+    zeroTables7d: {
+      title: "People are out there.",
+      body: "Real plans, real people — close to you. Your first table is waiting.",
+    },
+    rateHost: {
+      title: "How was it?",
+      body: "Rate {hostName}'s table and help others know who to trust.",
+    },
+    afterRating: {
+      title: "Glad you had fun.",
+      body: "Why not host one next time? It only takes a minute to create a table.",
+    },
+    guestBeenToXTables: {
+      title: "You've been to {x} tables.",
+      body: "Ever thought about hosting one? Your people are already out there.",
+    },
+    hostThirdRating: {
+      title: "Your reputation is building 🏆",
+      body: "{x} people have rated your tables. Keep going — consistency gets noticed.",
+    },
+    eventReminder: {
+      title: "Activity starting soon",
+      body: "Your activity \"{eventTitle}\" starts in {timeString}",
+    },
   },
 
   ja: {
@@ -95,6 +173,24 @@ module.exports = {
       title: "{name}",
       body: "{message}",
     },
+    eventNearby: { title: "Someone near you just made plans", body: "{name} is hosting {activity} nearby — {spotsOpen} spots open. Pull up a chair." },
+    firstJoin: { title: "Someone's in!", body: "{name} just pulled up a chair. Your table is getting started 🪑" },
+    table60Full: { title: "Your table is heating up 🔥", body: "{taken} out of {total} seats are taken — only {left} spots left." },
+    tableFull: { title: "Full house!", body: "Your table is packed. See who's coming and get ready." },
+    hostReengage48h: { title: "People had a great time.", body: "Ready to host again? Your next table is one tap away." },
+    hostInactive2w: { title: "Your crew is waiting.", body: "What are you planning next? Create a table and see who shows up." },
+    tableFillingFast: { title: "{name}'s {activity} is filling up fast", body: "Grab a chair before it's gone." },
+    weekendNudge: { title: "Nothing on your weekend yet.", body: "There's a table for that. See what's happening near you." },
+    firstTableEver: { title: "That was your first table 🎉", body: "There are more like it waiting. What do you want to do next?" },
+    personMetHosting: { title: "{name} is hosting something", body: "They're planning {activity} near you — you've met before. You in?" },
+    tableBlowingUp: { title: "This table is blowing up", body: "{x} people joined in under 30 minutes. A few spots left — move fast." },
+    topHostCreated: { title: "A top host just made plans", body: "{name} (⭐️ 4.9) is hosting {activity} near you. They always show up." },
+    zeroTables7d: { title: "People are out there.", body: "Real plans, real people — close to you. Your first table is waiting." },
+    rateHost: { title: "How was it?", body: "Rate {hostName}'s table and help others know who to trust." },
+    afterRating: { title: "Glad you had fun.", body: "Why not host one next time? It only takes a minute to create a table." },
+    guestBeenToXTables: { title: "You've been to {x} tables.", body: "Ever thought about hosting one? Your people are already out there." },
+    hostThirdRating: { title: "Your reputation is building 🏆", body: "{x} people have rated your tables. Keep going — consistency gets noticed." },
+    eventReminder: { title: "Activity starting soon", body: "Your activity \"{eventTitle}\" starts in {timeString}" },
   },
 
   es: {
@@ -138,6 +234,24 @@ module.exports = {
       title: "{name}",
       body: "{message}",
     },
+    eventNearby: { title: "Someone near you just made plans", body: "{name} is hosting {activity} nearby — {spotsOpen} spots open. Pull up a chair." },
+    firstJoin: { title: "Someone's in!", body: "{name} just pulled up a chair. Your table is getting started 🪑" },
+    table60Full: { title: "Your table is heating up 🔥", body: "{taken} out of {total} seats are taken — only {left} spots left." },
+    tableFull: { title: "Full house!", body: "Your table is packed. See who's coming and get ready." },
+    hostReengage48h: { title: "People had a great time.", body: "Ready to host again? Your next table is one tap away." },
+    hostInactive2w: { title: "Your crew is waiting.", body: "What are you planning next? Create a table and see who shows up." },
+    tableFillingFast: { title: "{name}'s {activity} is filling up fast", body: "Grab a chair before it's gone." },
+    weekendNudge: { title: "Nothing on your weekend yet.", body: "There's a table for that. See what's happening near you." },
+    firstTableEver: { title: "That was your first table 🎉", body: "There are more like it waiting. What do you want to do next?" },
+    personMetHosting: { title: "{name} is hosting something", body: "They're planning {activity} near you — you've met before. You in?" },
+    tableBlowingUp: { title: "This table is blowing up", body: "{x} people joined in under 30 minutes. A few spots left — move fast." },
+    topHostCreated: { title: "A top host just made plans", body: "{name} (⭐️ 4.9) is hosting {activity} near you. They always show up." },
+    zeroTables7d: { title: "People are out there.", body: "Real plans, real people — close to you. Your first table is waiting." },
+    rateHost: { title: "How was it?", body: "Rate {hostName}'s table and help others know who to trust." },
+    afterRating: { title: "Glad you had fun.", body: "Why not host one next time? It only takes a minute to create a table." },
+    guestBeenToXTables: { title: "You've been to {x} tables.", body: "Ever thought about hosting one? Your people are already out there." },
+    hostThirdRating: { title: "Your reputation is building 🏆", body: "{x} people have rated your tables. Keep going — consistency gets noticed." },
+    eventReminder: { title: "Activity starting soon", body: "Your activity \"{eventTitle}\" starts in {timeString}" },
   },
 
   de: {
@@ -181,6 +295,24 @@ module.exports = {
       title: "{name}",
       body: "{message}",
     },
+    eventNearby: { title: "Someone near you just made plans", body: "{name} is hosting {activity} nearby — {spotsOpen} spots open. Pull up a chair." },
+    firstJoin: { title: "Someone's in!", body: "{name} just pulled up a chair. Your table is getting started 🪑" },
+    table60Full: { title: "Your table is heating up 🔥", body: "{taken} out of {total} seats are taken — only {left} spots left." },
+    tableFull: { title: "Full house!", body: "Your table is packed. See who's coming and get ready." },
+    hostReengage48h: { title: "People had a great time.", body: "Ready to host again? Your next table is one tap away." },
+    hostInactive2w: { title: "Your crew is waiting.", body: "What are you planning next? Create a table and see who shows up." },
+    tableFillingFast: { title: "{name}'s {activity} is filling up fast", body: "Grab a chair before it's gone." },
+    weekendNudge: { title: "Nothing on your weekend yet.", body: "There's a table for that. See what's happening near you." },
+    firstTableEver: { title: "That was your first table 🎉", body: "There are more like it waiting. What do you want to do next?" },
+    personMetHosting: { title: "{name} is hosting something", body: "They're planning {activity} near you — you've met before. You in?" },
+    tableBlowingUp: { title: "This table is blowing up", body: "{x} people joined in under 30 minutes. A few spots left — move fast." },
+    topHostCreated: { title: "A top host just made plans", body: "{name} (⭐️ 4.9) is hosting {activity} near you. They always show up." },
+    zeroTables7d: { title: "People are out there.", body: "Real plans, real people — close to you. Your first table is waiting." },
+    rateHost: { title: "How was it?", body: "Rate {hostName}'s table and help others know who to trust." },
+    afterRating: { title: "Glad you had fun.", body: "Why not host one next time? It only takes a minute to create a table." },
+    guestBeenToXTables: { title: "You've been to {x} tables.", body: "Ever thought about hosting one? Your people are already out there." },
+    hostThirdRating: { title: "Your reputation is building 🏆", body: "{x} people have rated your tables. Keep going — consistency gets noticed." },
+    eventReminder: { title: "Activity starting soon", body: "Your activity \"{eventTitle}\" starts in {timeString}" },
   },
 
   fr: {
@@ -224,5 +356,23 @@ module.exports = {
       title: "{name}",
       body: "{message}",
     },
+    eventNearby: { title: "Someone near you just made plans", body: "{name} is hosting {activity} nearby — {spotsOpen} spots open. Pull up a chair." },
+    firstJoin: { title: "Someone's in!", body: "{name} just pulled up a chair. Your table is getting started 🪑" },
+    table60Full: { title: "Your table is heating up 🔥", body: "{taken} out of {total} seats are taken — only {left} spots left." },
+    tableFull: { title: "Full house!", body: "Your table is packed. See who's coming and get ready." },
+    hostReengage48h: { title: "People had a great time.", body: "Ready to host again? Your next table is one tap away." },
+    hostInactive2w: { title: "Your crew is waiting.", body: "What are you planning next? Create a table and see who shows up." },
+    tableFillingFast: { title: "{name}'s {activity} is filling up fast", body: "Grab a chair before it's gone." },
+    weekendNudge: { title: "Nothing on your weekend yet.", body: "There's a table for that. See what's happening near you." },
+    firstTableEver: { title: "That was your first table 🎉", body: "There are more like it waiting. What do you want to do next?" },
+    personMetHosting: { title: "{name} is hosting something", body: "They're planning {activity} near you — you've met before. You in?" },
+    tableBlowingUp: { title: "This table is blowing up", body: "{x} people joined in under 30 minutes. A few spots left — move fast." },
+    topHostCreated: { title: "A top host just made plans", body: "{name} (⭐️ 4.9) is hosting {activity} near you. They always show up." },
+    zeroTables7d: { title: "People are out there.", body: "Real plans, real people — close to you. Your first table is waiting." },
+    rateHost: { title: "How was it?", body: "Rate {hostName}'s table and help others know who to trust." },
+    afterRating: { title: "Glad you had fun.", body: "Why not host one next time? It only takes a minute to create a table." },
+    guestBeenToXTables: { title: "You've been to {x} tables.", body: "Ever thought about hosting one? Your people are already out there." },
+    hostThirdRating: { title: "Your reputation is building 🏆", body: "{x} people have rated your tables. Keep going — consistency gets noticed." },
+    eventReminder: { title: "Activity starting soon", body: "Your activity \"{eventTitle}\" starts in {timeString}" },
   },
 };

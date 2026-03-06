@@ -15,6 +15,11 @@ const notificationSchema = new mongoose.Schema({
       "event_nearby",
       "event_cancelled",
       "event_updated",
+      "event_checkin",
+      "event_removed",
+      "table_60_full",
+      "table_filling_fast",
+      "rate_host",
       "profile_like",
       "super_wave",
       "activity_suggestion",
@@ -25,8 +30,15 @@ const notificationSchema = new mongoose.Schema({
       "boost_warning",
       "boost_expired",
       "boost_credits_reset",
+      "after_rating",
+      "host_third_rating",
     ],
     required: true,
+  },
+  category: {
+    type: String,
+    enum: ["transactional", "discovery", "fomo", "re_engagement", "post_experience"],
+    default: null,
   },
   title: { type: String, required: true },
   message: { type: String, required: true },
@@ -42,6 +54,7 @@ const notificationSchema = new mongoose.Schema({
 // Compound index for efficient queries
 notificationSchema.index({ userId: 1, createdAt: -1 });
 notificationSchema.index({ userId: 1, read: 1 });
+notificationSchema.index({ userId: 1, category: 1, createdAt: -1 });
 
 module.exports = mongoose.model("Notification", notificationSchema);
 
