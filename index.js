@@ -1515,11 +1515,9 @@ app.get("/profiles", async (req, res) => {
       if (countryFilter && userCountry) {
         // Only add country filter here when we want same country
         query["location.country"] = userCountry;
-        console.log(`🌍 Attempting to find profiles from ${userCountry}`);
       } else {
         // When searching other countries, ensure we get profiles with a country set but not user's country
         query["location.country"] = { $exists: true, $ne: userCountry };
-        console.log(`🌍 Searching for profiles from other countries`);
       }
 
       let countryProfiles = [];
@@ -1548,11 +1546,6 @@ app.get("/profiles", async (req, res) => {
 
           countryProfiles = nearbyProfiles;
           hasLocation = true;
-          console.log(
-            `📍 Found ${countryProfiles.length} nearby profiles${
-              countryFilter ? ` in ${userCountry}` : ""
-            }`
-          );
         } catch (error) {
           console.error("❌ Error in geospatial query:", error);
         }
@@ -1564,11 +1557,6 @@ app.get("/profiles", async (req, res) => {
           mongoose.Types.ObjectId.isValid(p._id) ? new mongoose.Types.ObjectId(p._id) : p._id
         );
         const neededProfiles = 20 - countryProfiles.length;
-        console.log(
-          `🎯 Attempting to find ${neededProfiles} additional profiles${
-            countryFilter ? ` in ${userCountry}` : ""
-          } using $facet`
-        );
 
         // Combine priority and random sample queries using $facet for single DB round-trip
         const facetResults = await User.aggregate([
@@ -1615,11 +1603,8 @@ app.get("/profiles", async (req, res) => {
               (p) => !existingIds.has(p._id.toString())
             );
             countryProfiles.push(...uniqueRandom.slice(0, stillNeeded));
-            console.log(`🎲 Added ${Math.min(uniqueRandom.length, stillNeeded)} random profiles`);
           }
         }
-
-        console.log(`📊 Total profiles after $facet: ${countryProfiles.length}`);
       }
 
       return countryProfiles;
@@ -1627,12 +1612,9 @@ app.get("/profiles", async (req, res) => {
 
     if (userCountry) {
       // Country is known — only show profiles from the same country, never backfill with other countries
-      console.log(`\n🔍 Starting profile search for user in ${userCountry} (strict, no cross-country)`);
       profiles = await getProfilesWithCountry(true);
-      console.log(`📊 Found ${profiles.length} same-country profiles for ${userCountry}`);
     } else {
       // Country not yet resolved — use distance-based query with no country filter
-      console.log(`\n⚠️ User has no country set, falling back to distance-based search only`);
       const query = { ...baseMatch };
       if (longitude && latitude) {
         try {
@@ -1667,7 +1649,6 @@ app.get("/profiles", async (req, res) => {
           .limit(20)
           .lean();
       }
-      console.log(`📊 Found ${profiles.length} profiles via distance fallback`);
 
       // Attempt to resolve and save the user's country for future requests
       if (longitude && latitude) {
@@ -2516,13 +2497,6 @@ app.put("/push-notification-token/:userId", async (req, res) => {
     const { userId } = req.params;
     const { pushToken, language } = req.body;
 
-    console.log("🔔 [PUSH TOKEN API] ========================================");
-    console.log("🔔 [PUSH TOKEN API] Received request to save push token");
-    console.log("🔔 [PUSH TOKEN API] UserId:", userId);
-    console.log("🔔 [PUSH TOKEN API] Push Token:", pushToken);
-    console.log("🔔 [PUSH TOKEN API] Language:", language || "(not provided)");
-    console.log("🔔 [PUSH TOKEN API] ========================================");
-
     if (!pushToken && !language) {
       console.log("🔔 [PUSH TOKEN API] ❌ No pushToken or language provided in request body");
       return res.status(400).json({ message: "pushToken or language is required" });
@@ -2542,9 +2516,6 @@ app.put("/push-notification-token/:userId", async (req, res) => {
       return res.status(404).json({ message: "user not found" });
     }
 
-    console.log("🔔 [PUSH TOKEN API] ✅ SUCCESS! Push token saved for user:", user.name);
-    console.log("🔔 [PUSH TOKEN API] Saved token:", user.pushToken);
-    
     return res
       .status(200)
       .json({ message: "user pushToken updated successfully", savedToken: user.pushToken });
@@ -2597,10 +2568,6 @@ app.post("/user/:userId/update-location", async (req, res) => {
       return res.status(400).json({ error: "Invalid zero coordinates" });
     }
 
-    console.log(
-      `📍 Updating location for user ${userId} - [${parsedLat}, ${parsedLong}]`
-    );
-
     // Update user's location
     const user = await User.findByIdAndUpdate(
       userId,
@@ -2621,9 +2588,7 @@ app.post("/user/:userId/update-location", async (req, res) => {
 
     // Update the user's country based on coordinates
     try {
-      console.log("🌍 Attempting to update country...");
       const countryResult = await updateUserCountry(userId);
-      console.log("✅ Country updated successfully:", countryResult);
 
       return res.status(200).json({
         message: "Location and country updated successfully",
@@ -2657,7 +2622,6 @@ app.post("/user/:userId/update-location", async (req, res) => {
 app.get("/nearby-users", async (req, res) => {
   try {
     const { longitude, latitude, maxDistance, userId, limit } = req.query;
-    console.log(longitude, latitude, maxDistance, userId, limit);
 
     if (!longitude || !latitude || !maxDistance) {
       return res
@@ -2674,10 +2638,6 @@ app.get("/nearby-users", async (req, res) => {
     if (isNaN(parsedLong) || isNaN(parsedLat)) {
       return res.status(400).json({ error: "Invalid coordinates format" });
     }
-
-    console.log(
-      `Searching for users within ${parsedMaxDistance}m of [${parsedLong}, ${parsedLat}]`
-    );
 
     // Fetch user data upfront (like /profiles endpoint) - optimized for performance
     let excludedIds = [];
@@ -2751,9 +2711,7 @@ app.get("/nearby-users", async (req, res) => {
       },
     ]).option({ maxTimeMS: 5000 });
 
-    console.log(`Found ${nearbyUsers.length} nearby users`);
-
-    res.status(200).json({ 
+    res.status(200).json({
       message: nearbyUsers.length > 0 ? "Nearby users found" : "No users found nearby",
       users: nearbyUsers 
     });
@@ -3515,13 +3473,6 @@ app.post("/admin/send-notification", async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" });
     }
 
-    console.log(`[Notification Endpoint] Processing notification request:`, {
-      title,
-      body,
-      userIdCount: userIds.length,
-      ignoreWeeklyLimit,
-    });
-
     // Build query to find users with push tokens
     const query = {
       _id: { $in: userIds.map((id) => new ObjectId(id)) },
@@ -3536,9 +3487,6 @@ app.post("/admin/send-notification", async (req, res) => {
     }
 
     const users = await User.find(query);
-    console.log(
-      `[Notification Endpoint] Found ${users.length} eligible users with push tokens`
-    );
 
     let successCount = 0;
     let failureCount = 0;
@@ -3546,11 +3494,6 @@ app.post("/admin/send-notification", async (req, res) => {
 
     for (const user of users) {
       try {
-        console.log(`[Notification Endpoint] Sending notification to user:`, {
-          userId: user._id,
-          pushToken: user.pushToken.substring(0, 10) + "...",
-        });
-
         await sendNotification(user.pushToken, title, body);
 
         // Update last notification timestamp
@@ -3559,9 +3502,6 @@ app.post("/admin/send-notification", async (req, res) => {
         });
 
         successCount++;
-        console.log(
-          `[Notification Endpoint] Successfully sent notification to user ${user._id}`
-        );
       } catch (error) {
         failureCount++;
         errors.push({
@@ -3574,13 +3514,6 @@ app.post("/admin/send-notification", async (req, res) => {
         );
       }
     }
-
-    console.log(`[Notification Endpoint] Notification summary:`, {
-      totalUsers: users.length,
-      successCount,
-      failureCount,
-      errors: errors.length > 0 ? errors : undefined,
-    });
 
     res.json({
       success: true,
@@ -6889,8 +6822,6 @@ app.get("/users/nearby/open", async (req, res) => {
       });
     }
 
-    console.log(`👤 [NEARBY/OPEN] User: ${currentUser.name}, stored location: ${JSON.stringify(currentUser?.location?.coordinates)}`);
-
     // Check if user has valid location coordinates
     const userCoords = currentUser?.location?.coordinates;
     if (!userCoords || 
@@ -6910,14 +6841,11 @@ app.get("/users/nearby/open", async (req, res) => {
     // MongoDB stores coordinates as [longitude, latitude]
     const lng = userCoords[0];
     const lat = userCoords[1];
-    
-    console.log(`📍 [NEARBY/OPEN] Using DB coordinates for ${currentUser.name}: lat=${lat}, lng=${lng}`);
+
     const maxDistance = parseInt(radius);
     const queryLimit = Math.min(parseInt(limit) || 10, 50); // Cap at 50
     const querySkip = parseInt(skip) || 0;
     const searchTerm = search.trim();
-
-    console.log(`📍 [NEARBY/OPEN] Request: lat=${lat}, lng=${lng}, radius=${maxDistance}m, limit=${queryLimit}, skip=${querySkip}, search="${searchTerm}", userId=${userId}`);
 
     // Calculate date 90 days ago
     const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
@@ -7014,10 +6942,7 @@ app.get("/users/nearby/open", async (req, res) => {
       activeStatus: formatActiveStatus(user.effectiveLastActive),
     }));
 
-    console.log(`✅ [NEARBY/OPEN] Response: found ${formattedUsers.length} users, hasMore=${hasMore}`);
-    if (formattedUsers.length > 0) {
-      console.log(`   Users: ${formattedUsers.map(u => `${u.name} (${u.distance}km, ${u.activeStatus})`).join(", ")}`);
-    }
+    console.log(`[NEARBY/OPEN] ${formattedUsers.length} users, hasMore=${hasMore}`);
 
     res.status(200).json({
       users: formattedUsers,
