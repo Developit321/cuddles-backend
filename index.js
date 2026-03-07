@@ -27,7 +27,7 @@ const http = require("http").createServer(app);
 const io = require("socket.io")(http); // Pass the HTTP server instance
 const bcrypt = require("bcryptjs");
 const { sendNotification, sendNotificationBatch } = require("./notifications/pushNotifications");
-const { getQueue, enqueueNearbyEvent, enqueueNearby60Fill } = require("./queues/nearbyNotifications");
+const { getQueue, enqueueNearbyEvent, enqueueNearby60Fill, enqueueCapetownWeekend } = require("./queues/nearbyNotifications");
 const notificationStrings = require("./notifications/notificationStrings");
 const {
   shouldSendNotification,
@@ -283,6 +283,46 @@ if (nearbyQueue) {
       await sendNotificationBatch(messages);
       await Event.updateOne({ _id: eventId }, { sixtyPercentNotifSent: true });
       console.log(`[Nearby Queue] event_nearby_60: sent ${messages.length} notifications for event ${eventId}`);
+    } else if (type === "capetown_weekend") {
+      const capetownStr = getStrings("en").capetownWeekend;
+      if (!capetownStr) return;
+      const title = capetownStr.title;
+      const body = capetownStr.body;
+      const users = await User.aggregate([
+        {
+          $geoNear: {
+            near: { type: "Point", coordinates: [CAPETOWN_LNG, CAPETOWN_LAT] },
+            distanceField: "distance",
+            maxDistance: CAPETOWN_RADIUS_M,
+            spherical: true,
+            query: {
+              $and: [
+                { pushToken: { $exists: true, $ne: null } },
+                ...EVENTS_ONLY_QUERY.$and,
+              ],
+            },
+          },
+        },
+        { $limit: 500 },
+        { $project: { _id: 1, pushToken: 1 } },
+      ]);
+      const messages = [];
+      for (const u of users) {
+        const { allowed } = await shouldSendNotification(u._id, "re_engagement");
+        if (!allowed) continue;
+        await createNotificationWithCaps({
+          userId: u._id,
+          type: "capetown_weekend",
+          title,
+          message: body,
+          skipPush: true,
+        });
+        if (u.pushToken) messages.push({ to: u.pushToken, title, body });
+      }
+      if (messages.length > 0) {
+        await sendNotificationBatch(messages);
+        console.log(`[Nearby Queue] capetown_weekend: sent ${messages.length} notifications`);
+      }
     } else {
       console.warn("[Nearby Queue] Unknown job type:", type);
     }
@@ -5152,6 +5192,66 @@ cron.schedule("*/30 * * * *", sendRatingReminders);
 sendRatingReminders().catch((error) =>
   console.error("[Rating Reminder] Error on startup:", error)
 );
+
+// Cape Town weekend nudge: users within 80km of Cape Town, re-engagement cap, batch send
+const CAPETOWN_LNG = 18.4241;
+const CAPETOWN_LAT = -33.9249;
+const CAPETOWN_RADIUS_M = 80000;
+
+const sendCapetownWeekendNudge = async () => {
+  const now = new Date();
+  if (now.getDay() !== 6) return; // Saturday only
+  if (process.env.REDIS_URL && getQueue()) {
+    enqueueCapetownWeekend();
+    console.log("[Capetown Weekend] Enqueued capetown_weekend job");
+    return;
+  }
+  try {
+    const capetownStr = getStrings("en").capetownWeekend;
+    if (!capetownStr) return;
+    const title = capetownStr.title;
+    const body = capetownStr.body;
+    const users = await User.aggregate([
+      {
+        $geoNear: {
+          near: { type: "Point", coordinates: [CAPETOWN_LNG, CAPETOWN_LAT] },
+          distanceField: "distance",
+          maxDistance: CAPETOWN_RADIUS_M,
+          spherical: true,
+          query: {
+            $and: [
+              { pushToken: { $exists: true, $ne: null } },
+              ...EVENTS_ONLY_QUERY.$and,
+            ],
+          },
+        },
+      },
+      { $limit: 500 },
+      { $project: { _id: 1, pushToken: 1, preferredLanguage: 1 } },
+    ]);
+    const messages = [];
+    for (const u of users) {
+      const { allowed } = await shouldSendNotification(u._id, "re_engagement");
+      if (!allowed) continue;
+      await createNotificationWithCaps({
+        userId: u._id,
+        type: "capetown_weekend",
+        title,
+        message: body,
+        skipPush: true,
+      });
+      if (u.pushToken) messages.push({ to: u.pushToken, title, body });
+    }
+    if (messages.length > 0) {
+      await sendNotificationBatch(messages);
+      console.log(`[Capetown Weekend] Sent ${messages.length} notifications`);
+    }
+  } catch (err) {
+    console.error("[Capetown Weekend] Error:", err?.message || err);
+  }
+};
+
+cron.schedule("0 12 * * *", sendCapetownWeekendNudge);
 
 // ─── Priority Boost cron — runs every 5 minutes ──────────────────────────────
 cron.schedule("*/5 * * * *", async () => {
