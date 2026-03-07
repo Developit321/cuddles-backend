@@ -79,7 +79,39 @@ const sendNotification = async (expoPushToken, title, body) => {
 };
 
 /**
+ * Send a single message to Expo (used when retrying after PUSH_TOO_MANY_EXPERIENCE_IDS).
+ * Does not throw; returns false on failure.
+ */
+const sendOneToExpo = async (message) => {
+  try {
+    const body = {
+      to: message.to,
+      sound: "default",
+      title: message.title,
+      body: message.body,
+      data: message.data || { someData: "goes here" },
+    };
+    const response = await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      console.error("[Push Notification] Single send failed:", message.to?.substring(0, 15), data);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error("[Push Notification] Single send error:", err?.message || err);
+    return false;
+  }
+};
+
+/**
  * Send multiple push notifications to Expo in batches of EXPO_BATCH_SIZE (100).
+ * If a batch fails with PUSH_TOO_MANY_EXPERIENCE_IDS (mixed Expo projects), retries
+ * that chunk by sending each message in a separate request.
  * messages: Array<{ to: string, title: string, body: string }>
  * Invalid tokens are skipped. Does not throw so the worker can continue.
  */
@@ -101,7 +133,18 @@ const sendNotificationBatch = async (messages) => {
         body: JSON.stringify(chunk),
       });
       const data = await response.json();
-      if (!response.ok) {
+      const hasMixedProjects = Array.isArray(data?.errors) && data.errors.some(
+        (e) => e && e.code === "PUSH_TOO_MANY_EXPERIENCE_IDS"
+      );
+      if (hasMixedProjects) {
+        console.log("[Push Notification] Batch had mixed projects, retrying chunk as single messages:", chunk.length);
+        let sent = 0;
+        for (const msg of chunk) {
+          const ok = await sendOneToExpo(msg);
+          if (ok) sent++;
+        }
+        console.log(`[Push Notification] Retry sent ${sent}/${chunk.length} messages`);
+      } else if (!response.ok) {
         console.error("[Push Notification] Batch send failed:", response.status, data);
       } else {
         console.log(`[Push Notification] Batch sent ${chunk.length} messages`);

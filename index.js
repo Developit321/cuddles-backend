@@ -151,6 +151,15 @@ const createNotificationWithCaps = async (payload) => {
 
 const NEARBY_NOTIFY_LIMIT = 100;
 
+// Exclude Cuddles users from event/activity notification batches (they use a different Expo project).
+// Only ios-events populates event flows; ios-cuddles populates lookingFor and availability.
+const EVENTS_ONLY_QUERY = {
+  $and: [
+    { $or: [ { lookingFor: { $exists: false } }, { lookingFor: { $size: 0 } } ] },
+    { $or: [ { availability: { $exists: false } }, { availability: { $size: 0 } } ] },
+  ],
+};
+
 // Register nearby-notifications queue worker when Redis is available
 const nearbyQueue = getQueue();
 if (nearbyQueue) {
@@ -177,9 +186,12 @@ if (nearbyQueue) {
             maxDistance: 50000,
             spherical: true,
             query: {
-              _id: { $ne: new mongoose.Types.ObjectId(hostId) },
-              pushToken: { $exists: true, $ne: null },
-              ...audienceQuery,
+              $and: [
+                { _id: { $ne: new mongoose.Types.ObjectId(hostId) } },
+                { pushToken: { $exists: true, $ne: null } },
+                ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                ...EVENTS_ONLY_QUERY.$and,
+              ],
             },
           },
         },
@@ -235,9 +247,12 @@ if (nearbyQueue) {
             maxDistance: 50000,
             spherical: true,
             query: {
-              _id: { $nin: excludeIds.map((id) => new mongoose.Types.ObjectId(id)) },
-              pushToken: { $exists: true, $ne: null },
-              ...audienceQuery,
+              $and: [
+                { _id: { $nin: excludeIds.map((id) => new mongoose.Types.ObjectId(id)) } },
+                { pushToken: { $exists: true, $ne: null } },
+                ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                ...EVENTS_ONLY_QUERY.$and,
+              ],
             },
           },
         },
@@ -5445,9 +5460,12 @@ app.post("/events", async (req, res) => {
                   maxDistance: maxDistanceMeters,
                   spherical: true,
                   query: {
-                    _id: { $ne: new mongoose.Types.ObjectId(hostId) },
-                    pushToken: { $exists: true, $ne: null },
-                    ...audienceQuery,
+                    $and: [
+                      { _id: { $ne: new mongoose.Types.ObjectId(hostId) } },
+                      { pushToken: { $exists: true, $ne: null } },
+                      ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                      ...EVENTS_ONLY_QUERY.$and,
+                    ],
                   },
                 },
               },
@@ -6103,9 +6121,12 @@ app.post("/events/:eventId/join", async (req, res) => {
                   maxDistance: 50000,
                   spherical: true,
                   query: {
-                    _id: { $nin: excludeIds },
-                    pushToken: { $exists: true, $ne: null },
-                    ...audienceQuery,
+                    $and: [
+                      { _id: { $nin: excludeIds } },
+                      { pushToken: { $exists: true, $ne: null } },
+                      ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                      ...EVENTS_ONLY_QUERY.$and,
+                    ],
                   },
                 },
               },
