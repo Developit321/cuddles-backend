@@ -27,7 +27,7 @@ const http = require("http").createServer(app);
 const io = require("socket.io")(http); // Pass the HTTP server instance
 const bcrypt = require("bcryptjs");
 const { sendNotification, sendNotificationBatch } = require("./notifications/pushNotifications");
-const { getQueue, enqueueNearbyEvent, enqueueNearby60Fill } = require("./queues/nearbyNotifications");
+const { getQueue, enqueueNearbyEvent, enqueueNearby60Fill, enqueueCapetownWeekend } = require("./queues/nearbyNotifications");
 const notificationStrings = require("./notifications/notificationStrings");
 const {
   shouldSendNotification,
@@ -151,6 +151,15 @@ const createNotificationWithCaps = async (payload) => {
 
 const NEARBY_NOTIFY_LIMIT = 100;
 
+// Exclude Cuddles users from event/activity notification batches (they use a different Expo project).
+// Only ios-events populates event flows; ios-cuddles populates lookingFor and availability.
+const EVENTS_ONLY_QUERY = {
+  $and: [
+    { $or: [ { lookingFor: { $exists: false } }, { lookingFor: { $size: 0 } } ] },
+    { $or: [ { availability: { $exists: false } }, { availability: { $size: 0 } } ] },
+  ],
+};
+
 // Register nearby-notifications queue worker when Redis is available
 const nearbyQueue = getQueue();
 if (nearbyQueue) {
@@ -177,9 +186,12 @@ if (nearbyQueue) {
             maxDistance: 50000,
             spherical: true,
             query: {
-              _id: { $ne: new mongoose.Types.ObjectId(hostId) },
-              pushToken: { $exists: true, $ne: null },
-              ...audienceQuery,
+              $and: [
+                { _id: { $ne: new mongoose.Types.ObjectId(hostId) } },
+                { pushToken: { $exists: true, $ne: null } },
+                ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                ...EVENTS_ONLY_QUERY.$and,
+              ],
             },
           },
         },
@@ -235,9 +247,12 @@ if (nearbyQueue) {
             maxDistance: 50000,
             spherical: true,
             query: {
-              _id: { $nin: excludeIds.map((id) => new mongoose.Types.ObjectId(id)) },
-              pushToken: { $exists: true, $ne: null },
-              ...audienceQuery,
+              $and: [
+                { _id: { $nin: excludeIds.map((id) => new mongoose.Types.ObjectId(id)) } },
+                { pushToken: { $exists: true, $ne: null } },
+                ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                ...EVENTS_ONLY_QUERY.$and,
+              ],
             },
           },
         },
@@ -268,6 +283,46 @@ if (nearbyQueue) {
       await sendNotificationBatch(messages);
       await Event.updateOne({ _id: eventId }, { sixtyPercentNotifSent: true });
       console.log(`[Nearby Queue] event_nearby_60: sent ${messages.length} notifications for event ${eventId}`);
+    } else if (type === "capetown_weekend") {
+      const capetownStr = getStrings("en").capetownWeekend;
+      if (!capetownStr) return;
+      const title = capetownStr.title;
+      const body = capetownStr.body;
+      const users = await User.aggregate([
+        {
+          $geoNear: {
+            near: { type: "Point", coordinates: [CAPETOWN_LNG, CAPETOWN_LAT] },
+            distanceField: "distance",
+            maxDistance: CAPETOWN_RADIUS_M,
+            spherical: true,
+            query: {
+              $and: [
+                { pushToken: { $exists: true, $ne: null } },
+                ...EVENTS_ONLY_QUERY.$and,
+              ],
+            },
+          },
+        },
+        { $limit: 500 },
+        { $project: { _id: 1, pushToken: 1 } },
+      ]);
+      const messages = [];
+      for (const u of users) {
+        const { allowed } = await shouldSendNotification(u._id, "re_engagement");
+        if (!allowed) continue;
+        await createNotificationWithCaps({
+          userId: u._id,
+          type: "capetown_weekend",
+          title,
+          message: body,
+          skipPush: true,
+        });
+        if (u.pushToken) messages.push({ to: u.pushToken, title, body });
+      }
+      if (messages.length > 0) {
+        await sendNotificationBatch(messages);
+        console.log(`[Nearby Queue] capetown_weekend: sent ${messages.length} notifications`);
+      }
     } else {
       console.warn("[Nearby Queue] Unknown job type:", type);
     }
@@ -5138,6 +5193,66 @@ sendRatingReminders().catch((error) =>
   console.error("[Rating Reminder] Error on startup:", error)
 );
 
+// Cape Town weekend nudge: users within 80km of Cape Town, re-engagement cap, batch send
+const CAPETOWN_LNG = 18.4241;
+const CAPETOWN_LAT = -33.9249;
+const CAPETOWN_RADIUS_M = 80000;
+
+const sendCapetownWeekendNudge = async () => {
+  const now = new Date();
+  if (now.getDay() !== 6) return; // Saturday only
+  if (process.env.REDIS_URL && getQueue()) {
+    enqueueCapetownWeekend();
+    console.log("[Capetown Weekend] Enqueued capetown_weekend job");
+    return;
+  }
+  try {
+    const capetownStr = getStrings("en").capetownWeekend;
+    if (!capetownStr) return;
+    const title = capetownStr.title;
+    const body = capetownStr.body;
+    const users = await User.aggregate([
+      {
+        $geoNear: {
+          near: { type: "Point", coordinates: [CAPETOWN_LNG, CAPETOWN_LAT] },
+          distanceField: "distance",
+          maxDistance: CAPETOWN_RADIUS_M,
+          spherical: true,
+          query: {
+            $and: [
+              { pushToken: { $exists: true, $ne: null } },
+              ...EVENTS_ONLY_QUERY.$and,
+            ],
+          },
+        },
+      },
+      { $limit: 500 },
+      { $project: { _id: 1, pushToken: 1, preferredLanguage: 1 } },
+    ]);
+    const messages = [];
+    for (const u of users) {
+      const { allowed } = await shouldSendNotification(u._id, "re_engagement");
+      if (!allowed) continue;
+      await createNotificationWithCaps({
+        userId: u._id,
+        type: "capetown_weekend",
+        title,
+        message: body,
+        skipPush: true,
+      });
+      if (u.pushToken) messages.push({ to: u.pushToken, title, body });
+    }
+    if (messages.length > 0) {
+      await sendNotificationBatch(messages);
+      console.log(`[Capetown Weekend] Sent ${messages.length} notifications`);
+    }
+  } catch (err) {
+    console.error("[Capetown Weekend] Error:", err?.message || err);
+  }
+};
+
+cron.schedule("0 12 * * *", sendCapetownWeekendNudge);
+
 // ─── Priority Boost cron — runs every 5 minutes ──────────────────────────────
 cron.schedule("*/5 * * * *", async () => {
   try {
@@ -5445,9 +5560,12 @@ app.post("/events", async (req, res) => {
                   maxDistance: maxDistanceMeters,
                   spherical: true,
                   query: {
-                    _id: { $ne: new mongoose.Types.ObjectId(hostId) },
-                    pushToken: { $exists: true, $ne: null },
-                    ...audienceQuery,
+                    $and: [
+                      { _id: { $ne: new mongoose.Types.ObjectId(hostId) } },
+                      { pushToken: { $exists: true, $ne: null } },
+                      ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                      ...EVENTS_ONLY_QUERY.$and,
+                    ],
                   },
                 },
               },
@@ -6103,9 +6221,12 @@ app.post("/events/:eventId/join", async (req, res) => {
                   maxDistance: 50000,
                   spherical: true,
                   query: {
-                    _id: { $nin: excludeIds },
-                    pushToken: { $exists: true, $ne: null },
-                    ...audienceQuery,
+                    $and: [
+                      { _id: { $nin: excludeIds } },
+                      { pushToken: { $exists: true, $ne: null } },
+                      ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                      ...EVENTS_ONLY_QUERY.$and,
+                    ],
                   },
                 },
               },

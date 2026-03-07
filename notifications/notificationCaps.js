@@ -172,6 +172,7 @@ function getCategoryForType(type) {
   if (type === "suggestion_expired") return "transactional";
   if (type === "after_rating" || type === "host_third_rating") return "post_experience";
   if (type === "table_filling_fast") return "fomo";
+  if (type === "capetown_weekend") return "re_engagement";
   return "transactional";
 }
 

@@ -32,6 +32,7 @@ const notificationSchema = new mongoose.Schema({
       "boost_credits_reset",
       "after_rating",
       "host_third_rating",
+      "capetown_weekend",
     ],
     required: true,
   },

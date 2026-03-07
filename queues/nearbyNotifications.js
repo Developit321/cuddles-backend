@@ -33,4 +33,9 @@ function enqueueNearby60Fill(eventId) {
   queue.add({ type: "event_nearby_60", eventId: id }).catch((err) => console.error("[Nearby Queue] enqueue event_nearby_60 failed:", err?.message));
 }
 
-module.exports = { getQueue, enqueueNearbyEvent, enqueueNearby60Fill };
+function enqueueCapetownWeekend() {
+  if (!queue) return;
+  queue.add({ type: "capetown_weekend" }).catch((err) => console.error("[Nearby Queue] enqueue capetown_weekend failed:", err?.message));
+}
+
+module.exports = { getQueue, enqueueNearbyEvent, enqueueNearby60Fill, enqueueCapetownWeekend };
