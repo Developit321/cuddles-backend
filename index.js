@@ -1723,12 +1723,17 @@ app.get("/profiles", async (req, res) => {
           .lean();
       }
 
-      // Attempt to resolve and save the user's country for future requests
+      // Attempt to resolve and save the user's country for future requests.
+      // IMPORTANT: await the async function so errors are caught here and do not
+      // become unhandled promise rejections (which can crash the server).
       if (longitude && latitude) {
         try {
-          updateUserCountry(userId);
+          await updateUserCountry(userId);
         } catch (countryErr) {
-          console.error("Failed to resolve user country in background:", countryErr?.message);
+          console.error(
+            "Failed to resolve user country in background:",
+            countryErr?.message || countryErr
+          );
         }
       }
     }
