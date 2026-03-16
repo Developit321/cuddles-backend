@@ -105,11 +105,23 @@ const createNotification = async ({
     });
     await notification.save();
 
+    console.log(
+      `[Notification] Saved ${type} notification (id=${notification._id}) for user ${userId} (eventId=${eventId || "none"})`
+    );
+
     // 2. Send push unless skipPush (e.g. worker will batch-send later)
     if (!skipPush) {
       const user = await User.findById(userId).select("pushToken").lean();
       const token = user?.pushToken;
+      console.log(
+        `[Notification] Push check for user=${userId}, type=${type}, token=${
+          token ? `${String(token).slice(0, 20)}...` : "NONE"
+        }`
+      );
       if (isValidExpoPushToken(token)) {
+        console.log(
+          `[Notification] Sending push for type=${type} to user=${userId}`
+        );
         try {
           await sendNotification(token, title, message);
         } catch (pushError) {
@@ -119,7 +131,13 @@ const createNotification = async ({
           );
         }
       } else if (token) {
-        console.log(`[Notification] User ${userId} has no valid Expo push token, skipping push`);
+        console.log(
+          `[Notification] User ${userId} has no valid Expo push token, skipping push`
+        );
+      } else {
+        console.log(
+          `[Notification] User ${userId} has no pushToken stored, skipping push`
+        );
       }
     }
 
@@ -2784,20 +2802,23 @@ app.delete("/users/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
 
-    // Validate the userId format
     if (!mongoose.Types.ObjectId.isValid(userId)) {
       return res.status(400).json({ message: "Invalid user ID format." });
     }
 
-    // Convert userId to ObjectId
     const objectId = new mongoose.Types.ObjectId(userId);
 
-    // Find the user by ID and delete
     const deletedUser = await User.findByIdAndDelete(objectId);
 
     if (!deletedUser) {
       return res.status(404).json({ message: "User not found" });
     }
+
+    // Remove user from all event participants so they no longer appear in any activities
+    await Event.updateMany(
+      { "participants.userId": objectId },
+      { $pull: { participants: { userId: objectId } } }
+    );
 
     return res.status(200).json({ message: "User deleted successfully" });
   } catch (error) {
@@ -3832,6 +3853,14 @@ app.post("/admin/users/bulk-delete", async (req, res) => {
 
     // Delete multiple users
     const result = await User.deleteMany({ _id: { $in: objectIds } });
+
+    // Remove deleted users from all event participants so they no longer appear in any activities
+    if (result.deletedCount > 0) {
+      await Event.updateMany(
+        { "participants.userId": { $in: objectIds } },
+        { $pull: { participants: { userId: { $in: objectIds } } } }
+      );
+    }
 
     console.log(`Successfully deleted ${result.deletedCount} users`);
 
@@ -5371,6 +5400,7 @@ app.post("/events", async (req, res) => {
       suggestedToUserIds, // Array for group invites
       expiresAt,
       audience,
+      requiresApproval,
     } = req.body;
 
     // Validate required fields
@@ -5473,6 +5503,7 @@ app.post("/events", async (req, res) => {
       capacity: capacity || 6,
       tags: tags || [],
       audience: audience || "everyone",
+      requiresApproval: !!requiresApproval,
       // For suggestions, don't add participants yet (wait for acceptance)
       participants: isSuggestion ? [] : [
         {
@@ -6140,7 +6171,54 @@ app.post("/events/:eventId/join", async (req, res) => {
       return res.status(403).json({ message: "You cannot join this event" });
     }
 
-    // Add user as participant
+    // If event requires host approval, create a join request instead of adding participant
+    if (event.requiresApproval) {
+      if (!Array.isArray(event.joinRequests)) {
+        event.joinRequests = [];
+      }
+
+      const existingRequest = event.joinRequests.find(
+        (r) => r.userId.toString() === userId
+      );
+      if (existingRequest) {
+        return res
+          .status(400)
+          .json({ message: "You have already requested to join this event" });
+      }
+
+      event.joinRequests.push({
+        userId,
+        createdAt: new Date(),
+      });
+
+      await event.save();
+
+      // Notify host about the join request
+      try {
+        await createNotificationWithCaps({
+          userId: event.hostId,
+          type: "event_join_request",
+          title: `${joiningUser.name} requested to join your event`,
+          message: `${joiningUser.name} wants to join "${event.title}".`,
+          eventId: event._id,
+          eventName: event.title,
+          actorId: userId,
+          actorName: joiningUser.name,
+          actorImage: joiningUser.profileImages?.[0],
+        });
+        console.log(
+          `[JoinRequest] Created event_join_request notification for host=${event.hostId} from user=${userId} on event=${event._id}`
+        );
+      } catch (notifError) {
+        console.error("Error creating join request notification:", notifError);
+      }
+
+      return res.status(200).json({
+        message: "Join request sent",
+      });
+    }
+
+    // Add user as participant directly when approval is not required
     event.participants.push({
       userId,
       status: status,
@@ -6281,6 +6359,113 @@ app.post("/events/:eventId/join", async (req, res) => {
     }
     res.status(500).json({
       message: "Error joining event",
+      error: error.message,
+    });
+  }
+});
+
+// TEST helper: create join request by user email (without going through the app client)
+app.post("/events/:eventId/join-request-by-email", async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ message: "Email is required" });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(eventId)) {
+      return res.status(400).json({ message: "Invalid eventId format" });
+    }
+
+    const joiningUser = await User.findOne({ email }).select(
+      "name gender profileImages"
+    );
+    if (!joiningUser) {
+      return res.status(404).json({ message: "User not found for this email" });
+    }
+
+    if (!joiningUser.profileImages || joiningUser.profileImages.length === 0) {
+      return res.status(400).json({
+        message: "profile_incomplete",
+        detail: "User needs a profile photo before joining an activity",
+      });
+    }
+
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    // This helper is specifically for events that require approval
+    if (!event.requiresApproval) {
+      return res.status(400).json({
+        message: "Event does not require host approval for joins",
+      });
+    }
+
+    const userId = joiningUser._id;
+
+    // Make sure user is not already a participant
+    const existingParticipant = event.participants.find(
+      (p) => p.userId.toString() === userId.toString()
+    );
+    if (existingParticipant) {
+      return res
+        .status(400)
+        .json({ message: "User has already joined this event" });
+    }
+
+    // Ensure joinRequests array exists
+    if (!Array.isArray(event.joinRequests)) {
+      event.joinRequests = [];
+    }
+
+    // Check for an existing pending request
+    const existingRequest = event.joinRequests.find(
+      (r) => r.userId.toString() === userId.toString()
+    );
+    if (existingRequest) {
+      return res.status(400).json({
+        message: "User has already requested to join this event",
+      });
+    }
+
+    // Push new join request
+    event.joinRequests.push({
+      userId,
+      createdAt: new Date(),
+    });
+
+    await event.save();
+
+    // Notify host about the join request (same as main join route)
+    try {
+      await createNotificationWithCaps({
+        userId: event.hostId,
+        type: "event_join_request",
+        title: `${joiningUser.name} requested to join your event`,
+        message: `${joiningUser.name} wants to join "${event.title}".`,
+        eventId: event._id,
+        eventName: event.title,
+        actorId: userId,
+        actorName: joiningUser.name,
+        actorImage: joiningUser.profileImages?.[0],
+      });
+    } catch (notifError) {
+      console.error("Error creating join request notification (test helper):", notifError);
+    }
+
+    return res.status(200).json({
+      message: "Test join request created",
+      eventId: event._id,
+      userId,
+      email,
+    });
+  } catch (error) {
+    console.error("Error creating join request by email:", error);
+    return res.status(500).json({
+      message: "Error creating join request by email",
       error: error.message,
     });
   }
@@ -6479,6 +6664,138 @@ app.post("/events/:eventId/check-in", async (req, res) => {
     });
   }
 });
+
+// Approve a pending join request (host only)
+app.post(
+  "/events/:eventId/join-requests/:userId/approve",
+  async (req, res) => {
+    try {
+      const { eventId, userId } = req.params;
+
+      if (
+        !mongoose.Types.ObjectId.isValid(eventId) ||
+        !mongoose.Types.ObjectId.isValid(userId)
+      ) {
+        return res.status(400).json({ message: "Invalid ID format" });
+      }
+
+      const event = await Event.findById(eventId);
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+
+      if (!Array.isArray(event.joinRequests)) {
+        event.joinRequests = [];
+      }
+
+      const requestIndex = event.joinRequests.findIndex(
+        (r) => r.userId.toString() === userId
+      );
+      if (requestIndex === -1) {
+        return res
+          .status(404)
+          .json({ message: "Join request not found for this user" });
+      }
+
+      // Remove from pending requests
+      event.joinRequests.splice(requestIndex, 1);
+
+      // Add as participant with going status
+      event.participants.push({
+        userId,
+        status: "going",
+        joinedAt: new Date(),
+      });
+
+      await event.save();
+
+      // Notify user that they were approved
+      try {
+        const joiningUser = await User.findById(userId).select("name");
+        await createNotificationWithCaps({
+          userId,
+          type: "event_joined",
+          title: "You're in!",
+          message: `Your request to join "${event.title}" was approved.`,
+          eventId: event._id,
+          eventName: event.title,
+          actorId: event.hostId,
+          actorName: joiningUser?.name,
+        });
+      } catch (notifError) {
+        console.error("Error creating join approval notification:", notifError);
+      }
+
+      return res.status(200).json({ message: "Join request approved" });
+    } catch (error) {
+      console.error("Error approving join request:", error);
+      return res
+        .status(500)
+        .json({ message: "Error approving join request", error: error.message });
+    }
+  }
+);
+
+// Reject a pending join request (host only)
+app.post(
+  "/events/:eventId/join-requests/:userId/reject",
+  async (req, res) => {
+    try {
+      const { eventId, userId } = req.params;
+
+      if (
+        !mongoose.Types.ObjectId.isValid(eventId) ||
+        !mongoose.Types.ObjectId.isValid(userId)
+      ) {
+        return res.status(400).json({ message: "Invalid ID format" });
+      }
+
+      const event = await Event.findById(eventId);
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+
+      if (!Array.isArray(event.joinRequests)) {
+        event.joinRequests = [];
+      }
+
+      const requestIndex = event.joinRequests.findIndex(
+        (r) => r.userId.toString() === userId
+      );
+      if (requestIndex === -1) {
+        return res
+          .status(404)
+          .json({ message: "Join request not found for this user" });
+      }
+
+      // Remove from pending requests
+      event.joinRequests.splice(requestIndex, 1);
+
+      await event.save();
+
+      // Optionally notify user about rejection
+      try {
+        await createNotificationWithCaps({
+          userId,
+          type: "event_join_request_rejected",
+          title: "Request declined",
+          message: `Your request to join "${event.title}" was declined.`,
+          eventId: event._id,
+          eventName: event.title,
+        });
+      } catch (notifError) {
+        console.error("Error creating join rejection notification:", notifError);
+      }
+
+      return res.status(200).json({ message: "Join request rejected" });
+    } catch (error) {
+      console.error("Error rejecting join request:", error);
+      return res
+        .status(500)
+        .json({ message: "Error rejecting join request", error: error.message });
+    }
+  }
+);
 
 // Leave event
 app.delete("/events/:eventId/leave", async (req, res) => {
@@ -6789,6 +7106,13 @@ app.get("/notifications/:userId", async (req, res) => {
       userId,
       read: false,
     });
+
+    const joinRequestCount = notifications.filter(
+      (n) => n.type === "event_join_request"
+    ).length;
+    console.log(
+      `[NotificationsAPI] user=${userId} page=${page} limit=${limit} -> total=${total}, unread=${unreadCount}, event_join_request=${joinRequestCount}`
+    );
 
     res.status(200).json({
       notifications,
