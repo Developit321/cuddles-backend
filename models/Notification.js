@@ -33,6 +33,8 @@ const notificationSchema = new mongoose.Schema({
       "after_rating",
       "host_third_rating",
       "capetown_weekend",
+      "event_join_request",
+      "event_join_request_rejected",
     ],
     required: true,
   },
