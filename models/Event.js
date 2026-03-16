@@ -49,6 +49,10 @@ const eventSchema = new mongoose.Schema(
       default: 6,
       max: 10,
     },
+    requiresApproval: {
+      type: Boolean,
+      default: false,
+    },
     participants: [
       {
         userId: {
@@ -61,6 +65,18 @@ const eventSchema = new mongoose.Schema(
           default: "interested",
         },
         joinedAt: {
+          type: Date,
+          default: Date.now,
+        },
+      },
+    ],
+    joinRequests: [
+      {
+        userId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "User",
+        },
+        createdAt: {
           type: Date,
           default: Date.now,
         },
