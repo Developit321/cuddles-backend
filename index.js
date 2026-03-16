@@ -7060,7 +7060,8 @@ app.get("/events/:eventId", async (req, res) => {
 
     let event = await Event.findById(eventId)
       .populate("hostId", "name profileImages gender")
-      .populate("participants.userId", "name profileImages gender");
+      .populate("participants.userId", "name profileImages gender")
+      .populate("joinRequests.userId", "name profileImages gender");
 
     if (!event) {
       return res.status(404).json({ message: "Event not found" });

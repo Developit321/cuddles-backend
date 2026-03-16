@@ -4,7 +4,7 @@ const Event = require("../models/Event");
 
 async function main() {
   const EVENT_ID = process.env.EVENT_ID || "69b7e92f33649b44919d0f62";
-  const USER_ID = process.env.USER_ID || "69b7dce71067f155051816bc";
+  const USER_ID = process.env.USER_ID || "69b7f18a21887eef215d1574";
   // Default BASE_URL to the same host the client uses in eventApi.js
   const BASE_URL =
     process.env.BASE_URL || "https://cuddles-batcat.onrender.com";
