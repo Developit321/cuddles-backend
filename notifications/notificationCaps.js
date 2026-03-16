@@ -165,6 +165,8 @@ function getCategoryForType(type) {
     "boost_credits_reset",
     "profile_like",
     "super_wave",
+    "event_join_request",
+    "event_join_request_rejected",
   ];
   if (transactional.includes(type)) return "transactional";
   if (type === "activity_suggestion") return "transactional"; // direct invite
