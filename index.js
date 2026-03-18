@@ -31,7 +31,12 @@ const bcrypt = require("bcryptjs");
 const { sendNotification, sendNotificationBatch } = require("./notifications/pushNotifications");
 const { getQueue, enqueueNearbyEvent, enqueueNearby60Fill, enqueueCapetownWeekend } = require("./queues/nearbyNotifications");
 const notificationStrings = require("./notifications/notificationStrings");
-const { uploadImageBufferToR2, buildUserImageKey } = require("./storage/r2");
+const {
+  uploadImageBufferToR2,
+  buildUserImageKey,
+  deleteObjectFromR2,
+  keyFromPublicUrl,
+} = require("./storage/r2");
 const {
   normalizeProfileImageToJpeg,
   ALLOWED_INPUT_MIME_TYPES,
@@ -2588,6 +2593,21 @@ app.delete("/users/:userId/images", async (req, res) => {
     user.profileImages = user.profileImages.filter((img) => img !== imageUrl);
     await user.save();
 
+    let r2Warning = null;
+    const key = keyFromPublicUrl(imageUrl);
+    if (key) {
+      try {
+        await deleteObjectFromR2(key);
+      } catch (e) {
+        r2Warning = `Failed to delete image from R2 (key: ${key})`;
+        console.error("[R2 delete] Failed to delete object:", {
+          userId,
+          key,
+          error: e?.message || e,
+        });
+      }
+    }
+
     // Log the moderation action
     console.log(
       `Image deleted from user ${userId} for reason: ${
@@ -2598,6 +2618,7 @@ app.delete("/users/:userId/images", async (req, res) => {
     return res.status(200).json({
       message: "Image deleted successfully",
       remainingImages: user.profileImages.length,
+      warning: r2Warning || undefined,
     });
   } catch (error) {
     console.error("Error deleting image:", error);
@@ -2902,6 +2923,43 @@ app.delete("/users/:userId", async (req, res) => {
 
     const objectId = new mongoose.Types.ObjectId(userId);
 
+    const userToDelete = await User.findById(objectId).lean();
+
+    if (!userToDelete) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const urls = [];
+    if (Array.isArray(userToDelete.profileImages)) {
+      urls.push(...userToDelete.profileImages);
+    }
+    const selfieUrl = userToDelete.profileVerification?.selfieUrl;
+    if (selfieUrl) urls.push(selfieUrl);
+
+    const keys = urls
+      .map((u) => keyFromPublicUrl(u))
+      .filter(Boolean);
+
+    const failedR2Deletes = [];
+    if (keys.length > 0) {
+      const results = await Promise.allSettled(
+        keys.map((key) => deleteObjectFromR2(key))
+      );
+      results.forEach((r, idx) => {
+        if (r.status === "rejected") {
+          failedR2Deletes.push({
+            key: keys[idx],
+            error: r.reason?.message || String(r.reason),
+          });
+          console.error("[R2 delete] Failed to delete object:", {
+            userId,
+            key: keys[idx],
+            error: r.reason?.message || r.reason,
+          });
+        }
+      });
+    }
+
     const deletedUser = await User.findByIdAndDelete(objectId);
 
     if (!deletedUser) {
@@ -2914,7 +2972,14 @@ app.delete("/users/:userId", async (req, res) => {
       { $pull: { participants: { userId: objectId } } }
     );
 
-    return res.status(200).json({ message: "User deleted successfully" });
+    return res.status(200).json({
+      message: "User deleted successfully",
+      warning:
+        failedR2Deletes.length > 0
+          ? "Some R2 objects could not be deleted"
+          : undefined,
+      failedR2Deletes: failedR2Deletes.length > 0 ? failedR2Deletes : undefined,
+    });
   } catch (error) {
     console.error("Error deleting user:", error);
     return res

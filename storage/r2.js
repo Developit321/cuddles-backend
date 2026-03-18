@@ -1,5 +1,9 @@
 const crypto = require("crypto");
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  PutObjectCommand,
+  DeleteObjectCommand,
+} = require("@aws-sdk/client-s3");
 
 function requiredEnv(name) {
   const v = process.env[name];
@@ -10,6 +14,40 @@ function requiredEnv(name) {
 function getPublicBaseUrl() {
   const base = requiredEnv("R2_PUBLIC_BASE_URL");
   return base.endsWith("/") ? base.slice(0, -1) : base;
+}
+
+function keyFromPublicUrl(url) {
+  if (!url) return null;
+  let parsed;
+  try {
+    parsed = new URL(String(url));
+  } catch {
+    return null;
+  }
+
+  const base = getPublicBaseUrl();
+  let baseParsed;
+  try {
+    baseParsed = new URL(base);
+  } catch {
+    return null;
+  }
+
+  if (parsed.origin !== baseParsed.origin) return null;
+
+  const basePath = baseParsed.pathname.endsWith("/")
+    ? baseParsed.pathname
+    : `${baseParsed.pathname}/`;
+  if (!parsed.pathname.startsWith(basePath)) return null;
+
+  const rawKey = parsed.pathname.slice(basePath.length);
+  if (!rawKey) return null;
+
+  try {
+    return decodeURIComponent(rawKey);
+  } catch {
+    return rawKey;
+  }
 }
 
 function createR2Client() {
@@ -60,6 +98,18 @@ async function uploadImageBufferToR2({ buffer, contentType, key }) {
   };
 }
 
+async function deleteObjectFromR2(key) {
+  const Bucket = requiredEnv("R2_BUCKET");
+  const client = createR2Client();
+
+  await client.send(
+    new DeleteObjectCommand({
+      Bucket,
+      Key: key,
+    })
+  );
+}
+
 function buildUserImageKey({ userId, mimetype, originalname, extOverride }) {
   const ext = extOverride || guessExtension({ mimetype, originalname });
   const ts = Date.now();
@@ -68,6 +118,8 @@ function buildUserImageKey({ userId, mimetype, originalname, extOverride }) {
 
 module.exports = {
   uploadImageBufferToR2,
+  deleteObjectFromR2,
+  keyFromPublicUrl,
   buildUserImageKey,
 };
 
