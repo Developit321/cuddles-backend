@@ -32,6 +32,8 @@ const notificationStrings = require("./notifications/notificationStrings");
 const {
   shouldSendNotification,
   getCategoryForType,
+  getRecentlyNotifiedUserIds,
+  DISCOVERY_COOLDOWN_MS,
 } = require("./notifications/notificationCaps");
 const { ObjectId } = require("mongodb");
 const { updateUserCountry } = require("./Controllers/userController");
@@ -167,7 +169,8 @@ const createNotificationWithCaps = async (payload) => {
   return createNotification({ ...payload, category });
 };
 
-const NEARBY_NOTIFY_LIMIT = 100;
+const NEARBY_NOTIFY_LIMIT = 200;
+const MIN_FRESH_RECIPIENTS = 30;
 
 // Exclude Cuddles users from event/activity notification batches (they use a different Expo project).
 // Only ios-events populates event flows; ios-cuddles populates lookingFor and availability.
@@ -196,7 +199,10 @@ if (nearbyQueue) {
       const audienceQuery = {};
       if (event.audience === "women_only") audienceQuery.gender = "female";
       else if (event.audience === "men_only") audienceQuery.gender = "male";
-      const nearbyUsers = await User.aggregate([
+      const recentlyNotifiedIds = (await getRecentlyNotifiedUserIds("event_nearby", DISCOVERY_COOLDOWN_MS))
+        .map((id) => new mongoose.Types.ObjectId(id));
+      // Tier A: prefer users who haven't received event_nearby in the cooldown window.
+      const tierAUsers = await User.aggregate([
         {
           $geoNear: {
             near: { type: "Point", coordinates: [lng, lat] },
@@ -206,6 +212,7 @@ if (nearbyQueue) {
             query: {
               $and: [
                 { _id: { $ne: new mongoose.Types.ObjectId(hostId) } },
+                ...(recentlyNotifiedIds.length ? [{ _id: { $nin: recentlyNotifiedIds } }] : []),
                 { pushToken: { $exists: true, $ne: null } },
                 ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
                 ...EVENTS_ONLY_QUERY.$and,
@@ -213,9 +220,40 @@ if (nearbyQueue) {
             },
           },
         },
-        { $limit: NEARBY_NOTIFY_LIMIT },
+        { $sample: { size: NEARBY_NOTIFY_LIMIT } },
         { $project: { _id: 1, pushToken: 1 } },
       ]);
+
+      let nearbyUsers = tierAUsers;
+
+      // Tier B fallback: if the fresh pool is too small, fill from recently-notified users so we never hit 0 recipients.
+      if (nearbyUsers.length < MIN_FRESH_RECIPIENTS && recentlyNotifiedIds.length > 0) {
+        const remaining = Math.max(0, NEARBY_NOTIFY_LIMIT - nearbyUsers.length);
+        if (remaining > 0) {
+          const tierBUsers = await User.aggregate([
+            {
+              $geoNear: {
+                near: { type: "Point", coordinates: [lng, lat] },
+                distanceField: "distance",
+                maxDistance: 50000,
+                spherical: true,
+                query: {
+                  $and: [
+                    { _id: { $ne: new mongoose.Types.ObjectId(hostId) } },
+                    { _id: { $in: recentlyNotifiedIds } },
+                    { pushToken: { $exists: true, $ne: null } },
+                    ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                    ...EVENTS_ONLY_QUERY.$and,
+                  ],
+                },
+              },
+            },
+            { $sample: { size: remaining } },
+            { $project: { _id: 1, pushToken: 1 } },
+          ]);
+          nearbyUsers = [...nearbyUsers, ...tierBUsers];
+        }
+      }
       const eventNearbyStr = getStrings("en").eventNearby;
       const spotsOpen = Math.max(0, (event.capacity || 6) - 1);
       const title = interpolate(eventNearbyStr.title, {});
@@ -257,6 +295,12 @@ if (nearbyQueue) {
       const audienceQuery = {};
       if (event.audience === "women_only") audienceQuery.gender = "female";
       else if (event.audience === "men_only") audienceQuery.gender = "male";
+      const recentlyNotifiedIds60 = (await getRecentlyNotifiedUserIds("table_filling_fast", DISCOVERY_COOLDOWN_MS))
+        .map((id) => new mongoose.Types.ObjectId(id));
+      const allExcludeIds = [
+        ...excludeIds.map((id) => new mongoose.Types.ObjectId(id)),
+        ...recentlyNotifiedIds60,
+      ];
       const nearbyNotJoined = await User.aggregate([
         {
           $geoNear: {
@@ -266,7 +310,7 @@ if (nearbyQueue) {
             spherical: true,
             query: {
               $and: [
-                { _id: { $nin: excludeIds.map((id) => new mongoose.Types.ObjectId(id)) } },
+                { _id: { $nin: allExcludeIds } },
                 { pushToken: { $exists: true, $ne: null } },
                 ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
                 ...EVENTS_ONLY_QUERY.$and,
@@ -274,7 +318,7 @@ if (nearbyQueue) {
             },
           },
         },
-        { $limit: NEARBY_NOTIFY_LIMIT },
+        { $sample: { size: NEARBY_NOTIFY_LIMIT } },
         { $project: { _id: 1, pushToken: 1, preferredLanguage: 1 } },
       ]);
       const fillStrEn = getStrings("en").tableFillingFast;
@@ -5588,7 +5632,10 @@ app.post("/events", async (req, res) => {
             const audienceQuery = {};
             if (newEvent.audience === "women_only") audienceQuery.gender = "female";
             else if (newEvent.audience === "men_only") audienceQuery.gender = "male";
-            const nearbyUsers = await User.aggregate([
+            const recentlyNotifiedInline = (await getRecentlyNotifiedUserIds("event_nearby", DISCOVERY_COOLDOWN_MS))
+              .map((id) => new mongoose.Types.ObjectId(id));
+            // Tier A: prefer users who haven't received event_nearby in the cooldown window.
+            const tierAUsers = await User.aggregate([
               {
                 $geoNear: {
                   near: { type: "Point", coordinates: [eventLng, eventLat] },
@@ -5598,6 +5645,7 @@ app.post("/events", async (req, res) => {
                   query: {
                     $and: [
                       { _id: { $ne: new mongoose.Types.ObjectId(hostId) } },
+                      ...(recentlyNotifiedInline.length ? [{ _id: { $nin: recentlyNotifiedInline } }] : []),
                       { pushToken: { $exists: true, $ne: null } },
                       ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
                       ...EVENTS_ONLY_QUERY.$and,
@@ -5605,9 +5653,40 @@ app.post("/events", async (req, res) => {
                   },
                 },
               },
-              { $limit: NEARBY_NOTIFY_LIMIT },
+              { $sample: { size: NEARBY_NOTIFY_LIMIT } },
               { $project: { _id: 1, name: 1 } },
             ]);
+
+            let nearbyUsers = tierAUsers;
+
+            // Tier B fallback: if the fresh pool is too small, fill from recently-notified users so we never hit 0 recipients.
+            if (nearbyUsers.length < MIN_FRESH_RECIPIENTS && recentlyNotifiedInline.length > 0) {
+              const remaining = Math.max(0, NEARBY_NOTIFY_LIMIT - nearbyUsers.length);
+              if (remaining > 0) {
+                const tierBUsers = await User.aggregate([
+                  {
+                    $geoNear: {
+                      near: { type: "Point", coordinates: [eventLng, eventLat] },
+                      distanceField: "distance",
+                      maxDistance: maxDistanceMeters,
+                      spherical: true,
+                      query: {
+                        $and: [
+                          { _id: { $ne: new mongoose.Types.ObjectId(hostId) } },
+                          { _id: { $in: recentlyNotifiedInline } },
+                          { pushToken: { $exists: true, $ne: null } },
+                          ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                          ...EVENTS_ONLY_QUERY.$and,
+                        ],
+                      },
+                    },
+                  },
+                  { $sample: { size: remaining } },
+                  { $project: { _id: 1, name: 1 } },
+                ]);
+                nearbyUsers = [...nearbyUsers, ...tierBUsers];
+              }
+            }
             console.log(`[Event Nearby] Found ${nearbyUsers.length} users near new event "${title}"`);
             const eventNearbyStr = getStrings("en").eventNearby;
             const spotsOpen = Math.max(0, (newEvent.capacity || 6) - 1);
@@ -6296,6 +6375,12 @@ app.post("/events/:eventId/join", async (req, res) => {
             const audienceQuery = {};
             if (event.audience === "women_only") audienceQuery.gender = "female";
             else if (event.audience === "men_only") audienceQuery.gender = "male";
+            const recentlyNotified60Inline = (await getRecentlyNotifiedUserIds("table_filling_fast", DISCOVERY_COOLDOWN_MS))
+              .map((id) => new mongoose.Types.ObjectId(id));
+            const allExcludeIdsInline = [
+              ...excludeIds.map((id) => (id instanceof mongoose.Types.ObjectId ? id : new mongoose.Types.ObjectId(id))),
+              ...recentlyNotified60Inline,
+            ];
             const nearbyNotJoined = await User.aggregate([
               {
                 $geoNear: {
@@ -6305,7 +6390,7 @@ app.post("/events/:eventId/join", async (req, res) => {
                   spherical: true,
                   query: {
                     $and: [
-                      { _id: { $nin: excludeIds } },
+                      { _id: { $nin: allExcludeIdsInline } },
                       { pushToken: { $exists: true, $ne: null } },
                       ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
                       ...EVENTS_ONLY_QUERY.$and,
@@ -6313,7 +6398,7 @@ app.post("/events/:eventId/join", async (req, res) => {
                   },
                 },
               },
-              { $limit: NEARBY_NOTIFY_LIMIT },
+              { $sample: { size: NEARBY_NOTIFY_LIMIT } },
               { $project: { _id: 1, preferredLanguage: 1 } },
             ]);
             const fillStrEn = getStrings("en").tableFillingFast;
