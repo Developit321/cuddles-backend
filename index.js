@@ -1,3 +1,5 @@
+require("dotenv").config();
+
 const bodyParser = require("body-parser");
 const express = require("express");
 const mongoose = require("mongoose");
@@ -29,6 +31,11 @@ const bcrypt = require("bcryptjs");
 const { sendNotification, sendNotificationBatch } = require("./notifications/pushNotifications");
 const { getQueue, enqueueNearbyEvent, enqueueNearby60Fill, enqueueCapetownWeekend } = require("./queues/nearbyNotifications");
 const notificationStrings = require("./notifications/notificationStrings");
+const { uploadImageBufferToR2, buildUserImageKey } = require("./storage/r2");
+const {
+  normalizeProfileImageToJpeg,
+  ALLOWED_INPUT_MIME_TYPES,
+} = require("./utils/normalizeProfileImage");
 const {
   shouldSendNotification,
   getCategoryForType,
@@ -405,6 +412,25 @@ const { profile } = require("console");
 // Configure multer for file handling
 const storage = multer.memoryStorage(); // Store files in memory
 const upload = multer({ storage });
+const imageUpload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  fileFilter: (req, file, cb) => {
+    const ok = ALLOWED_INPUT_MIME_TYPES.has(
+      String(file?.mimetype || "").toLowerCase()
+    );
+    if (!ok) return cb(new Error("Only jpeg/png/webp images are allowed"));
+    cb(null, true);
+  },
+});
+
+const imageUploadSingle = (req, res, next) => {
+  imageUpload.single("file")(req, res, (err) => {
+    if (!err) return next();
+    const message = err.message || "Invalid upload";
+    return res.status(400).json({ error: message });
+  });
+};
 
 // Cloudinary configuration
 cloudinary.config({
@@ -1066,6 +1092,21 @@ const generateSecreteKey = () => {
 
 const secretKey = generateSecreteKey();
 
+function requireAuth(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  if (!match) return res.status(401).json({ message: "Missing Authorization Bearer token" });
+
+  try {
+    const decoded = jwt.verify(match[1], secretKey);
+    if (!decoded?.userId) return res.status(401).json({ message: "Invalid token payload" });
+    req.authUserId = decoded.userId;
+    return next();
+  } catch (err) {
+    return res.status(401).json({ message: "Invalid or expired token" });
+  }
+}
+
 //login user
 
 app.post("/login", async (req, res) => {
@@ -1468,7 +1509,7 @@ app.get("/users/:userId/relationship/:otherUserId", async (req, res) => {
 
 //image upload
 
-app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
+app.post("/users/:userId/upload", imageUploadSingle, async (req, res) => {
   const userId = req.params.userId;
 
   if (!req.file) {
@@ -1476,23 +1517,27 @@ app.post("/users/:userId/upload", upload.single("file"), async (req, res) => {
   }
 
   try {
-    // Step 1: Detect faces in the uploaded image
-
-    // Step 2: Upload the image to Cloudinary
-    let imageUrl;
-    const result = await new Promise((resolve, reject) => {
-      const uploadStream = cloudinary.uploader.upload_stream(
-        (uploadResult, error) => {
-          if (error) {
-            console.log("Cloudinary upload error:", error);
-            return reject(error);
-          }
-
-          imageUrl = uploadResult.secure_url;
-          resolve(uploadResult); // Resolve the promise with the upload result
-        }
+    let normalized;
+    try {
+      normalized = await normalizeProfileImageToJpeg(
+        req.file.buffer,
+        req.file.mimetype
       );
-      uploadStream.end(req.file.buffer);
+    } catch (e) {
+      return res.status(400).json({ error: e?.message || "Invalid image" });
+    }
+
+    const key = buildUserImageKey({
+      userId,
+      mimetype: normalized.contentType,
+      originalname: req.file.originalname,
+      extOverride: normalized.extension,
+    });
+
+    const { url: imageUrl } = await uploadImageBufferToR2({
+      buffer: normalized.buffer,
+      contentType: normalized.contentType,
+      key,
     });
 
     // Step 3: Update the user's profile with the uploaded image URL
@@ -2881,7 +2926,7 @@ app.delete("/users/:userId", async (req, res) => {
 // Endpoint to update profile image
 app.put(
   "/update-profile-image/:userId",
-  upload.single("file"),
+  imageUploadSingle,
   async (req, res) => {
     const { userId } = req.params;
 
@@ -2892,21 +2937,29 @@ app.put(
         return res.status(400).json({ message: "No image file uploaded" });
       }
 
-      // Upload image to Cloudinary
-      let imageUrl;
-      const result = await new Promise((resolve, reject) => {
-        const uploadStream = cloudinary.uploader.upload_stream(
-          (uploadResult, error) => {
-            if (error) {
-              console.log("some errors", error);
-              return reject(error);
-            }
-
-            imageUrl = uploadResult.secure_url;
-            resolve(uploadResult); // Resolve the promise with the upload result
-          }
+      let normalized;
+      try {
+        normalized = await normalizeProfileImageToJpeg(
+          req.file.buffer,
+          req.file.mimetype
         );
-        uploadStream.end(req.file.buffer);
+      } catch (e) {
+        return res
+          .status(400)
+          .json({ message: e?.message || "Invalid image" });
+      }
+
+      const key = buildUserImageKey({
+        userId,
+        mimetype: normalized.contentType,
+        originalname: req.file.originalname,
+        extOverride: normalized.extension,
+      });
+
+      const { url: imageUrl } = await uploadImageBufferToR2({
+        buffer: normalized.buffer,
+        contentType: normalized.contentType,
+        key,
       });
 
       console.log(userId, imageUrl);
@@ -3658,6 +3711,59 @@ app.post("/admin/send-notification", async (req, res) => {
   }
 });
 
+// CMS test endpoint: upload profile image to R2 for the logged-in user
+app.post(
+  "/admin/me/profile-image",
+  requireAuth,
+  imageUploadSingle,
+  async (req, res) => {
+    const userId = req.authUserId;
+
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    try {
+      const normalized = await normalizeProfileImageToJpeg(
+        req.file.buffer,
+        req.file.mimetype
+      );
+
+      const key = buildUserImageKey({
+        userId,
+        mimetype: "image/webp",
+        originalname: req.file.originalname,
+        extOverride: normalized.extension,
+      });
+
+      const { url: imageUrl } = await uploadImageBufferToR2({
+        buffer: normalized.buffer,
+        contentType: normalized.contentType,
+        key,
+      });
+
+      const updatedUser = await User.findByIdAndUpdate(
+        userId,
+        { $addToSet: { profileImages: imageUrl } },
+        { new: true }
+      ).select("_id name email profileImages");
+
+      if (!updatedUser) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      return res.status(200).json({
+        message: "Upload was a success",
+        imageUrl,
+        profileImages: updatedUser.profileImages,
+      });
+    } catch (error) {
+      console.error("R2 file upload failed:", error);
+      return res.status(500).json({ error: "File upload failed" });
+    }
+  }
+);
+
 // Endpoint to update user's anonymous mode
 app.put("/users/:userId/anonymous", async (req, res) => {
   try {
@@ -4404,7 +4510,7 @@ app.get("/admin/users", async (req, res) => {
 // Endpoint to upload verification selfie
 app.post(
   "/verify/:userId/verification-selfie",
-  upload.single("file"),
+  imageUploadSingle,
   async (req, res) => {
     const userId = req.params.userId;
 
@@ -4415,21 +4521,27 @@ app.post(
     console.log("userId", userId);
 
     try {
-      // Upload the verification selfie to Cloudinary
-      let selfieUrl;
-      const result = await new Promise((resolve, reject) => {
-        const uploadStream = cloudinary.uploader.upload_stream(
-          (uploadResult, error) => {
-            if (error) {
-              console.log("Cloudinary upload error:", error);
-              return reject(error);
-            }
-
-            selfieUrl = uploadResult.secure_url;
-            resolve(uploadResult); // Resolve the promise with the upload result
-          }
+      let normalized;
+      try {
+        normalized = await normalizeProfileImageToJpeg(
+          req.file.buffer,
+          req.file.mimetype
         );
-        uploadStream.end(req.file.buffer);
+      } catch (e) {
+        return res.status(400).json({ error: e?.message || "Invalid image" });
+      }
+
+      const key = buildUserImageKey({
+        userId,
+        mimetype: normalized.contentType,
+        originalname: req.file.originalname,
+        extOverride: normalized.extension,
+      });
+
+      const { url: selfieUrl } = await uploadImageBufferToR2({
+        buffer: normalized.buffer,
+        contentType: normalized.contentType,
+        key,
       });
 
       // Update the user's profile with the verification selfie URL
