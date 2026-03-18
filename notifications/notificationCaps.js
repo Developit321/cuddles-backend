@@ -16,8 +16,9 @@ const Notification = require("../models/Notification");
 const GLOBAL_NON_TRANSACTIONAL_CAP_PER_DAY = 3;
 const FOMO_CAP_PER_DAY = 3;
 const RE_ENGAGEMENT_CAP_PER_WEEK = 1;
+const DISCOVERY_COOLDOWN_MS = 60 * 60 * 1000; // 60 minutes
 
-/** Categories that count toward the global non-transactional daily cap. Discovery (event_nearby) is unlimited for now. */
+/** Categories that count toward the global non-transactional daily cap. */
 const NON_TRANSACTIONAL_CATEGORIES = ["fomo", "re_engagement"];
 
 /**
@@ -80,6 +81,25 @@ async function getReEngagementCountThisWeek(userId) {
 }
 
 /**
+ * Returns ObjectIds of users who received a notification of the given type(s)
+ * within the cooldown window. Used to exclude recently-notified users from
+ * nearby queries so different users get a chance (rotation).
+ *
+ * @param {string|string[]} type - notification type or array of types
+ * @param {number} cooldownMs - window in milliseconds (e.g. DISCOVERY_COOLDOWN_MS)
+ * @returns {Promise<import("mongoose").Types.ObjectId[]>}
+ */
+async function getRecentlyNotifiedUserIds(type, cooldownMs) {
+  const cutoff = new Date(Date.now() - cooldownMs);
+  const typeFilter = Array.isArray(type) ? { $in: type } : type;
+  const ids = await Notification.distinct("userId", {
+    type: typeFilter,
+    createdAt: { $gte: cutoff },
+  });
+  return ids;
+}
+
+/**
  * Whether the user received any transactional notification today.
  * Plan: "If a user already received a transactional notification that day, skip re-engagement and discovery nudges entirely."
  */
@@ -108,7 +128,6 @@ async function shouldSendNotification(userId, category) {
   }
 
   if (category === "discovery") {
-    // Discovery (e.g. new table nearby) is not skipped when user had transactional today — discovery stays high priority.
     return { allowed: true };
   }
 
@@ -182,9 +201,11 @@ module.exports = {
   getNonTransactionalCountToday,
   getFomoCountToday,
   getReEngagementCountThisWeek,
+  getRecentlyNotifiedUserIds,
   shouldSendNotification,
   getCategoryForType,
   GLOBAL_NON_TRANSACTIONAL_CAP_PER_DAY,
   FOMO_CAP_PER_DAY,
+  DISCOVERY_COOLDOWN_MS,
   RE_ENGAGEMENT_CAP_PER_WEEK,
 };

@@ -58,6 +58,7 @@ const notificationSchema = new mongoose.Schema({
 notificationSchema.index({ userId: 1, createdAt: -1 });
 notificationSchema.index({ userId: 1, read: 1 });
 notificationSchema.index({ userId: 1, category: 1, createdAt: -1 });
+notificationSchema.index({ type: 1, createdAt: -1 });
 
 module.exports = mongoose.model("Notification", notificationSchema);
 
