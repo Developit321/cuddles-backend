@@ -3322,12 +3322,16 @@ app.post("/report", async (req, res) => {
       : `event with ID ${reportedEventId}`;
     const reasonText = reason ? `\nReason: ${reason}` : "";
 
-    await transporter.sendMail({
-      from: "cuddlesquery@gmail.com",
-      to: "cuddlesquery@gmail.com",
-      subject: "New Report",
-      text: `User with ID ${reporterId} reported ${target}.${reasonText}\n\nMessage: ${message}`,
-    });
+    try {
+      await transporter.sendMail({
+        from: "cuddlesquery@gmail.com",
+        to: "cuddlesquery@gmail.com",
+        subject: "New Report",
+        text: `User with ID ${reporterId} reported ${target}.${reasonText}\n\nMessage: ${message}`,
+      });
+    } catch (mailError) {
+      console.error("Report saved but email notification failed:", mailError);
+    }
 
     res.status(201).json({ message: "Report submitted successfully." });
   } catch (error) {
