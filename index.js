@@ -5154,40 +5154,53 @@ app.post("/support-email", async (req, res) => {
 // OPEN TABLES / EVENTS ENDPOINTS
 // ============================================================
 
-// Helper function to update event status based on time
-const updateEventStatus = async (event) => {
+/** Pure status transition logic (mirrors previous updateEventStatus behavior). */
+const computeNextEventStatus = (event) => {
   const now = new Date();
   let newStatus = event.status;
 
   if (event.status === "cancelled" || event.status === "ended") {
-    return event;
+    return event.status;
   }
 
-  // Check if event should be live
-  if (event.startTime <= now && event.status === "upcoming") {
+  const startTime =
+    event.startTime instanceof Date ? event.startTime : new Date(event.startTime);
+  const endTime = event.endTime
+    ? event.endTime instanceof Date
+      ? event.endTime
+      : new Date(event.endTime)
+    : null;
+  const capacity = event.capacity != null ? event.capacity : 6;
+
+  if (startTime <= now && event.status === "upcoming") {
     newStatus = "live";
   }
 
-  // Check if event should be ended
-  if (event.endTime && event.endTime <= now) {
+  if (endTime && endTime <= now) {
     newStatus = "ended";
   }
 
-  // Auto-end events 4 hours after startTime (even without endTime)
-  const fourHoursAfterStart = new Date(event.startTime.getTime() + 4 * 60 * 60 * 1000);
+  const fourHoursAfterStart = new Date(startTime.getTime() + 4 * 60 * 60 * 1000);
   if (now >= fourHoursAfterStart && newStatus !== "ended") {
     newStatus = "ended";
   }
 
-  // Check if event is full
-  const goingCount = event.participants.filter(
-    (p) => p.status === "going" || p.status === "checked_in"
+  const participants = event.participants || [];
+  const goingCount = participants.filter(
+    (p) => p && (p.status === "going" || p.status === "checked_in")
   ).length;
-  if (goingCount >= event.capacity && newStatus !== "ended") {
+  if (goingCount >= capacity && newStatus !== "ended") {
     newStatus = "full";
-  } else if (goingCount < event.capacity && event.status === "full") {
-    newStatus = event.startTime <= now ? "live" : "upcoming";
+  } else if (goingCount < capacity && event.status === "full") {
+    newStatus = startTime <= now ? "live" : "upcoming";
   }
+
+  return newStatus;
+};
+
+// Helper function to update event status based on time
+const updateEventStatus = async (event) => {
+  const newStatus = computeNextEventStatus(event);
 
   if (newStatus !== event.status) {
     event.status = newStatus;
@@ -5195,6 +5208,35 @@ const updateEventStatus = async (event) => {
   }
 
   return event;
+};
+
+/** Persist status transitions for active events (used by cron; avoids per-read work on /events/nearby). */
+const syncEventStatusesBatch = async () => {
+  const started = Date.now();
+  const cursor = Event.find({
+    status: { $in: ["upcoming", "live", "full"] },
+  }).cursor();
+
+  const bulkOps = [];
+  for await (const doc of cursor) {
+    const next = computeNextEventStatus(doc);
+    if (next !== doc.status) {
+      bulkOps.push({
+        updateOne: {
+          filter: { _id: doc._id },
+          update: { $set: { status: next } },
+        },
+      });
+    }
+  }
+
+  if (bulkOps.length > 0) {
+    await Event.bulkWrite(bulkOps, { ordered: false });
+  }
+
+  console.log(
+    `[EventStatusSync] Done in ${Date.now() - started}ms, updated ${bulkOps.length} event(s)`
+  );
 };
 
 const cleanupExpiredEvents = async () => {
@@ -5240,6 +5282,13 @@ cron.schedule("0 * * * *", () => {
   console.log(`[Event Cleanup] Cron job triggered at ${new Date().toISOString()}`);
   cleanupExpiredEvents().catch((error) => {
     console.error("[Event Cleanup] Cron job error:", error);
+  });
+});
+
+// Keep event status in sync with time/capacity (so reads like /events/nearby stay fast)
+cron.schedule("*/5 * * * *", () => {
+  syncEventStatusesBatch().catch((error) => {
+    console.error("[EventStatusSync] Cron error:", error);
   });
 });
 
@@ -6178,20 +6227,52 @@ app.get("/events/nearby", async (req, res) => {
       {
         $limit: 50,
       },
+      // Map / home tab only needs a small slice of each event (see ios-events EventMapMarker, EventPreviewCard compact, list fallback)
+      {
+        $project: {
+          _id: 1,
+          title: 1,
+          startTime: 1,
+          endTime: 1,
+          capacity: 1,
+          status: 1,
+          audience: 1,
+          distance: 1,
+          participantCount: 1,
+          location: {
+            type: "$location.type",
+            coordinates: "$location.coordinates",
+            name: "$location.name",
+          },
+          participants: {
+            $map: {
+              input: { $ifNull: ["$participants", []] },
+              as: "p",
+              in: {
+                userId: "$$p.userId",
+                status: "$$p.status",
+              },
+            },
+          },
+          host: {
+            name: "$host.name",
+            profileImages: "$host.profileImages",
+          },
+        },
+      },
     ]);
 
-    // Update status for each event if needed
-    for (let event of nearbyEvents) {
-      const eventDoc = await Event.findById(event._id);
-      if (eventDoc) {
-        await updateEventStatus(eventDoc);
-      }
-    }
+    const eventsWithStatus = nearbyEvents
+      .map((e) => ({
+        ...e,
+        status: computeNextEventStatus(e),
+      }))
+      .filter((e) => e.status !== "ended" && e.status !== "cancelled");
 
     res.status(200).json({
       message: "Nearby events found",
-      events: nearbyEvents,
-      count: nearbyEvents.length,
+      events: eventsWithStatus,
+      count: eventsWithStatus.length,
     });
   } catch (error) {
     console.error("Error fetching nearby events:", error);
