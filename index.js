@@ -1585,9 +1585,9 @@ app.get("/profiles", async (req, res) => {
         : 50;
     const maxDistanceMeters = parsedMaxDistanceKm * 1000;
 
-    // Filter out stale accounts (inactive for 60+ days)
-    const staleAccountThreshold = new Date();
-    staleAccountThreshold.setDate(staleAccountThreshold.getDate() - 60);
+    // Keep discovery focused on recently created accounts (last 60 days)
+    const recentAccountThreshold = new Date();
+    recentAccountThreshold.setDate(recentAccountThreshold.getDate() - 60);
 
     // Input validation
     if (!mongoose.Types.ObjectId.isValid(userId) || !gender) {
@@ -1643,14 +1643,8 @@ app.get("/profiles", async (req, res) => {
       profileImages: { $exists: true, $ne: [] },  // Faster than $not: { $size: 0 }
       anonymous: { $ne: true },                    // Simpler than $or with $exists
       flagged: { $ne: true },                      // Simpler than $and/$or with $exists
-      // Filter out stale accounts using lastActiveAt or updatedAt as fallback
-      $or: [
-        { lastActiveAt: { $gte: staleAccountThreshold } },
-        { 
-          lastActiveAt: { $exists: false },
-          updatedAt: { $gte: staleAccountThreshold }
-        }
-      ],
+      // Recency is based on account creation time
+      createdAt: { $gte: recentAccountThreshold },
     };
 
     // Projection to limit returned fields for better performance
@@ -1671,6 +1665,8 @@ app.get("/profiles", async (req, res) => {
       expectations: 1,
       lookingFor: 1,
       distance: 1,
+      priority: 1,
+      createdAt: 1,
     };
 
     let profiles = [];
@@ -1707,6 +1703,7 @@ app.get("/profiles", async (req, res) => {
                 key: "location",
               },
             },
+            { $sort: { priority: -1, createdAt: -1 } },
             { $project: profileProjection },
             { $limit: 20 },
           ]).option({ maxTimeMS: 5000 });
@@ -1725,7 +1722,7 @@ app.get("/profiles", async (req, res) => {
         );
         const neededProfiles = 20 - countryProfiles.length;
 
-        // Combine priority and random sample queries using $facet for single DB round-trip
+        // Combine priority and newest non-priority queries using $facet for single DB round-trip
         const facetResults = await User.aggregate([
           {
             $match: {
@@ -1737,39 +1734,40 @@ app.get("/profiles", async (req, res) => {
             $facet: {
               priorityUsers: [
                 { $match: { priority: 1 } },
+                { $sort: { createdAt: -1 } },
                 { $project: profileProjection },
                 { $limit: neededProfiles },
               ],
-              randomUsers: [
-                { $sample: { size: neededProfiles } },  // Use $sample for better variety
+              nonPriorityUsers: [
+                { $match: { priority: { $ne: 1 } } },
+                { $sort: { createdAt: -1 } },
                 { $project: profileProjection },
+                { $limit: neededProfiles },
               ],
             },
           },
         ]).option({ maxTimeMS: 5000 });
 
         if (facetResults.length > 0) {
-          const { priorityUsers = [], randomUsers = [] } = facetResults[0];
-          
+          const { priorityUsers = [], nonPriorityUsers = [] } = facetResults[0];
+
           // Add priority users first
-          const priorityIds = new Set();
           priorityUsers.forEach((p) => {
             const idStr = p._id.toString();
             if (!existingProfileIds.some((id) => id.toString() === idStr)) {
               countryProfiles.push(p);
-              priorityIds.add(idStr);
             }
           });
           console.log(`⭐ Found ${priorityUsers.length} priority profiles`);
 
-          // Add random users that aren't already included (using $sample for variety)
+          // Add newest non-priority users that aren't already included
           const stillNeeded = 20 - countryProfiles.length;
           if (stillNeeded > 0) {
             const existingIds = new Set(countryProfiles.map((p) => p._id.toString()));
-            const uniqueRandom = randomUsers.filter(
+            const uniqueNonPriority = nonPriorityUsers.filter(
               (p) => !existingIds.has(p._id.toString())
             );
-            countryProfiles.push(...uniqueRandom.slice(0, stillNeeded));
+            countryProfiles.push(...uniqueNonPriority.slice(0, stillNeeded));
           }
         }
       }
@@ -1800,6 +1798,7 @@ app.get("/profiles", async (req, res) => {
                 key: "location",
               },
             },
+            { $sort: { priority: -1, createdAt: -1 } },
             { $project: profileProjection },
             { $limit: 20 },
           ]).option({ maxTimeMS: 5000 });
@@ -1813,6 +1812,7 @@ app.get("/profiles", async (req, res) => {
       if (profiles.length === 0) {
         profiles = await User.find(query)
           .select(Object.keys(profileProjection).join(" "))
+          .sort({ priority: -1, createdAt: -1 })
           .limit(20)
           .lean();
       }
@@ -1832,19 +1832,14 @@ app.get("/profiles", async (req, res) => {
       }
     }
 
-    // Apply Fisher-Yates shuffle for proper randomness (in-place)
-    for (let i = profiles.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [profiles[i], profiles[j]] = [profiles[j], profiles[i]];
-    }
-    const shuffledProfiles = profiles;
+    const rankedProfiles = profiles;
 
     // Calculate distances if location is provided
-    if (hasLocation && shuffledProfiles.length > 0) {
+    if (hasLocation && rankedProfiles.length > 0) {
       const parsedLong = parseFloat(longitude);
       const parsedLat = parseFloat(latitude);
 
-      shuffledProfiles.forEach((profile) => {
+      rankedProfiles.forEach((profile) => {
         if (!profile.distance && profile.location?.coordinates) {
           profile.distance = calculateDistance(
             parsedLat,
@@ -1857,10 +1852,10 @@ app.get("/profiles", async (req, res) => {
     }
 
     // Boost impression tracking: increment impressionCount for any active-boosted profiles shown
-    if (shuffledProfiles.length > 0) {
+    if (rankedProfiles.length > 0) {
       try {
         const now = new Date();
-        const boostedIds = shuffledProfiles.map((p) => p._id?.toString()).filter(Boolean);
+        const boostedIds = rankedProfiles.map((p) => p._id?.toString()).filter(Boolean);
         await Boost.updateMany(
           { userId: { $in: boostedIds }, status: "active", expiresAt: { $gt: now } },
           { $inc: { impressionCount: 1 } }
@@ -1871,11 +1866,11 @@ app.get("/profiles", async (req, res) => {
     }
 
     return res.status(200).json({
-      profiles: shuffledProfiles,
-      totalCount: shuffledProfiles.length,
-      nearbyCount: shuffledProfiles.filter((p) => p.distance != null).length,
+      profiles: rankedProfiles,
+      totalCount: rankedProfiles.length,
+      nearbyCount: rankedProfiles.filter((p) => p.distance != null).length,
       userCountry: userCountry || "Unknown",
-      sameCountryCount: shuffledProfiles.filter(
+      sameCountryCount: rankedProfiles.filter(
         (p) => p.location?.country === userCountry
       ).length,
     });
