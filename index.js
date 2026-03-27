@@ -3873,6 +3873,24 @@ app.post("/admin/regional-campaigns", async (req, res) => {
       return res.status(400).json({ error: "name, regionType, title, and message are required" });
     }
 
+    if (testUser) {
+      const lookup = testUser.trim();
+      let foundUser;
+      if (mongoose.Types.ObjectId.isValid(lookup)) {
+        foundUser = await User.findById(lookup).select("_id email name pushToken").lean();
+      } else if (lookup.includes("@")) {
+        foundUser = await User.findOne({ email: lookup.toLowerCase() }).select("_id email name pushToken").lean();
+      } else {
+        foundUser = await User.findOne({ name: { $regex: new RegExp(`^${lookup}$`, "i") } }).select("_id email name pushToken").lean();
+      }
+      if (!foundUser) {
+        return res.status(400).json({ error: `Test user "${lookup}" not found` });
+      }
+      if (!foundUser.pushToken) {
+        return res.status(400).json({ error: `Test user "${foundUser.email || foundUser.name}" has no push token` });
+      }
+    }
+
     const tz = timezone || "UTC";
     const campaignData = {
       name,
@@ -3942,7 +3960,26 @@ app.put("/admin/regional-campaigns/:id", async (req, res) => {
     if (requirePushToken != null) updates.requirePushToken = requirePushToken;
     if (eventsOnly != null) updates.eventsOnly = eventsOnly;
     if (audience != null) updates.audience = audience;
-    if (testUser !== undefined) updates.testUser = testUser || null;
+    if (testUser !== undefined) {
+      if (testUser) {
+        const lookup = testUser.trim();
+        let foundUser;
+        if (mongoose.Types.ObjectId.isValid(lookup)) {
+          foundUser = await User.findById(lookup).select("_id email name pushToken").lean();
+        } else if (lookup.includes("@")) {
+          foundUser = await User.findOne({ email: lookup.toLowerCase() }).select("_id email name pushToken").lean();
+        } else {
+          foundUser = await User.findOne({ name: { $regex: new RegExp(`^${lookup}$`, "i") } }).select("_id email name pushToken").lean();
+        }
+        if (!foundUser) {
+          return res.status(400).json({ error: `Test user "${lookup}" not found` });
+        }
+        if (!foundUser.pushToken) {
+          return res.status(400).json({ error: `Test user "${foundUser.email || foundUser.name}" has no push token` });
+        }
+      }
+      updates.testUser = testUser || null;
+    }
     if (radiusM != null) updates.radiusM = radiusM;
     if (center && center.lat != null && center.lng != null) {
       updates.center = { type: "Point", coordinates: [center.lng, center.lat] };
