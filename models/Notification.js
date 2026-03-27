@@ -35,6 +35,7 @@ const notificationSchema = new mongoose.Schema({
       "capetown_weekend",
       "event_join_request",
       "event_join_request_rejected",
+      "regional_campaign",
     ],
     required: true,
   },

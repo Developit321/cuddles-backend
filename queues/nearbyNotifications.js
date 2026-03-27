@@ -38,4 +38,11 @@ function enqueueCapetownWeekend() {
   queue.add({ type: "capetown_weekend" }).catch((err) => console.error("[Nearby Queue] enqueue capetown_weekend failed:", err?.message));
 }
 
-module.exports = { getQueue, enqueueNearbyEvent, enqueueNearby60Fill, enqueueCapetownWeekend };
+function enqueueCampaign(campaignId) {
+  if (!queue) return false;
+  const id = campaignId && campaignId.toString ? campaignId.toString() : campaignId;
+  queue.add({ type: "regional_campaign", campaignId: id }).catch((err) => console.error("[Nearby Queue] enqueue regional_campaign failed:", err?.message));
+  return true;
+}
+
+module.exports = { getQueue, enqueueNearbyEvent, enqueueNearby60Fill, enqueueCapetownWeekend, enqueueCampaign };
