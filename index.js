@@ -29,7 +29,7 @@ const http = require("http").createServer(app);
 const io = require("socket.io")(http); // Pass the HTTP server instance
 const bcrypt = require("bcryptjs");
 const { sendNotification, sendNotificationBatch } = require("./notifications/pushNotifications");
-const { getQueue, enqueueNearbyEvent, enqueueNearby60Fill, enqueueCapetownWeekend } = require("./queues/nearbyNotifications");
+const { getQueue, enqueueNearbyEvent, enqueueNearby60Fill, enqueueCapetownWeekend, enqueueCampaign } = require("./queues/nearbyNotifications");
 const notificationStrings = require("./notifications/notificationStrings");
 const {
   uploadImageBufferToR2,
@@ -399,6 +399,11 @@ if (nearbyQueue) {
         await sendNotificationBatch(messages);
         console.log(`[Nearby Queue] capetown_weekend: sent ${messages.length} notifications`);
       }
+    } else if (type === "regional_campaign") {
+      const { campaignId } = job.data;
+      console.log(`[Nearby Queue] regional_campaign: executing campaign ${campaignId}`);
+      await executeCampaign(campaignId, { shouldSendNotification, createNotificationWithCaps });
+      console.log(`[Nearby Queue] regional_campaign: finished campaign ${campaignId}`);
     } else {
       console.warn("[Nearby Queue] Unknown job type:", type);
     }
@@ -5885,11 +5890,16 @@ cron.schedule("* * * * *", async () => {
       scheduleAt: { $lte: now },
     });
     for (const campaign of due) {
-      console.log(`[Campaign Cron] Executing campaign "${campaign.name}" (${campaign._id})`);
+      console.log(`[Campaign Cron] Dispatching campaign "${campaign.name}" (${campaign._id})`);
       try {
-        await executeCampaign(campaign._id);
+        if (getQueue()) {
+          enqueueCampaign(campaign._id);
+          console.log(`[Campaign Cron] Enqueued "${campaign.name}" to Bull queue`);
+        } else {
+          await executeCampaign(campaign._id, { shouldSendNotification, createNotificationWithCaps });
+        }
       } catch (err) {
-        console.error(`[Campaign Cron] Failed to execute "${campaign.name}":`, err?.message || err);
+        console.error(`[Campaign Cron] Failed to dispatch "${campaign.name}":`, err?.message || err);
       }
     }
   } catch (err) {

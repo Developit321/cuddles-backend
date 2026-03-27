@@ -1,7 +1,6 @@
 const mongoose = require("mongoose");
 const RegionalCampaign = require("../models/RegionalCampaign");
 const User = require("../models/User");
-const Notification = require("../models/Notification");
 const { sendNotification, sendNotificationBatch } = require("../notifications/pushNotifications");
 
 const EVENTS_ONLY_QUERY = {
@@ -10,8 +9,6 @@ const EVENTS_ONLY_QUERY = {
     { $or: [{ availability: { $exists: false } }, { availability: { $size: 0 } }] },
   ],
 };
-
-const BATCH_SIZE = 500;
 
 function buildGeoQuery(campaign) {
   const matchConditions = [{ pushToken: { $exists: true, $ne: null } }];
@@ -78,7 +75,15 @@ async function findTestUser(lookup) {
   return User.findOne({ name: { $regex: new RegExp(`^${trimmed}$`, "i") } }).select("_id pushToken email name").lean();
 }
 
-async function executeCampaign(campaignId) {
+/**
+ * @param {string} campaignId
+ * @param {object} opts
+ * @param {function} opts.shouldSendNotification - (userId, category) => { allowed, reason }
+ * @param {function} opts.createNotificationWithCaps - (payload) => Notification|null
+ */
+async function executeCampaign(campaignId, opts = {}) {
+  const { shouldSendNotification, createNotificationWithCaps } = opts;
+
   const campaign = await RegionalCampaign.findById(campaignId);
   if (!campaign) throw new Error(`Campaign ${campaignId} not found`);
   if (campaign.status !== "scheduled" && campaign.status !== "draft") {
@@ -117,43 +122,46 @@ async function executeCampaign(campaignId) {
     metrics.invalidTokenCount = metrics.targetedCount - validUsers.length;
     metrics.eligibleCount = validUsers.length;
 
-    if (campaign.testUser && validUsers.length > 0) {
-      const u = validUsers[0];
+    const messages = [];
+
+    for (const u of validUsers) {
+      if (shouldSendNotification) {
+        const { allowed } = await shouldSendNotification(u._id, "discovery");
+        if (!allowed) {
+          metrics.skippedCapCount++;
+          continue;
+        }
+      }
+
+      if (createNotificationWithCaps) {
+        await createNotificationWithCaps({
+          userId: u._id,
+          type: "regional_campaign",
+          title: campaign.title,
+          message: campaign.message,
+          skipPush: true,
+        });
+      }
+
+      messages.push({ to: u.pushToken, title: campaign.title, body: campaign.message });
+    }
+
+    if (campaign.testUser && messages.length > 0) {
       try {
-        await sendNotification(u.pushToken, campaign.title, campaign.message);
+        await sendNotification(messages[0].to, messages[0].title, messages[0].body);
         metrics.sentCount = 1;
       } catch (err) {
         console.error("[Campaign] Test send error:", err?.message || err);
         metrics.failedCount = 1;
       }
-    } else {
-      for (let i = 0; i < validUsers.length; i += BATCH_SIZE) {
-        const batch = validUsers.slice(i, i + BATCH_SIZE);
-        const messages = batch.map((u) => ({
-          to: u.pushToken,
-          title: campaign.title,
-          body: campaign.message,
-        }));
-
-        try {
-          await sendNotificationBatch(messages);
-          metrics.sentCount += messages.length;
-        } catch (err) {
-          console.error("[Campaign] Batch send error:", err?.message || err);
-          metrics.failedCount += messages.length;
-        }
+    } else if (messages.length > 0) {
+      try {
+        await sendNotificationBatch(messages);
+        metrics.sentCount = messages.length;
+      } catch (err) {
+        console.error("[Campaign] Batch send error:", err?.message || err);
+        metrics.failedCount = messages.length;
       }
-    }
-
-    const notificationDocs = validUsers.map((u) => ({
-      userId: u._id,
-      type: "regional_campaign",
-      category: "discovery",
-      title: campaign.title,
-      message: campaign.message,
-    }));
-    if (notificationDocs.length > 0) {
-      await Notification.insertMany(notificationDocs, { ordered: false }).catch(() => {});
     }
 
     await RegionalCampaign.findByIdAndUpdate(campaignId, {
@@ -162,7 +170,7 @@ async function executeCampaign(campaignId) {
     });
 
     console.log(
-      `[Campaign] ${campaign.name} completed: ${metrics.sentCount} sent, ${metrics.failedCount} failed out of ${metrics.targetedCount} targeted`
+      `[Campaign] ${campaign.name} completed: ${metrics.sentCount} sent, ${metrics.skippedCapCount} capped, ${metrics.failedCount} failed out of ${metrics.targetedCount} targeted`
     );
   } catch (err) {
     console.error(`[Campaign] ${campaign.name} failed:`, err?.message || err);
