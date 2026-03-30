@@ -212,6 +212,12 @@ const userSchema = mongoose.Schema(
       type: Number,
       default: 0,
     },
+    coAttendees: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+      },
+    ],
   },
   { timestamps: true }
 ); // Add timestamps option here
