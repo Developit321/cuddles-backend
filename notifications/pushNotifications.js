@@ -6,7 +6,7 @@ const isValidExpoToken = (token) =>
   (token.startsWith("ExponentPushToken[") || token.startsWith("ExpoPushToken[")) &&
   token.endsWith("]");
 
-const sendNotification = async (expoPushToken, title, body) => {
+const sendNotification = async (expoPushToken, title, body, data = {}) => {
   // Skip sending if no token or invalid format - never throw so callers (e.g. wave) don't fail
   const isValidToken = isValidExpoToken(expoPushToken);
   if (!isValidToken) {
@@ -21,7 +21,7 @@ const sendNotification = async (expoPushToken, title, body) => {
     sound: "default",
     title,
     body,
-    data: { someData: "goes here" },
+    data,
   };
 
   try {
@@ -89,7 +89,7 @@ const sendOneToExpo = async (message) => {
       sound: "default",
       title: message.title,
       body: message.body,
-      data: message.data || { someData: "goes here" },
+      data: message.data || {},
     };
     const response = await fetch("https://exp.host/--/api/v2/push/send", {
       method: "POST",
@@ -112,7 +112,7 @@ const sendOneToExpo = async (message) => {
  * Send multiple push notifications to Expo in batches of EXPO_BATCH_SIZE (100).
  * If a batch fails with PUSH_TOO_MANY_EXPERIENCE_IDS (mixed Expo projects), retries
  * that chunk by sending each message in a separate request.
- * messages: Array<{ to: string, title: string, body: string }>
+ * messages: Array<{ to: string, title: string, body: string, data?: object }>
  * Invalid tokens are skipped. Does not throw so the worker can continue.
  */
 const sendNotificationBatch = async (messages) => {
@@ -124,7 +124,7 @@ const sendNotificationBatch = async (messages) => {
       sound: "default",
       title: m.title,
       body: m.body,
-      data: m.data || { someData: "goes here" },
+      data: m.data || {},
     }));
     try {
       const response = await fetch("https://exp.host/--/api/v2/push/send", {

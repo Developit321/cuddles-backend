@@ -139,7 +139,11 @@ const createNotification = async ({
           `[Notification] Sending push for type=${type} to user=${userId}`
         );
         try {
-          await sendNotification(token, title, message);
+          await sendNotification(token, title, message, {
+            type,
+            eventId: eventId?.toString(),
+            actorId: actorId?.toString(),
+          });
         } catch (pushError) {
           console.error(
             `[Notification] Failed to send push to user ${userId}:`,
@@ -287,7 +291,7 @@ if (nearbyQueue) {
           actorName: hostName,
           skipPush: true,
         });
-        if (u.pushToken) messages.push({ to: u.pushToken, title, body });
+        if (u.pushToken) messages.push({ to: u.pushToken, title, body, data: { type: "event_nearby", eventId: event._id.toString() } });
       }
       await sendNotificationBatch(messages);
       console.log(`[Nearby Queue] event_nearby: sent ${messages.length} notifications for event ${eventId}`);
@@ -354,7 +358,7 @@ if (nearbyQueue) {
           actorName: hostName,
           skipPush: true,
         });
-        if (u.pushToken) messages.push({ to: u.pushToken, title: notifTitle, body: notifBody });
+        if (u.pushToken) messages.push({ to: u.pushToken, title: notifTitle, body: notifBody, data: { type: "table_filling_fast", eventId: event._id.toString() } });
       }
       await sendNotificationBatch(messages);
       await Event.updateOne({ _id: eventId }, { sixtyPercentNotifSent: true });
@@ -393,7 +397,7 @@ if (nearbyQueue) {
           message: body,
           skipPush: true,
         });
-        if (u.pushToken) messages.push({ to: u.pushToken, title, body });
+        if (u.pushToken) messages.push({ to: u.pushToken, title, body, data: { type: "capetown_weekend" } });
       }
       if (messages.length > 0) {
         await sendNotificationBatch(messages);
@@ -655,7 +659,8 @@ io.on("connection", (socket) => {
             await sendNotification(
               participant.pushToken,
               `${event.title}`,
-              `${sender.name}: ${notificationMessage}`
+              `${sender.name}: ${notificationMessage}`,
+              { type: "event_chat", eventId: eventId.toString() }
             );
           } catch (notifError) {
             console.error(
@@ -746,7 +751,8 @@ io.on("connection", (socket) => {
         await sendPushNotification(
           receiver.pushToken,
           sender.name,
-          notificationMessage
+          notificationMessage,
+          { type: "dm", senderId: senderId.toString() }
         );
       }
 
@@ -2234,7 +2240,10 @@ app.post("/super-flirts", async (req, res) => {
       });
 
       if (receiver.pushToken) {
-        await sendNotification(receiver.pushToken, sfTitle, sfBody);
+        await sendNotification(receiver.pushToken, sfTitle, sfBody, {
+          type: "super_flirt",
+          actorId: senderId.toString(),
+        });
       }
     } catch (notifErr) {
       console.error("[Super Flirt] notification failed:", notifErr?.message || notifErr);
@@ -2301,7 +2310,10 @@ app.post("/super-flirts/:id/match", async (req, res) => {
     if (senderUser?.pushToken) {
       try {
         const sfMatch = getStrings(senderUser.preferredLanguage).superFlirtMatched;
-        await sendNotification(senderUser.pushToken, sfMatch.title, sfMatch.body);
+        await sendNotification(senderUser.pushToken, sfMatch.title, sfMatch.body, {
+          type: "super_flirt_match",
+          actorId: currentUserId.toString(),
+        });
       } catch (pushErr) {
         console.error("[Super Flirt Match] push notification failed:", pushErr?.message || pushErr);
       }
@@ -2430,7 +2442,9 @@ app.post("/boosts/activate", async (req, res) => {
     const boostActivatedStr = getStrings(user.preferredLanguage).boostActivated;
     if (user.pushToken) {
       try {
-        await sendNotification(user.pushToken, boostActivatedStr.title, boostActivatedStr.body);
+        await sendNotification(user.pushToken, boostActivatedStr.title, boostActivatedStr.body, {
+          type: "boost_activated",
+        });
       } catch (notifErr) {
         console.error("[Boost] Activation notification failed:", notifErr?.message);
       }
@@ -2482,7 +2496,9 @@ app.post("/boosts/reset-credits", async (req, res) => {
 
     if (user.pushToken) {
       try {
-        await sendNotification(user.pushToken, boostResetStr.title, boostResetStr.body);
+        await sendNotification(user.pushToken, boostResetStr.title, boostResetStr.body, {
+          type: "boost_credits_reset",
+        });
       } catch (notifErr) {
         console.error("[Boost] Credits reset notification failed:", notifErr?.message);
       }
@@ -2533,7 +2549,10 @@ app.post("/create-match", async (req, res) => {
     // Only send notification if the expoPushToken is available
     if (selectedUser && selectedUser.pushToken) {
       const s = getStrings(selectedUser.preferredLanguage).newMatch;
-      await sendNotification(selectedUser.pushToken, s.title, s.body);
+      await sendNotification(selectedUser.pushToken, s.title, s.body, {
+        type: "new_match",
+        actorId: currentUserId.toString(),
+      });
     }
     res.sendStatus(200);
     console.log("new match ");
@@ -3792,7 +3811,7 @@ app.post("/admin/send-notification", async (req, res) => {
 
     for (const user of users) {
       try {
-        await sendNotification(user.pushToken, title, body);
+        await sendNotification(user.pushToken, title, body, { type: "admin_broadcast" });
 
         // Update last notification timestamp
         await User.findByIdAndUpdate(user._id, {
@@ -5164,9 +5183,8 @@ app.get("/admin/verifications/pending", async (req, res) => {
 });
 
 // Add this function before the message handling code
-const sendPushNotification = async (receiverId, title, body) => {
+const sendPushNotification = async (receiverId, title, body, data = {}) => {
   try {
-    // Find the user by their ID
     const user = await User.findById(receiverId);
     if (!user) {
       console.log(`[Push Notification] User not found with ID ${receiverId}`);
@@ -5180,7 +5198,6 @@ const sendPushNotification = async (receiverId, title, body) => {
       return;
     }
 
-    // Validate the push token format
     if (
       !user.pushToken.startsWith("ExponentPushToken[") ||
       !user.pushToken.endsWith("]")
@@ -5194,7 +5211,7 @@ const sendPushNotification = async (receiverId, title, body) => {
     console.log(
       `[Push Notification] Sending message notification to user ${receiverId}`
     );
-    await sendNotification(user.pushToken, title, body);
+    await sendNotification(user.pushToken, title, body, data);
     console.log(`[Push Notification] Successfully sent to user ${receiverId}`);
   } catch (error) {
     console.error(
@@ -5387,7 +5404,7 @@ app.post("/admin/send-likes-notification", async (req, res) => {
                 likesCount.toString()
               );
 
-              await sendNotification(user.pushToken, title, body);
+              await sendNotification(user.pushToken, title, body, { type: "likes_campaign" });
               pushCount++;
               notificationSent = true;
               console.log(`Push notification sent to user ${userId}`);
@@ -6027,7 +6044,9 @@ cron.schedule("*/5 * * * *", async () => {
       if (boost.userId?.pushToken) {
         try {
           const warnStr = getStrings(boost.userId.preferredLanguage).boostWarning;
-          await sendNotification(boost.userId.pushToken, warnStr.title, warnStr.body);
+          await sendNotification(boost.userId.pushToken, warnStr.title, warnStr.body, {
+            type: "boost_warning",
+          });
         } catch (e) {
           console.error("[Boost Cron] Warning notif failed:", e?.message);
         }
@@ -6085,7 +6104,9 @@ cron.schedule("*/5 * * * *", async () => {
 
       if (boost.userId?.pushToken) {
         try {
-          await sendNotification(boost.userId.pushToken, expiredTitle, expiredBody);
+          await sendNotification(boost.userId.pushToken, expiredTitle, expiredBody, {
+            type: "boost_expired",
+          });
         } catch (e) {
           console.error("[Boost Cron] Expiry notif failed:", e?.message);
         }
