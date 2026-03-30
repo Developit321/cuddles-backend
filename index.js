@@ -1519,6 +1519,37 @@ app.get("/users/:userId/relationship/:otherUserId", async (req, res) => {
   }
 });
 
+// Check whether two users can connect (shared checked-in activity via coAttendees ledger)
+app.get("/users/:userId/connect-eligibility/:otherUserId", async (req, res) => {
+  try {
+    const { userId, otherUserId } = req.params;
+
+    if (
+      !mongoose.Types.ObjectId.isValid(userId) ||
+      !mongoose.Types.ObjectId.isValid(otherUserId)
+    ) {
+      return res.status(400).json({ message: "Invalid user ID format" });
+    }
+
+    const user = await User.findById(userId).select("coAttendees").lean();
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const canConnect = (user.coAttendees || []).some(
+      (id) => id.toString() === otherUserId
+    );
+
+    return res.status(200).json({ canConnect });
+  } catch (error) {
+    console.error("Error checking connect eligibility:", error);
+    res.status(500).json({
+      message: "Error checking connect eligibility",
+      error: error.message,
+    });
+  }
+});
+
 //image upload
 
 app.post("/users/:userId/upload", imageUploadSingle, async (req, res) => {
@@ -1904,6 +1935,15 @@ app.post("/likeprofile", async (req, res) => {
       "pushToken recievedLikes"
     );
 
+    // Gate: must have attended at least one shared activity (coAttendees)
+    if (currentUser && !(currentUser.coAttendees || []).some(
+      (id) => id.toString() === selectedUserId
+    )) {
+      return res.status(403).json({
+        message: "You need to have attended at least 1 activity with this person before you can connect with them.",
+      });
+    }
+
     if (!currentUser || !selectedUser) {
       return res.status(404).json({ message: "User not found." });
     }
@@ -1934,8 +1974,8 @@ app.post("/likeprofile", async (req, res) => {
       await createNotificationWithCaps({
         userId: selectedUserId,
         type: "profile_like",
-        title: "Someone wants to connect",
-        message: `${currentUser.name || "A user"} wants to connect with you`,
+        title: "Someone wants to stay in touch",
+        message: `${currentUser.name || "A user"} wants to stay in touch with you`,
         actorId: currentUserId,
         actorName: currentUser.name,
         actorImage: currentUser.profileImages?.[0] || null,
@@ -2049,8 +2089,17 @@ app.post("/super-wave", async (req, res) => {
       return res.status(400).json({ message: "senderId and receiverId are required" });
     }
 
-    const sender = await User.findById(senderId).select("name profileImages crushes").lean();
+    const sender = await User.findById(senderId).select("name profileImages crushes coAttendees").lean();
     const receiver = await User.findById(receiverId).select("pushToken recievedLikes").lean();
+
+    // Gate: must have attended at least one shared activity (coAttendees)
+    if (sender && !(sender.coAttendees || []).some(
+      (id) => id.toString() === receiverId.toString()
+    )) {
+      return res.status(403).json({
+        message: "You need to have attended at least 1 activity with this person before you can connect with them.",
+      });
+    }
 
     if (!sender || !receiver) {
       return res.status(404).json({ message: "User not found" });
@@ -5617,6 +5666,23 @@ const cleanupExpiredEvents = async () => {
           }
         }
       }
+
+      // Safety-net: backfill coAttendees for all checked-in pairs before deletion
+      const checkedIn = (event.participants || []).filter(
+        (p) => p && p.status === "checked_in" && p.userId
+      );
+      for (let i = 0; i < checkedIn.length; i++) {
+        for (let j = i + 1; j < checkedIn.length; j++) {
+          const idA = checkedIn[i].userId._id || checkedIn[i].userId;
+          const idB = checkedIn[j].userId._id || checkedIn[j].userId;
+          try {
+            await User.findByIdAndUpdate(idA, { $addToSet: { coAttendees: idB } });
+            await User.findByIdAndUpdate(idB, { $addToSet: { coAttendees: idA } });
+          } catch (coErr) {
+            console.error("[Event Cleanup] Error backfilling coAttendees:", coErr);
+          }
+        }
+      }
     }
 
     const result = await Event.deleteMany({
@@ -7352,6 +7418,23 @@ app.post("/events/:eventId/check-in", async (req, res) => {
     // Update participant status to checked_in
     event.participants[participantIndex].status = "checked_in";
     await event.save();
+
+    // Persist co-attendee ledger: mutual $addToSet for every other checked-in participant
+    const otherCheckedIn = event.participants.filter(
+      (p) =>
+        p.status === "checked_in" &&
+        p.userId &&
+        p.userId.toString() !== userId
+    );
+    for (const peer of otherCheckedIn) {
+      const peerId = peer.userId._id || peer.userId;
+      try {
+        await User.findByIdAndUpdate(userId, { $addToSet: { coAttendees: peerId } });
+        await User.findByIdAndUpdate(peerId, { $addToSet: { coAttendees: userId } });
+      } catch (coErr) {
+        console.error("[Check-in] Error updating coAttendees:", coErr);
+      }
+    }
 
     // Notify other participants (in-app + push)
     const otherParticipantIds = event.participants
