@@ -29,7 +29,7 @@ const http = require("http").createServer(app);
 const io = require("socket.io")(http); // Pass the HTTP server instance
 const bcrypt = require("bcryptjs");
 const { sendNotification, sendNotificationBatch } = require("./notifications/pushNotifications");
-const { getQueue, enqueueNearbyEvent, enqueueNearby60Fill, enqueueCapetownWeekend } = require("./queues/nearbyNotifications");
+const { getQueue, enqueueNearbyEvent, enqueueNearby60Fill, enqueueCapetownWeekend, enqueueCampaign } = require("./queues/nearbyNotifications");
 const notificationStrings = require("./notifications/notificationStrings");
 const {
   uploadImageBufferToR2,
@@ -49,6 +49,8 @@ const {
 } = require("./notifications/notificationCaps");
 const { ObjectId } = require("mongodb");
 const { updateUserCountry } = require("./Controllers/userController");
+const RegionalCampaign = require("./models/RegionalCampaign");
+const { executeCampaign, buildGeoQuery } = require("./campaigns/executeCampaign");
 
 // Returns the notification strings for the given language, falling back to English
 const getStrings = (lang) => notificationStrings[lang] || notificationStrings["en"];
@@ -397,6 +399,11 @@ if (nearbyQueue) {
         await sendNotificationBatch(messages);
         console.log(`[Nearby Queue] capetown_weekend: sent ${messages.length} notifications`);
       }
+    } else if (type === "regional_campaign") {
+      const { campaignId } = job.data;
+      console.log(`[Nearby Queue] regional_campaign: executing campaign ${campaignId}`);
+      await executeCampaign(campaignId, { shouldSendNotification, createNotificationWithCaps });
+      console.log(`[Nearby Queue] regional_campaign: finished campaign ${campaignId}`);
     } else {
       console.warn("[Nearby Queue] Unknown job type:", type);
     }
@@ -447,7 +454,7 @@ cloudinary.config({
 // MongoDB connection
 mongoose
   .connect(
-    "mongodb+srv://cuddles:LNum9ZwrrcNDyl5c@cluster0.bdtblda.mongodb.net/"
+    "mongodb://cuddles:LNum9ZwrrcNDyl5c@ac-r0ymzab-shard-00-00.bdtblda.mongodb.net:27017,ac-r0ymzab-shard-00-01.bdtblda.mongodb.net:27017,ac-r0ymzab-shard-00-02.bdtblda.mongodb.net:27017/?ssl=true&replicaSet=atlas-ll9zih-shard-0&authSource=admin&retryWrites=true&w=majority"
   )
   .then(async () => {
     console.log("Connected to the Database");
@@ -3824,6 +3831,361 @@ app.post("/admin/send-notification", async (req, res) => {
   }
 });
 
+// ─── Regional Campaigns ───────────────────────────────────────────────────────
+
+function localTimeToUTC(localDateStr, tz) {
+  if (!localDateStr || !tz || tz === "UTC") return localDateStr ? new Date(localDateStr) : null;
+  const [datePart, timePart] = localDateStr.split("T");
+  if (!datePart || !timePart) return new Date(localDateStr);
+  const [year, month, day] = datePart.split("-").map(Number);
+  const [hour, minute] = timePart.split(":").map(Number);
+  const guess = new Date(Date.UTC(year, month - 1, day, hour, minute));
+  const utcStr = guess.toLocaleString("en-US", { timeZone: "UTC" });
+  const localStr = guess.toLocaleString("en-US", { timeZone: tz });
+  const offsetMs = new Date(localStr).getTime() - new Date(utcStr).getTime();
+  return new Date(guess.getTime() - offsetMs);
+}
+
+app.get("/admin/regional-campaigns/preview-count", async (req, res) => {
+  try {
+    const lat = parseFloat(req.query.lat);
+    const lng = parseFloat(req.query.lng);
+    const radiusM = parseFloat(req.query.radiusM);
+    const eventsOnly = req.query.eventsOnly !== "false";
+    const gender = req.query.gender || null;
+
+    if (isNaN(lat) || isNaN(lng) || isNaN(radiusM)) {
+      return res.status(400).json({ error: "lat, lng, and radiusM are required numbers" });
+    }
+
+    const matchConditions = [{ pushToken: { $exists: true, $ne: null } }];
+    if (eventsOnly) {
+      matchConditions.push(
+        { $or: [{ lookingFor: { $exists: false } }, { lookingFor: { $size: 0 } }] },
+        { $or: [{ availability: { $exists: false } }, { availability: { $size: 0 } }] }
+      );
+    }
+    if (gender) matchConditions.push({ gender });
+
+    const result = await User.aggregate([
+      {
+        $geoNear: {
+          near: { type: "Point", coordinates: [lng, lat] },
+          distanceField: "distance",
+          maxDistance: radiusM,
+          spherical: true,
+          query: { $and: matchConditions },
+        },
+      },
+      { $count: "count" },
+    ]);
+
+    res.json({ count: result[0]?.count || 0 });
+  } catch (err) {
+    console.error("[Regional Campaigns] Preview count error:", err?.message || err);
+    res.status(500).json({ error: "Failed to get preview count" });
+  }
+});
+
+app.get("/admin/regional-campaigns", async (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+    const statusFilter = req.query.status;
+    const query = statusFilter && statusFilter !== "all" ? { status: statusFilter } : {};
+
+    const [campaigns, total] = await Promise.all([
+      RegionalCampaign.find(query)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      RegionalCampaign.countDocuments(query),
+    ]);
+
+    res.json({ campaigns, total, page, limit });
+  } catch (err) {
+    console.error("[Regional Campaigns] List error:", err?.message || err);
+    res.status(500).json({ error: "Failed to list campaigns" });
+  }
+});
+
+app.post("/admin/regional-campaigns", async (req, res) => {
+  try {
+    const {
+      name, regionType, country, center, radiusM,
+      title, message, timezone, scheduleAt,
+      requirePushToken, eventsOnly, audience, testUser,
+    } = req.body;
+
+    if (!name || !regionType || !title || !message) {
+      return res.status(400).json({ error: "name, regionType, title, and message are required" });
+    }
+
+    if (testUser) {
+      const lookup = testUser.trim();
+      let foundUser;
+      if (mongoose.Types.ObjectId.isValid(lookup)) {
+        foundUser = await User.findById(lookup).select("_id email name pushToken").lean();
+      } else if (lookup.includes("@")) {
+        foundUser = await User.findOne({ email: lookup.toLowerCase() }).select("_id email name pushToken").lean();
+      } else {
+        foundUser = await User.findOne({ name: { $regex: new RegExp(`^${lookup}$`, "i") } }).select("_id email name pushToken").lean();
+      }
+      if (!foundUser) {
+        return res.status(400).json({ error: `Test user "${lookup}" not found` });
+      }
+      if (!foundUser.pushToken) {
+        return res.status(400).json({ error: `Test user "${foundUser.email || foundUser.name}" has no push token` });
+      }
+    }
+
+    const tz = timezone || "UTC";
+    const campaignData = {
+      name,
+      regionType,
+      country: country || null,
+      title,
+      message,
+      timezone: tz,
+      scheduleAt: scheduleAt ? localTimeToUTC(scheduleAt, tz) : null,
+      requirePushToken: requirePushToken !== false,
+      eventsOnly: eventsOnly !== false,
+      audience: audience || {},
+      testUser: testUser || null,
+      status: "draft",
+    };
+
+    if (center && center.lat != null && center.lng != null) {
+      campaignData.center = {
+        type: "Point",
+        coordinates: [center.lng, center.lat],
+      };
+    }
+    if (radiusM) campaignData.radiusM = radiusM;
+
+    const campaign = await RegionalCampaign.create(campaignData);
+    res.status(201).json(campaign);
+  } catch (err) {
+    console.error("[Regional Campaigns] Create error:", err?.message || err);
+    res.status(500).json({ error: "Failed to create campaign" });
+  }
+});
+
+app.get("/admin/regional-campaigns/:id", async (req, res) => {
+  try {
+    const campaign = await RegionalCampaign.findById(req.params.id).lean();
+    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
+    res.json(campaign);
+  } catch (err) {
+    console.error("[Regional Campaigns] Get error:", err?.message || err);
+    res.status(500).json({ error: "Failed to get campaign" });
+  }
+});
+
+app.put("/admin/regional-campaigns/:id", async (req, res) => {
+  try {
+    const campaign = await RegionalCampaign.findById(req.params.id);
+    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
+    if (campaign.status !== "draft") {
+      return res.status(400).json({ error: "Only draft campaigns can be edited" });
+    }
+
+    const {
+      name, regionType, country, center, radiusM,
+      title, message, timezone, scheduleAt,
+      requirePushToken, eventsOnly, audience, testUser,
+    } = req.body;
+
+    const updates = {};
+    if (name != null) updates.name = name;
+    if (regionType != null) updates.regionType = regionType;
+    if (country !== undefined) updates.country = country || null;
+    if (title != null) updates.title = title;
+    if (message != null) updates.message = message;
+    if (timezone != null) updates.timezone = timezone;
+    const updateTz = timezone || campaign.timezone || "UTC";
+    if (scheduleAt !== undefined) updates.scheduleAt = scheduleAt ? localTimeToUTC(scheduleAt, updateTz) : null;
+    if (requirePushToken != null) updates.requirePushToken = requirePushToken;
+    if (eventsOnly != null) updates.eventsOnly = eventsOnly;
+    if (audience != null) updates.audience = audience;
+    if (testUser !== undefined) {
+      if (testUser) {
+        const lookup = testUser.trim();
+        let foundUser;
+        if (mongoose.Types.ObjectId.isValid(lookup)) {
+          foundUser = await User.findById(lookup).select("_id email name pushToken").lean();
+        } else if (lookup.includes("@")) {
+          foundUser = await User.findOne({ email: lookup.toLowerCase() }).select("_id email name pushToken").lean();
+        } else {
+          foundUser = await User.findOne({ name: { $regex: new RegExp(`^${lookup}$`, "i") } }).select("_id email name pushToken").lean();
+        }
+        if (!foundUser) {
+          return res.status(400).json({ error: `Test user "${lookup}" not found` });
+        }
+        if (!foundUser.pushToken) {
+          return res.status(400).json({ error: `Test user "${foundUser.email || foundUser.name}" has no push token` });
+        }
+      }
+      updates.testUser = testUser || null;
+    }
+    if (radiusM != null) updates.radiusM = radiusM;
+    if (center && center.lat != null && center.lng != null) {
+      updates.center = { type: "Point", coordinates: [center.lng, center.lat] };
+    }
+
+    const updated = await RegionalCampaign.findByIdAndUpdate(req.params.id, updates, { new: true }).lean();
+    res.json(updated);
+  } catch (err) {
+    console.error("[Regional Campaigns] Update error:", err?.message || err);
+    res.status(500).json({ error: "Failed to update campaign" });
+  }
+});
+
+app.delete("/admin/regional-campaigns/:id", async (req, res) => {
+  try {
+    const result = await RegionalCampaign.findByIdAndDelete(req.params.id);
+    if (!result) return res.status(404).json({ error: "Campaign not found" });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("[Regional Campaigns] Delete error:", err?.message || err);
+    res.status(500).json({ error: "Failed to delete campaign" });
+  }
+});
+
+app.post("/admin/regional-campaigns/:id/schedule", async (req, res) => {
+  try {
+    const campaign = await RegionalCampaign.findById(req.params.id);
+    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
+    if (campaign.status !== "draft") {
+      return res.status(400).json({ error: "Only draft campaigns can be scheduled" });
+    }
+
+    const scheduleTz = campaign.timezone || "UTC";
+    const scheduleAt = req.body.scheduleAt ? localTimeToUTC(req.body.scheduleAt, scheduleTz) : campaign.scheduleAt;
+    if (!scheduleAt) {
+      return res.status(400).json({ error: "scheduleAt is required (set on campaign or in request)" });
+    }
+
+    const updated = await RegionalCampaign.findByIdAndUpdate(
+      req.params.id,
+      { status: "scheduled", scheduleAt },
+      { new: true }
+    ).lean();
+
+    console.log(`[Regional Campaigns] Campaign "${campaign.name}" scheduled for ${scheduleAt}`);
+    res.json(updated);
+  } catch (err) {
+    console.error("[Regional Campaigns] Schedule error:", err?.message || err);
+    res.status(500).json({ error: "Failed to schedule campaign" });
+  }
+});
+
+app.post("/admin/regional-campaigns/:id/cancel", async (req, res) => {
+  try {
+    const campaign = await RegionalCampaign.findById(req.params.id);
+    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
+    if (campaign.status !== "scheduled") {
+      return res.status(400).json({ error: "Only scheduled campaigns can be cancelled" });
+    }
+
+    const updated = await RegionalCampaign.findByIdAndUpdate(
+      req.params.id,
+      { status: "cancelled" },
+      { new: true }
+    ).lean();
+
+    console.log(`[Regional Campaigns] Campaign "${campaign.name}" cancelled`);
+    res.json(updated);
+  } catch (err) {
+    console.error("[Regional Campaigns] Cancel error:", err?.message || err);
+    res.status(500).json({ error: "Failed to cancel campaign" });
+  }
+});
+
+app.post("/admin/regional-campaigns/:id/test", async (req, res) => {
+  try {
+    const campaign = await RegionalCampaign.findById(req.params.id);
+    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
+
+    const { userId, userEmail, userName } = req.body;
+    if (!userId && !userEmail && !userName) {
+      return res.status(400).json({ error: "Provide userId, userEmail, or userName" });
+    }
+
+    let user;
+    if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+      user = await User.findById(userId);
+    } else if (userEmail) {
+      user = await User.findOne({ email: userEmail.toLowerCase().trim() });
+    } else if (userName) {
+      user = await User.findOne({ name: { $regex: new RegExp(`^${userName.trim()}$`, "i") } });
+    }
+
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (!user.pushToken) {
+      return res.status(400).json({ error: "User does not have a push token" });
+    }
+
+    await sendNotification(user.pushToken, campaign.title, campaign.message);
+
+    await Notification.create({
+      userId: user._id,
+      type: "regional_campaign",
+      category: "discovery",
+      title: campaign.title,
+      message: campaign.message,
+    });
+
+    console.log(`[Regional Campaigns] Test notification sent to ${user.email || user.name} for campaign "${campaign.name}"`);
+    res.json({
+      success: true,
+      recipient: { _id: user._id, email: user.email, name: user.name },
+    });
+  } catch (err) {
+    console.error("[Regional Campaigns] Test send error:", err?.message || err);
+    res.status(500).json({ error: "Failed to send test notification" });
+  }
+});
+
+app.post("/admin/regional-campaigns/quick-test", async (req, res) => {
+  try {
+    const { title, message, userId, userEmail, userName } = req.body;
+    if (!title || !message) {
+      return res.status(400).json({ error: "title and message are required" });
+    }
+    if (!userId && !userEmail && !userName) {
+      return res.status(400).json({ error: "Provide userId, userEmail, or userName" });
+    }
+
+    let user;
+    if (userId && mongoose.Types.ObjectId.isValid(userId)) {
+      user = await User.findById(userId);
+    } else if (userEmail) {
+      user = await User.findOne({ email: userEmail.toLowerCase().trim() });
+    } else if (userName) {
+      user = await User.findOne({ name: { $regex: new RegExp(`^${userName.trim()}$`, "i") } });
+    }
+
+    if (!user) return res.status(404).json({ error: "User not found" });
+    if (!user.pushToken) {
+      return res.status(400).json({ error: "User does not have a push token" });
+    }
+
+    await sendNotification(user.pushToken, title, message);
+    console.log(`[Regional Campaigns] Quick test sent to ${user.email || user.name}: "${title}"`);
+    res.json({
+      success: true,
+      recipient: { _id: user._id, email: user.email, name: user.name },
+    });
+  } catch (err) {
+    console.error("[Regional Campaigns] Quick test error:", err?.message || err);
+    res.status(500).json({ error: "Failed to send test notification" });
+  }
+});
+
+// ─── End Regional Campaigns ───────────────────────────────────────────────────
+
 // CMS test endpoint: upload profile image to R2 for the logged-in user
 app.post(
   "/admin/me/profile-image",
@@ -5621,6 +5983,32 @@ const sendCapetownWeekendNudge = async () => {
 };
 
 cron.schedule("0 12 * * *", sendCapetownWeekendNudge);
+
+// ─── Regional Campaign scheduler — runs every minute ─────────────────────────
+cron.schedule("* * * * *", async () => {
+  try {
+    const now = new Date();
+    const due = await RegionalCampaign.find({
+      status: "scheduled",
+      scheduleAt: { $lte: now },
+    });
+    for (const campaign of due) {
+      console.log(`[Campaign Cron] Dispatching campaign "${campaign.name}" (${campaign._id})`);
+      try {
+        if (getQueue()) {
+          enqueueCampaign(campaign._id);
+          console.log(`[Campaign Cron] Enqueued "${campaign.name}" to Bull queue`);
+        } else {
+          await executeCampaign(campaign._id, { shouldSendNotification, createNotificationWithCaps });
+        }
+      } catch (err) {
+        console.error(`[Campaign Cron] Failed to dispatch "${campaign.name}":`, err?.message || err);
+      }
+    }
+  } catch (err) {
+    console.error("[Campaign Cron] Error:", err?.message || err);
+  }
+});
 
 // ─── Priority Boost cron — runs every 5 minutes ──────────────────────────────
 cron.schedule("*/5 * * * *", async () => {

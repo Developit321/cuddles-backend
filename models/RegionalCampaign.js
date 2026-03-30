@@ -2,34 +2,31 @@ const mongoose = require("mongoose");
 
 const regionalCampaignSchema = new mongoose.Schema(
   {
-    name: { type: String, required: true, trim: true },
-    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
-    status: {
-      type: String,
-      enum: ["draft", "scheduled", "running", "completed", "failed", "paused", "cancelled"],
-      default: "draft",
-      index: true,
-    },
+    name: { type: String, required: true },
     regionType: {
       type: String,
       enum: ["country", "radius", "country_plus_radius"],
       required: true,
     },
-    country: { type: String, default: null, trim: true },
+    country: { type: String, default: null },
     center: {
-      lng: { type: Number, default: null },
-      lat: { type: Number, default: null },
+      type: { type: String, enum: ["Point"], default: "Point" },
+      coordinates: { type: [Number], default: [0, 0] },
     },
     radiusM: { type: Number, default: null },
-    notificationType: { type: String, default: "capetown_weekend" },
     title: { type: String, required: true },
     message: { type: String, required: true },
     timezone: { type: String, default: "UTC" },
-    scheduleAt: { type: Date, default: null, index: true },
-    requirePushToken: { type: Boolean, default: true },
+    scheduleAt: { type: Date, default: null },
+    status: {
+      type: String,
+      enum: ["draft", "scheduled", "running", "completed", "failed", "paused", "cancelled"],
+      default: "draft",
+    },
     eventsOnly: { type: Boolean, default: true },
+    requirePushToken: { type: Boolean, default: true },
     audience: {
-      gender: { type: String, enum: ["male", "female", "other"], default: null },
+      gender: { type: String, default: null },
       minLastActiveDays: { type: Number, default: null },
     },
     metrics: {
@@ -40,13 +37,12 @@ const regionalCampaignSchema = new mongoose.Schema(
       invalidTokenCount: { type: Number, default: 0 },
       failedCount: { type: Number, default: 0 },
     },
+    testUser: { type: String, default: null },
     lastRunAt: { type: Date, default: null },
-    lastError: { type: String, default: "" },
   },
   { timestamps: true }
 );
 
-regionalCampaignSchema.index({ createdAt: -1, status: 1 });
-regionalCampaignSchema.index({ regionType: 1, country: 1 });
+regionalCampaignSchema.index({ status: 1, scheduleAt: 1 });
 
 module.exports = mongoose.model("RegionalCampaign", regionalCampaignSchema);
