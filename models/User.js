@@ -176,6 +176,36 @@ const userSchema = mongoose.Schema(
       type: [String],
       default: [],
     },
+    marriageTimeline: {
+      type: String,
+      enum: [
+        "within_1_year",
+        "1_to_2_years",
+        "2_to_3_years",
+        "3_plus_years",
+        "when_right_person",
+      ],
+      default: null,
+    },
+    childrenPreference: {
+      type: String,
+      enum: [
+        "want_children",
+        "dont_want_children",
+        "open_to_discussion",
+        "already_have_children",
+      ],
+      default: null,
+    },
+    relocationOpenness: {
+      type: String,
+      enum: [
+        "willing_to_relocate",
+        "prefer_local",
+        "open_to_discussion",
+      ],
+      default: null,
+    },
     anonymous: {
       type: Boolean,
       default: false,

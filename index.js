@@ -1422,6 +1422,128 @@ app.put("/users/:userId/cuddle-preference", async (req, res) => {
   }
 });
 
+// Konkatsu onboarding: marriage timeline
+app.put("/users/:userId/marriage-timeline", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { marriageTimeline } = req.body;
+
+    const valid = [
+      "within_1_year",
+      "1_to_2_years",
+      "2_to_3_years",
+      "3_plus_years",
+      "when_right_person",
+    ];
+
+    if (!marriageTimeline || !valid.includes(marriageTimeline)) {
+      return res.status(400).json({
+        message: `Invalid marriageTimeline. Must be one of: ${valid.join(", ")}`,
+      });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { marriageTimeline },
+      { new: true, runValidators: true }
+    );
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    return res.status(200).json({
+      message: "Marriage timeline updated successfully",
+      marriageTimeline: user.marriageTimeline,
+    });
+  } catch (error) {
+    console.error("Error updating marriage timeline:", error);
+    return res.status(500).json({
+      message: "Error updating marriage timeline",
+      error: error.message,
+    });
+  }
+});
+
+// Konkatsu onboarding: children preference
+app.put("/users/:userId/children-preference", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { childrenPreference } = req.body;
+
+    const valid = [
+      "want_children",
+      "dont_want_children",
+      "open_to_discussion",
+      "already_have_children",
+    ];
+
+    if (!childrenPreference || !valid.includes(childrenPreference)) {
+      return res.status(400).json({
+        message: `Invalid childrenPreference. Must be one of: ${valid.join(", ")}`,
+      });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { childrenPreference },
+      { new: true, runValidators: true }
+    );
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    return res.status(200).json({
+      message: "Children preference updated successfully",
+      childrenPreference: user.childrenPreference,
+    });
+  } catch (error) {
+    console.error("Error updating children preference:", error);
+    return res.status(500).json({
+      message: "Error updating children preference",
+      error: error.message,
+    });
+  }
+});
+
+// Konkatsu onboarding: relocation openness
+app.put("/users/:userId/relocation-openness", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { relocationOpenness } = req.body;
+
+    const valid = ["willing_to_relocate", "prefer_local", "open_to_discussion"];
+
+    if (!relocationOpenness || !valid.includes(relocationOpenness)) {
+      return res.status(400).json({
+        message: `Invalid relocationOpenness. Must be one of: ${valid.join(", ")}`,
+      });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { relocationOpenness },
+      { new: true, runValidators: true }
+    );
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    return res.status(200).json({
+      message: "Relocation openness updated successfully",
+      relocationOpenness: user.relocationOpenness,
+    });
+  } catch (error) {
+    console.error("Error updating relocation openness:", error);
+    return res.status(500).json({
+      message: "Error updating relocation openness",
+      error: error.message,
+    });
+  }
+});
+
 // DELETE route to remove an item from the lookingFor array
 app.delete("/users/:userId/lookingfor/remove", async (req, res) => {
   try {
@@ -1708,6 +1830,9 @@ app.get("/profiles", async (req, res) => {
       availability: 1,
       expectations: 1,
       lookingFor: 1,
+      marriageTimeline: 1,
+      childrenPreference: 1,
+      relocationOpenness: 1,
       distance: 1,
       priority: 1,
       createdAt: 1,
