@@ -18,6 +18,7 @@ const Notification = require("./models/Notification");
 const Rating = require("./models/Rating");
 const SuperFlirt = require("./models/SuperFlirt");
 const Boost = require("./models/Boost");
+const MissionStats = require("./models/MissionStats");
 const jwt = require("jsonwebtoken");
 const cloudinary = require("cloudinary");
 const app = express();
@@ -63,6 +64,44 @@ const interpolate = (str, params = {}) =>
 const userSockets = new Map();
 
 const userRoutes = require("./routes/userRoutes");
+const MISSION_STATS_SINGLETON_KEY = "global";
+const DEFAULT_MISSION_GOAL =
+  Number(process.env.MISSION_GOAL) > 0 ? Number(process.env.MISSION_GOAL) : 1000000;
+
+const ensureMissionStats = async () =>
+  MissionStats.findOneAndUpdate(
+    { singletonKey: MISSION_STATS_SINGLETON_KEY },
+    {
+      $setOnInsert: {
+        singletonKey: MISSION_STATS_SINGLETON_KEY,
+        goal: DEFAULT_MISSION_GOAL,
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+
+const incrementMissionStats = async ({
+  tablesCreatedDelta = 0,
+  strangersConnectedDelta = 0,
+}) => {
+  const hasIncrement = tablesCreatedDelta !== 0 || strangersConnectedDelta !== 0;
+  if (!hasIncrement) return ensureMissionStats();
+
+  return MissionStats.findOneAndUpdate(
+    { singletonKey: MISSION_STATS_SINGLETON_KEY },
+    {
+      $setOnInsert: {
+        singletonKey: MISSION_STATS_SINGLETON_KEY,
+        goal: DEFAULT_MISSION_GOAL,
+      },
+      $inc: {
+        tablesCreatedTotal: tablesCreatedDelta,
+        strangersConnectedTotal: strangersConnectedDelta,
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+};
 
 // Helper function to calculate distance between two coordinates
 function calculateDistance(lat1, lon1, lat2, lon2) {
@@ -420,6 +459,31 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 // Routes
 app.use("/api/users", userRoutes);
+
+app.get("/public/mission-stats", async (req, res) => {
+  try {
+    const stats = await ensureMissionStats();
+    const goal = Number(stats.goal) > 0 ? Number(stats.goal) : DEFAULT_MISSION_GOAL;
+    const strangersConnected = Math.max(0, Number(stats.strangersConnectedTotal) || 0);
+    const tablesCreated = Math.max(0, Number(stats.tablesCreatedTotal) || 0);
+    const progressPercent =
+      goal > 0 ? Math.min((strangersConnected / goal) * 100, 100) : 0;
+
+    return res.status(200).json({
+      strangersConnected,
+      tablesCreated,
+      goal,
+      progressPercent,
+      updatedAt: stats.updatedAt,
+    });
+  } catch (error) {
+    console.error("Error fetching mission stats:", error);
+    return res.status(500).json({
+      message: "Error fetching mission stats",
+      error: error.message,
+    });
+  }
+});
 
 // controllers
 const { getUnreadCounts } = require("./Controllers/conversationController");
@@ -5793,8 +5857,14 @@ const cleanupExpiredEvents = async () => {
     console.log(`[Event Cleanup] Starting cleanup at ${new Date().toISOString()}`);
     console.log(`[Event Cleanup] Deleting events with startTime before: ${cutoffDate.toISOString()}`);
 
-    const eventsToDelete = await Event.find({ startTime: { $lte: cutoffDate } }).select("participants");
+    const eventsToDelete = await Event.find({ startTime: { $lte: cutoffDate } }).select(
+      "_id participants missionStatsCounted"
+    );
     for (const event of eventsToDelete) {
+      if (event.missionStatsCounted) {
+        continue;
+      }
+
       const toCredit = (event.participants || []).filter(
         (p) => p && (p.status === "going" || p.status === "checked_in") && p.userId
       );
@@ -5808,6 +5878,10 @@ const cleanupExpiredEvents = async () => {
           }
         }
       }
+
+      await incrementMissionStats({
+        strangersConnectedDelta: toCredit.length,
+      });
 
       // Safety-net: backfill coAttendees for all checked-in pairs before deletion
       const checkedIn = (event.participants || []).filter(
@@ -5825,6 +5899,10 @@ const cleanupExpiredEvents = async () => {
           }
         }
       }
+
+      await Event.findByIdAndUpdate(event._id, {
+        $set: { missionStatsCounted: true },
+      });
     }
 
     const result = await Event.deleteMany({
@@ -6396,6 +6474,7 @@ app.post("/events", async (req, res) => {
 
     if (!isSuggestion) {
       await User.findByIdAndUpdate(hostId, { $inc: { eventsHosted: 1 } });
+      await incrementMissionStats({ tablesCreatedDelta: 1 });
     }
 
     // Populate host info for response (wrap in try-catch to ensure response is sent)

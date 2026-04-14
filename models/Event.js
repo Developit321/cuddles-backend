@@ -124,6 +124,10 @@ const eventSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    missionStatsCounted: {
+      type: Boolean,
+      default: false,
+    },
   },
   { timestamps: true }
 );
