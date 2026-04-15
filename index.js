@@ -6648,6 +6648,7 @@ app.put("/events/:eventId", async (req, res) => {
       tags,
       coverImage,
       audience,
+      requiresApproval,
     } = req.body;
 
     if (!mongoose.Types.ObjectId.isValid(eventId)) {
@@ -6709,12 +6710,19 @@ app.put("/events/:eventId", async (req, res) => {
     if (audience && ["everyone", "women_only", "men_only"].includes(audience)) {
       event.audience = audience;
     }
+    if (typeof requiresApproval === "boolean") {
+      event.requiresApproval = requiresApproval;
+    }
 
     await event.save();
 
     // Notify all participants (except host) about the update
     const participantIds = event.participants
-      .map((p) => p.userId.toString())
+      .map((p) => {
+        const participantUserId = p?.userId?._id || p?.userId;
+        return participantUserId?.toString();
+      })
+      .filter(Boolean)
       .filter((id) => id !== userId);
 
     for (const participantId of participantIds) {
@@ -7123,6 +7131,98 @@ app.get("/events/user/:userId", async (req, res) => {
   }
 });
 
+const hasUserInList = (list = [], targetUserId) => {
+  const normalizedTarget = targetUserId?.toString();
+  if (!normalizedTarget) return false;
+  return list.some((entry) => {
+    const rawUserId = entry?.userId?._id || entry?.userId || entry;
+    return rawUserId?.toString() === normalizedTarget;
+  });
+};
+
+const promoteNextWaitlistedUser = async (event) => {
+  if (event.requiresApproval) {
+    return { handled: false, promoted: false };
+  }
+
+  if (!Array.isArray(event.waitlist)) {
+    event.waitlist = [];
+  }
+
+  if (!Array.isArray(event.joinRequests)) {
+    event.joinRequests = [];
+  }
+
+  const hostUser = await User.findById(event.hostId)
+    .select("name blockedBy")
+    .lean();
+  const genderMap = { women_only: "female", men_only: "male" };
+  let promotedUser = null;
+
+  while (event.waitlist.length > 0) {
+    const nextInLine = event.waitlist.shift();
+    const candidateUserId =
+      nextInLine?.userId?._id || nextInLine?.userId || nextInLine;
+    const normalizedCandidateUserId = candidateUserId?.toString();
+
+    if (!normalizedCandidateUserId) continue;
+    if (!mongoose.Types.ObjectId.isValid(normalizedCandidateUserId)) continue;
+    if (hasUserInList(event.participants, normalizedCandidateUserId)) continue;
+    if (hasUserInList(event.joinRequests, normalizedCandidateUserId)) continue;
+
+    const candidate = await User.findById(normalizedCandidateUserId)
+      .select("name gender profileImages")
+      .lean();
+    if (!candidate) continue;
+    if (!candidate.profileImages || candidate.profileImages.length === 0) continue;
+
+    if (event.audience && event.audience !== "everyone") {
+      if (candidate.gender !== genderMap[event.audience]) continue;
+    }
+
+    const blockedByHost = (hostUser?.blockedBy || []).some(
+      (blockedId) => blockedId?.toString() === normalizedCandidateUserId
+    );
+    if (blockedByHost) continue;
+
+    event.participants.push({
+      userId: normalizedCandidateUserId,
+      status: "going",
+      joinedAt: new Date(),
+    });
+    promotedUser = {
+      userId: normalizedCandidateUserId,
+      name: candidate.name || "Someone",
+    };
+    break;
+  }
+
+  event.status = computeNextEventStatus(event);
+  await event.save();
+
+  if (promotedUser) {
+    try {
+      await createNotificationWithCaps({
+        userId: promotedUser.userId,
+        type: "event_joined",
+        title: "You're in!",
+        message: `A spot opened up for "${event.title}" and you've been added from the waitlist.`,
+        eventId: event._id,
+        eventName: event.title,
+        actorId: event.hostId,
+        actorName: hostUser?.name,
+      });
+    } catch (notifError) {
+      console.error(
+        "Error sending waitlist promotion notification:",
+        notifError
+      );
+    }
+  }
+
+  return { handled: true, promoted: !!promotedUser, promotedUser };
+};
+
 // Join event
 app.post("/events/:eventId/join", async (req, res) => {
   try {
@@ -7171,13 +7271,19 @@ app.post("/events/:eventId/join", async (req, res) => {
         .json({ message: "Cannot join ended or cancelled events" });
     }
 
-    if (event.status === "full") {
-      return res.status(400).json({ message: "Event is full" });
+    // Check if user is already a participant
+    if (!Array.isArray(event.participants)) {
+      event.participants = [];
+    }
+    if (!Array.isArray(event.joinRequests)) {
+      event.joinRequests = [];
+    }
+    if (!Array.isArray(event.waitlist)) {
+      event.waitlist = [];
     }
 
-    // Check if user is already a participant
-    const existingParticipant = event.participants.find(
-      (p) => p.userId.toString() === userId
+    const existingParticipant = event.participants.find((p) =>
+      hasUserInList([p], userId)
     );
     if (existingParticipant) {
       return res
@@ -7185,27 +7291,54 @@ app.post("/events/:eventId/join", async (req, res) => {
         .json({ message: "You have already joined this event" });
     }
 
+    const existingRequest = event.joinRequests.find((r) =>
+      hasUserInList([r], userId)
+    );
+    if (existingRequest) {
+      return res
+        .status(400)
+        .json({ message: "You have already requested to join this event" });
+    }
+
+    const existingWaitlistEntry = event.waitlist.find((w) =>
+      hasUserInList([w], userId)
+    );
+    if (existingWaitlistEntry) {
+      return res.status(400).json({
+        message: "You are already on the waitlist for this event",
+        waitlisted: true,
+      });
+    }
+
     // Check if user is blocked by host
     const host = await User.findById(event.hostId).select("blockedBy preferredLanguage");
-    if (host && host.blockedBy.includes(userId)) {
+    const blockedByHost = (host?.blockedBy || []).some(
+      (blockedId) => blockedId.toString() === userId
+    );
+    if (blockedByHost) {
       return res.status(403).json({ message: "You cannot join this event" });
+    }
+
+    if (event.status === "full") {
+      if (event.requiresApproval) {
+        return res.status(400).json({ message: "Event is full" });
+      }
+
+      event.waitlist.push({
+        userId,
+        createdAt: new Date(),
+      });
+      await event.save();
+
+      return res.status(200).json({
+        message: "Added to waitlist",
+        waitlisted: true,
+        waitlistPosition: event.waitlist.length,
+      });
     }
 
     // If event requires host approval, create a join request instead of adding participant
     if (event.requiresApproval) {
-      if (!Array.isArray(event.joinRequests)) {
-        event.joinRequests = [];
-      }
-
-      const existingRequest = event.joinRequests.find(
-        (r) => r.userId.toString() === userId
-      );
-      if (existingRequest) {
-        return res
-          .status(400)
-          .json({ message: "You have already requested to join this event" });
-      }
-
       event.joinRequests.push({
         userId,
         createdAt: new Date(),
@@ -7372,7 +7505,8 @@ app.post("/events/:eventId/join", async (req, res) => {
 
     const updatedEvent = await Event.findById(eventId)
       .populate("hostId", "name profileImages")
-      .populate("participants.userId", "name profileImages");
+      .populate("participants.userId", "name profileImages")
+      .populate("waitlist.userId", "name profileImages");
 
     res.status(200).json({
       message: "Successfully joined event",
@@ -7433,8 +7567,8 @@ app.post("/events/:eventId/join-request-by-email", async (req, res) => {
     const userId = joiningUser._id;
 
     // Make sure user is not already a participant
-    const existingParticipant = event.participants.find(
-      (p) => p.userId.toString() === userId.toString()
+    const existingParticipant = event.participants.find((p) =>
+      hasUserInList([p], userId)
     );
     if (existingParticipant) {
       return res
@@ -7448,8 +7582,8 @@ app.post("/events/:eventId/join-request-by-email", async (req, res) => {
     }
 
     // Check for an existing pending request
-    const existingRequest = event.joinRequests.find(
-      (r) => r.userId.toString() === userId.toString()
+    const existingRequest = event.joinRequests.find((r) =>
+      hasUserInList([r], userId)
     );
     if (existingRequest) {
       return res.status(400).json({
@@ -7731,8 +7865,8 @@ app.post(
         event.joinRequests = [];
       }
 
-      const requestIndex = event.joinRequests.findIndex(
-        (r) => r.userId.toString() === userId
+      const requestIndex = event.joinRequests.findIndex((r) =>
+        hasUserInList([r], userId)
       );
       if (requestIndex === -1) {
         return res
@@ -7802,8 +7936,8 @@ app.post(
         event.joinRequests = [];
       }
 
-      const requestIndex = event.joinRequests.findIndex(
-        (r) => r.userId.toString() === userId
+      const requestIndex = event.joinRequests.findIndex((r) =>
+        hasUserInList([r], userId)
       );
       if (requestIndex === -1) {
         return res
@@ -7876,16 +8010,21 @@ app.delete("/events/:eventId/leave", async (req, res) => {
     }
 
     event.participants.splice(participantIndex, 1);
-
-    // Update event status if it was full
-    if (event.status === "full") {
-      const now = new Date();
-      event.status = event.startTime <= now ? "live" : "upcoming";
+    const waitlistResult = await promoteNextWaitlistedUser(event);
+    if (!waitlistResult.handled) {
+      if (event.status === "full") {
+        const now = new Date();
+        event.status = event.startTime <= now ? "live" : "upcoming";
+      }
+      await event.save();
     }
 
-    await event.save();
-
-    res.status(200).json({ message: "Successfully left event" });
+    res.status(200).json({
+      message: "Successfully left event",
+      waitlistPromotion: waitlistResult.promoted
+        ? { userId: waitlistResult.promotedUser?.userId }
+        : null,
+    });
   } catch (error) {
     console.error("Error leaving event:", error);
     res.status(500).json({
@@ -7939,14 +8078,14 @@ app.delete("/events/:eventId/participants/:participantId", async (req, res) => {
     }
 
     event.participants.splice(participantIndex, 1);
-
-    // Update event status if it was full
-    if (event.status === "full") {
-      const now = new Date();
-      event.status = event.startTime <= now ? "live" : "upcoming";
+    const waitlistResult = await promoteNextWaitlistedUser(event);
+    if (!waitlistResult.handled) {
+      if (event.status === "full") {
+        const now = new Date();
+        event.status = event.startTime <= now ? "live" : "upcoming";
+      }
+      await event.save();
     }
-
-    await event.save();
 
     // Notify removed participant (in-app + push)
     try {
@@ -7967,7 +8106,12 @@ app.delete("/events/:eventId/participants/:participantId", async (req, res) => {
       console.error("Error sending notification:", notifError);
     }
 
-    res.status(200).json({ message: "Participant removed successfully" });
+    res.status(200).json({
+      message: "Participant removed successfully",
+      waitlistPromotion: waitlistResult.promoted
+        ? { userId: waitlistResult.promotedUser?.userId }
+        : null,
+    });
   } catch (error) {
     console.error("Error removing participant:", error);
     res.status(500).json({
@@ -8104,7 +8248,8 @@ app.get("/events/:eventId", async (req, res) => {
     let event = await Event.findById(eventId)
       .populate("hostId", "name profileImages gender")
       .populate("participants.userId", "name profileImages gender")
-      .populate("joinRequests.userId", "name profileImages gender");
+      .populate("joinRequests.userId", "name profileImages gender")
+      .populate("waitlist.userId", "name profileImages gender");
 
     if (!event) {
       return res.status(404).json({ message: "Event not found" });

@@ -82,6 +82,18 @@ const eventSchema = new mongoose.Schema(
         },
       },
     ],
+    waitlist: [
+      {
+        userId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "User",
+        },
+        createdAt: {
+          type: Date,
+          default: Date.now,
+        },
+      },
+    ],
     status: {
       type: String,
       enum: ["upcoming", "live", "full", "ended", "cancelled", "suggested"],
