@@ -6260,6 +6260,7 @@ app.put("/events/:eventId", async (req, res) => {
       tags,
       coverImage,
       audience,
+      requiresApproval,
     } = req.body;
 
     if (!mongoose.Types.ObjectId.isValid(eventId)) {
@@ -6320,6 +6321,9 @@ app.put("/events/:eventId", async (req, res) => {
     if (coverImage !== undefined) event.coverImage = coverImage;
     if (audience && ["everyone", "women_only", "men_only"].includes(audience)) {
       event.audience = audience;
+    }
+    if (typeof requiresApproval === "boolean") {
+      event.requiresApproval = requiresApproval;
     }
 
     await event.save();
