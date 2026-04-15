@@ -6890,8 +6890,8 @@ app.post("/events/:eventId/join", async (req, res) => {
       event.waitlist = [];
     }
 
-    const existingParticipant = event.participants.find(
-      (p) => p.userId.toString() === userId
+    const existingParticipant = event.participants.find((p) =>
+      hasUserInList([p], userId)
     );
     if (existingParticipant) {
       return res
@@ -6899,8 +6899,8 @@ app.post("/events/:eventId/join", async (req, res) => {
         .json({ message: "You have already joined this event" });
     }
 
-    const existingRequest = event.joinRequests.find(
-      (r) => r.userId.toString() === userId
+    const existingRequest = event.joinRequests.find((r) =>
+      hasUserInList([r], userId)
     );
     if (existingRequest) {
       return res
@@ -6908,8 +6908,8 @@ app.post("/events/:eventId/join", async (req, res) => {
         .json({ message: "You have already requested to join this event" });
     }
 
-    const existingWaitlistEntry = event.waitlist.find(
-      (w) => w.userId.toString() === userId
+    const existingWaitlistEntry = event.waitlist.find((w) =>
+      hasUserInList([w], userId)
     );
     if (existingWaitlistEntry) {
       return res.status(400).json({
@@ -7175,8 +7175,8 @@ app.post("/events/:eventId/join-request-by-email", async (req, res) => {
     const userId = joiningUser._id;
 
     // Make sure user is not already a participant
-    const existingParticipant = event.participants.find(
-      (p) => p.userId.toString() === userId.toString()
+    const existingParticipant = event.participants.find((p) =>
+      hasUserInList([p], userId)
     );
     if (existingParticipant) {
       return res
@@ -7190,8 +7190,8 @@ app.post("/events/:eventId/join-request-by-email", async (req, res) => {
     }
 
     // Check for an existing pending request
-    const existingRequest = event.joinRequests.find(
-      (r) => r.userId.toString() === userId.toString()
+    const existingRequest = event.joinRequests.find((r) =>
+      hasUserInList([r], userId)
     );
     if (existingRequest) {
       return res.status(400).json({
@@ -7473,8 +7473,8 @@ app.post(
         event.joinRequests = [];
       }
 
-      const requestIndex = event.joinRequests.findIndex(
-        (r) => r.userId.toString() === userId
+      const requestIndex = event.joinRequests.findIndex((r) =>
+        hasUserInList([r], userId)
       );
       if (requestIndex === -1) {
         return res
@@ -7544,8 +7544,8 @@ app.post(
         event.joinRequests = [];
       }
 
-      const requestIndex = event.joinRequests.findIndex(
-        (r) => r.userId.toString() === userId
+      const requestIndex = event.joinRequests.findIndex((r) =>
+        hasUserInList([r], userId)
       );
       if (requestIndex === -1) {
         return res
