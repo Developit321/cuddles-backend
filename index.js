@@ -13,6 +13,7 @@ const SharedQuestion = require("./models/SharedQuestion");
 const Question = require("./models/ Question");
 const Message = require("./models/message");
 const Event = require("./models/Event");
+const HostPayoutProfile = require("./models/HostPayoutProfile");
 const EventMessage = require("./models/EventMessage");
 const Notification = require("./models/Notification");
 const Rating = require("./models/Rating");
@@ -64,6 +65,7 @@ const interpolate = (str, params = {}) =>
 const userSockets = new Map();
 
 const userRoutes = require("./routes/userRoutes");
+const createPaymentRoutes = require("./routes/paymentRoutes");
 const MISSION_STATS_SINGLETON_KEY = "global";
 const DEFAULT_MISSION_GOAL =
   Number(process.env.MISSION_GOAL) > 0 ? Number(process.env.MISSION_GOAL) : 1000000;
@@ -456,7 +458,13 @@ if (nearbyQueue) {
 
 app.use(cors());
 app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
+app.use(
+  bodyParser.json({
+    verify: (req, _res, buf) => {
+      req.rawBody = buf.toString("utf8");
+    },
+  })
+);
 // Routes
 app.use("/api/users", userRoutes);
 
@@ -1167,12 +1175,13 @@ app.get("/verify/:token", async (req, res) => {
   }
 });
 
-const generateSecreteKey = () => {
-  const secretKey = crypto.randomBytes(32).toString("hex");
-  return secretKey;
-};
-
-const secretKey = generateSecreteKey();
+const secretKey =
+  process.env.JWT_SECRET || "dev-local-jwt-secret-change-me";
+if (!process.env.JWT_SECRET) {
+  console.warn(
+    "[Auth] JWT_SECRET is not set; using development fallback secret."
+  );
+}
 
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
@@ -1188,6 +1197,8 @@ function requireAuth(req, res, next) {
     return res.status(401).json({ message: "Invalid or expired token" });
   }
 }
+
+app.use("/", createPaymentRoutes(requireAuth));
 
 //login user
 
@@ -6353,6 +6364,10 @@ app.post("/events", async (req, res) => {
       expiresAt,
       audience,
       requiresApproval,
+      isPaid,
+      priceAmount,
+      currency,
+      paymentPolicy,
     } = req.body;
 
     // Validate required fields
@@ -6402,6 +6417,27 @@ app.post("/events", async (req, res) => {
     }
     if (audience === "men_only" && host.gender !== "male") {
       return res.status(400).json({ message: "Only men can create men-only events" });
+    }
+
+    const normalizedIsPaid = Boolean(isPaid);
+    const normalizedPriceAmount = Number(priceAmount || 0);
+    const normalizedCurrency = (currency || "ZAR").toUpperCase();
+    const normalizedPaymentPolicy =
+      paymentPolicy === "pay_after_approval" ? "pay_after_approval" : "pay_before_join";
+
+    if (normalizedIsPaid) {
+      if (!Number.isFinite(normalizedPriceAmount) || normalizedPriceAmount <= 0) {
+        return res.status(400).json({
+          message: "Paid events require a valid priceAmount greater than 0",
+        });
+      }
+
+      const hostPayoutProfile = await HostPayoutProfile.findOne({ userId: hostId }).lean();
+      if (!hostPayoutProfile || hostPayoutProfile.status !== "active") {
+        return res.status(403).json({
+          message: "Host payout profile must be active to create paid events",
+        });
+      }
     }
 
     // Check if this is a suggestion (single or group)
@@ -6456,6 +6492,10 @@ app.post("/events", async (req, res) => {
       tags: tags || [],
       audience: audience || "everyone",
       requiresApproval: !!requiresApproval,
+      isPaid: normalizedIsPaid,
+      priceAmount: normalizedIsPaid ? Math.round(normalizedPriceAmount) : 0,
+      currency: normalizedCurrency,
+      paymentPolicy: normalizedPaymentPolicy,
       // For suggestions, don't add participants yet (wait for acceptance)
       participants: isSuggestion ? [] : [
         {
@@ -6649,6 +6689,10 @@ app.put("/events/:eventId", async (req, res) => {
       coverImage,
       audience,
       requiresApproval,
+      isPaid,
+      priceAmount,
+      currency,
+      paymentPolicy,
     } = req.body;
 
     if (!mongoose.Types.ObjectId.isValid(eventId)) {
@@ -6712,6 +6756,47 @@ app.put("/events/:eventId", async (req, res) => {
     }
     if (typeof requiresApproval === "boolean") {
       event.requiresApproval = requiresApproval;
+    }
+    if (typeof isPaid === "boolean") {
+      if (isPaid) {
+        const normalizedPriceAmount = Number(priceAmount ?? event.priceAmount);
+        if (!Number.isFinite(normalizedPriceAmount) || normalizedPriceAmount <= 0) {
+          return res.status(400).json({
+            message: "Paid events require a valid priceAmount greater than 0",
+          });
+        }
+        const hostPayoutProfile = await HostPayoutProfile.findOne({ userId }).lean();
+        if (!hostPayoutProfile || hostPayoutProfile.status !== "active") {
+          return res.status(403).json({
+            message: "Host payout profile must be active to enable paid events",
+          });
+        }
+        event.isPaid = true;
+        event.priceAmount = Math.round(normalizedPriceAmount);
+        event.currency = (currency || event.currency || "ZAR").toUpperCase();
+        event.paymentPolicy =
+          paymentPolicy === "pay_after_approval" ? "pay_after_approval" : "pay_before_join";
+      } else {
+        event.isPaid = false;
+        event.priceAmount = 0;
+      }
+    } else {
+      if (priceAmount !== undefined && event.isPaid) {
+        const normalizedPriceAmount = Number(priceAmount);
+        if (!Number.isFinite(normalizedPriceAmount) || normalizedPriceAmount <= 0) {
+          return res.status(400).json({
+            message: "Paid events require a valid priceAmount greater than 0",
+          });
+        }
+        event.priceAmount = Math.round(normalizedPriceAmount);
+      }
+      if (currency && event.isPaid) {
+        event.currency = String(currency).toUpperCase();
+      }
+      if (paymentPolicy && event.isPaid) {
+        event.paymentPolicy =
+          paymentPolicy === "pay_after_approval" ? "pay_after_approval" : "pay_before_join";
+      }
     }
 
     await event.save();
