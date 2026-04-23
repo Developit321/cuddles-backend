@@ -53,6 +53,26 @@ const eventSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    isPaid: {
+      type: Boolean,
+      default: false,
+    },
+    priceAmount: {
+      type: Number,
+      min: 0,
+      default: 0,
+    },
+    currency: {
+      type: String,
+      default: "ZAR",
+      uppercase: true,
+      trim: true,
+    },
+    paymentPolicy: {
+      type: String,
+      enum: ["pay_before_join", "pay_after_approval"],
+      default: "pay_before_join",
+    },
     participants: [
       {
         userId: {
