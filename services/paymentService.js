@@ -518,6 +518,7 @@ const handleProviderWebhook = async ({
   rawBody,
   signature,
   parsedBody,
+  webhookHeaders = {},
 }) => {
   const provider = getPaymentProvider(providerName || getActiveProviderName());
   const secret =
@@ -526,7 +527,12 @@ const handleProviderWebhook = async ({
       : provider.getName() === "stitch"
         ? process.env.STITCH_WEBHOOK_SECRET
         : "mock";
-  const isValid = provider.verifyWebhookSignature(rawBody, signature, secret);
+  const isValid = provider.verifyWebhookSignature(
+    rawBody,
+    signature,
+    secret,
+    webhookHeaders
+  );
   if (!isValid) {
     const err = new Error("Invalid webhook signature");
     err.status = 401;

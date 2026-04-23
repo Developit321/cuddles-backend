@@ -259,12 +259,40 @@ class StitchProvider extends PaymentProvider {
     };
   }
 
-  verifyWebhookSignature(rawBody, signature, secretKey) {
+  verifyWebhookSignature(rawBody, signature, secretKey, metadata = {}) {
     if (!signature || !secretKey || !rawBody) return false;
-    const computed = crypto
-      .createHmac("sha256", secretKey)
-      .update(rawBody)
-      .digest("hex");
+
+    const svixId = String(metadata?.svixId || "").trim();
+    const svixTimestamp = String(metadata?.svixTimestamp || "").trim();
+
+    // Stitch webhooks are delivered with Svix headers/signatures.
+    // Signed content format: `${svix-id}.${svix-timestamp}.${rawBody}`
+    if (svixId && svixTimestamp && String(signature).includes("v1,")) {
+      const rawSecret = String(secretKey || "");
+      const keyMaterial = rawSecret.startsWith("whsec_")
+        ? Buffer.from(rawSecret.slice(6), "base64")
+        : Buffer.from(rawSecret, "utf8");
+
+      const payload = `${svixId}.${svixTimestamp}.${rawBody}`;
+      const expected = crypto.createHmac("sha256", keyMaterial).update(payload).digest("base64");
+
+      const candidates = [];
+      const regex = /v1,([A-Za-z0-9+/=]+)/g;
+      let match = regex.exec(String(signature));
+      while (match) {
+        candidates.push(match[1]);
+        match = regex.exec(String(signature));
+      }
+
+      return candidates.some((candidate) => {
+        const a = Buffer.from(candidate);
+        const b = Buffer.from(expected);
+        return a.length === b.length && crypto.timingSafeEqual(a, b);
+      });
+    }
+
+    // Backward-compatible fallback for non-Svix style signatures.
+    const computed = crypto.createHmac("sha256", secretKey).update(rawBody).digest("hex");
     return computed === signature;
   }
 

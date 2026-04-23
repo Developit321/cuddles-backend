@@ -211,12 +211,19 @@ router.post("/webhooks/payments/:provider", async (req, res) => {
       req.rawBody ||
       (typeof req.body === "string" ? req.body : JSON.stringify(req.body || {}));
     const signature =
-      req.headers["x-stitch-signature"] || req.headers["x-paystack-signature"] || "";
+      req.headers["svix-signature"] ||
+      req.headers["x-stitch-signature"] ||
+      req.headers["x-paystack-signature"] ||
+      "";
     const result = await handleProviderWebhook({
       providerName,
       rawBody,
       signature,
       parsedBody: req.body,
+      webhookHeaders: {
+        svixId: req.headers["svix-id"] || "",
+        svixTimestamp: req.headers["svix-timestamp"] || "",
+      },
     });
     return res.status(200).json(result);
   } catch (error) {
