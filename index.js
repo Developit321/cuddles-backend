@@ -67,6 +67,7 @@ const userSockets = new Map();
 
 const userRoutes = require("./routes/userRoutes");
 const createPaymentRoutes = require("./routes/paymentRoutes");
+const { createRefund } = require("./services/paymentService");
 const MISSION_STATS_SINGLETON_KEY = "global";
 const DEFAULT_MISSION_GOAL =
   Number(process.env.MISSION_GOAL) > 0 ? Number(process.env.MISSION_GOAL) : 1000000;
@@ -6913,6 +6914,73 @@ app.delete("/events/:eventId", async (req, res) => {
     const participantIds = event.participants
       .map((p) => p.userId.toString())
       .filter((id) => id !== userId);
+    const refundSummary = {
+      attempted: 0,
+      successful: 0,
+      failed: 0,
+      skipped: 0,
+      results: [],
+    };
+
+    if (event.isPaid) {
+      const paidPayments = await EventPayment.find({
+        eventId: event._id,
+        status: "paid",
+      })
+        .sort({ paidAt: -1, createdAt: -1 })
+        .lean();
+
+      // Refund each participant at most once (latest paid record per user).
+      const latestPaidByUser = new Map();
+      for (const payment of paidPayments) {
+        const participantId = String(payment.userId);
+        if (!latestPaidByUser.has(participantId)) {
+          latestPaidByUser.set(participantId, payment);
+        }
+      }
+
+      for (const [participantId, payment] of latestPaidByUser.entries()) {
+        refundSummary.attempted += 1;
+        try {
+          const refund = await createRefund({
+            eventId: event._id.toString(),
+            reference: payment.providerReference,
+            requesterUserId: userId,
+            refundType: "ticket_only",
+            reason: "Host cancelled paid event",
+          });
+          refundSummary.successful += 1;
+          refundSummary.results.push({
+            userId: participantId,
+            reference: payment.providerReference,
+            status: "refunded",
+            amount: refund?.amount || 0,
+          });
+        } catch (refundError) {
+          const message = String(refundError?.message || "");
+          if (
+            message.includes("Only paid payments can be refunded") ||
+            message.includes("Payment not found")
+          ) {
+            refundSummary.skipped += 1;
+            refundSummary.results.push({
+              userId: participantId,
+              reference: payment.providerReference,
+              status: "skipped",
+              reason: message,
+            });
+          } else {
+            refundSummary.failed += 1;
+            refundSummary.results.push({
+              userId: participantId,
+              reference: payment.providerReference,
+              status: "failed",
+              reason: message || "Refund failed",
+            });
+          }
+        }
+      }
+    }
 
     // Notify all participants (except host) about cancellation before deleting
     for (const participantId of participantIds) {
@@ -6945,7 +7013,10 @@ app.delete("/events/:eventId", async (req, res) => {
 
     console.log(`[Event Delete] Successfully deleted event ${eventId}`);
 
-    res.status(200).json({ message: "Event cancelled and deleted successfully" });
+    res.status(200).json({
+      message: "Event cancelled and deleted successfully",
+      refunds: refundSummary,
+    });
   } catch (error) {
     console.error("Error cancelling event:", error);
     res.status(500).json({
@@ -8248,28 +8319,100 @@ app.delete("/events/:eventId/leave", async (req, res) => {
       });
     }
 
-    // Find and remove participant
-    const participantIndex = event.participants.findIndex(
-      (p) => p.userId.toString() === userId
-    );
-    if (participantIndex === -1) {
+    const isParticipant = event.participants.some((p) => p.userId.toString() === userId);
+    if (!isParticipant) {
       return res
         .status(404)
         .json({ message: "You are not a participant of this event" });
     }
 
-    event.participants.splice(participantIndex, 1);
-    const waitlistResult = await promoteNextWaitlistedUser(event);
-    if (!waitlistResult.handled) {
-      if (event.status === "full") {
-        const now = new Date();
-        event.status = event.startTime <= now ? "live" : "upcoming";
+    const now = new Date();
+    const startTime =
+      event.startTime && !Number.isNaN(new Date(event.startTime).getTime())
+        ? new Date(event.startTime)
+        : null;
+    const msUntilStart = startTime ? startTime.getTime() - now.getTime() : null;
+    const eventAlreadyLive =
+      event.status === "live" || event.status === "ended" || (msUntilStart != null && msUntilStart <= 0);
+    const eligibleEarlyWindow = msUntilStart != null && msUntilStart > 24 * 60 * 60 * 1000;
+
+    let refundEligible = false;
+    let refundProcessed = false;
+    let refundAmount = 0;
+    let refundReason = "not_paid_event";
+    let refundReference = "";
+
+    if (event.isPaid) {
+      if (eventAlreadyLive) {
+        refundReason = "live_no_refund";
+      } else if (eligibleEarlyWindow) {
+        refundEligible = true;
+        refundReason = "outside_24h_refund_window";
+      } else {
+        refundReason = "within_24h_no_refund";
       }
-      await event.save();
+    }
+
+    if (refundEligible) {
+      const payment = await EventPayment.findOne({
+        eventId: event._id,
+        userId,
+        status: "paid",
+      })
+        .sort({ paidAt: -1, createdAt: -1 })
+        .lean();
+
+      if (!payment) {
+        refundReason = "no_paid_record";
+      } else {
+        refundReference = payment.providerReference || "";
+        try {
+          const refundResult = await createRefund({
+            eventId: event._id.toString(),
+            reference: payment.providerReference,
+            requesterUserId: userId,
+            refundType: "ticket_only",
+            reason: "Attendee left event more than 24 hours before start",
+          });
+          refundProcessed = true;
+          refundAmount = Number(refundResult?.amount) || 0;
+          refundReason = "ticket_only_refund_processed";
+        } catch (refundError) {
+          refundReason = String(refundError?.message || "refund_failed");
+        }
+      }
+    }
+
+    const targetEvent = await Event.findById(eventId);
+    if (!targetEvent) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    const participantStillPresent = (targetEvent.participants || []).some(
+      (p) => p?.userId?.toString() === userId
+    );
+    if (participantStillPresent) {
+      targetEvent.participants = (targetEvent.participants || []).filter(
+        (p) => p?.userId?.toString() !== userId
+      );
+    }
+
+    const waitlistResult = await promoteNextWaitlistedUser(targetEvent);
+    if (!waitlistResult.handled) {
+      if (targetEvent.status === "full") {
+        const statusNow = new Date();
+        targetEvent.status = targetEvent.startTime <= statusNow ? "live" : "upcoming";
+      }
+      await targetEvent.save();
     }
 
     res.status(200).json({
       message: "Successfully left event",
+      refundEligible,
+      refundProcessed,
+      refundAmount,
+      refundReference,
+      refundReason,
       waitlistPromotion: waitlistResult.promoted
         ? { userId: waitlistResult.promotedUser?.userId }
         : null,

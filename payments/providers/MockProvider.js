@@ -41,6 +41,17 @@ class MockProvider extends PaymentProvider {
     };
   }
 
+  async refundTransaction({ reference, amount }) {
+    return {
+      provider: this.getName(),
+      reference,
+      status: "refunded",
+      refundedAt: new Date(),
+      amount: Number(amount) || 0,
+      payload: { simulated: true },
+    };
+  }
+
   verifyWebhookSignature() {
     // Mock provider always accepts signatures.
     return true;

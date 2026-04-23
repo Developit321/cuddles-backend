@@ -329,6 +329,158 @@ const verifyPayment = async ({ eventId, reference }) => {
   };
 };
 
+const createRefund = async ({
+  eventId,
+  reference,
+  requesterUserId,
+  amount,
+  reason = "",
+  refundType = "ticket_only",
+}) => {
+  if (
+    !mongoose.Types.ObjectId.isValid(eventId) ||
+    !mongoose.Types.ObjectId.isValid(requesterUserId)
+  ) {
+    const err = new Error("Invalid ID format");
+    err.status = 400;
+    throw err;
+  }
+  if (!reference) {
+    const err = new Error("Reference is required");
+    err.status = 400;
+    throw err;
+  }
+
+  const payment = await EventPayment.findOne({
+    eventId,
+    providerReference: reference,
+  });
+  if (!payment) {
+    const err = new Error("Payment not found");
+    err.status = 404;
+    throw err;
+  }
+  if (payment.status !== "paid") {
+    const err = new Error("Only paid payments can be refunded");
+    err.status = 400;
+    throw err;
+  }
+
+  const event = await Event.findById(eventId).select("hostId participants");
+  if (!event) {
+    const err = new Error("Event not found");
+    err.status = 404;
+    throw err;
+  }
+
+  const requesterId = String(requesterUserId);
+  const isPayer = String(payment.userId) === requesterId;
+  const isHost = String(event.hostId) === requesterId;
+  if (!isPayer && !isHost) {
+    const err = new Error("Only the payer or host can trigger a refund");
+    err.status = 403;
+    throw err;
+  }
+
+  const normalizedRefundType = String(refundType || "ticket_only").trim().toLowerCase();
+  const ticketAmount = Math.max(
+    0,
+    Math.round(
+      Number.isFinite(Number(payment.baseAmount)) ? Number(payment.baseAmount) : Number(payment.amount)
+    )
+  );
+  const totalPaidAmount = Math.max(0, Math.round(Number(payment.amount) || 0));
+  const requestedAmount = Number(amount);
+
+  let refundAmount = 0;
+  if (Number.isFinite(requestedAmount) && requestedAmount > 0) {
+    refundAmount = Math.round(requestedAmount);
+  } else if (normalizedRefundType === "ticket_only") {
+    refundAmount = ticketAmount;
+  } else if (normalizedRefundType === "full") {
+    refundAmount = totalPaidAmount;
+  } else if (normalizedRefundType === "custom") {
+    const err = new Error("Custom refunds require a positive amount");
+    err.status = 400;
+    throw err;
+  } else {
+    const err = new Error("Invalid refundType. Use ticket_only, full, or custom");
+    err.status = 400;
+    throw err;
+  }
+
+  // Margin-safe policy: attendee-initiated refunds are capped at ticket-only.
+  if (isPayer && !isHost) {
+    if (normalizedRefundType === "full" || normalizedRefundType === "custom") {
+      const err = new Error("Only hosts can request full or custom refunds");
+      err.status = 403;
+      throw err;
+    }
+    if (refundAmount > ticketAmount) {
+      const err = new Error("Attendee refunds cannot exceed ticket amount");
+      err.status = 403;
+      throw err;
+    }
+  }
+
+  if (refundAmount <= 0) {
+    const err = new Error("Refund amount must be a positive number");
+    err.status = 400;
+    throw err;
+  }
+  if (refundAmount > totalPaidAmount) {
+    const err = new Error("Refund amount cannot exceed paid amount");
+    err.status = 400;
+    throw err;
+  }
+
+  const provider = getPaymentProvider(payment.provider);
+  const refundResult = await provider.refundTransaction({
+    reference: payment.providerReference,
+    amount: refundAmount,
+    reason,
+    eventId: String(payment.eventId),
+    userId: String(payment.userId),
+  });
+
+  payment.status = "refunded";
+  payment.refundedAt = refundResult.refundedAt || new Date();
+  payment.providerPayload = {
+    ...(payment.providerPayload || {}),
+    refund: refundResult.payload || {
+      reference: payment.providerReference,
+      amount: refundAmount,
+      reason: reason || "Event refund",
+      refundType: normalizedRefundType,
+      requestedBy: requesterId,
+    },
+  };
+
+  if (payment.admissionStatus === "admitted" || payment.admissionStatus === "pending_payment") {
+    payment.admissionStatus = "expired";
+    const participantIndex = Array.isArray(event.participants)
+      ? event.participants.findIndex(
+          (participant) => participant?.userId?.toString() === payment.userId.toString()
+        )
+      : -1;
+    if (participantIndex >= 0) {
+      event.participants.splice(participantIndex, 1);
+      await event.save();
+    }
+  }
+
+  await payment.save();
+
+  return {
+    provider: payment.provider,
+    reference: payment.providerReference,
+    status: payment.status,
+    refundedAt: payment.refundedAt,
+    amount: refundAmount,
+    refundType: normalizedRefundType,
+  };
+};
+
 const applyForHostPayout = async ({ userId, payload }) => {
   console.log("[paymentService.applyForHostPayout] start", {
     userId,
@@ -614,6 +766,7 @@ module.exports = {
   createQuote,
   initializePayment,
   verifyPayment,
+  createRefund,
   getPaymentStatus,
   applyForHostPayout,
   getHostPayoutStatus,

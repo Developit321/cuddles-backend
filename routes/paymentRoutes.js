@@ -3,6 +3,7 @@ const {
   createQuote,
   initializePayment,
   verifyPayment,
+  createRefund,
   getPaymentStatus,
   applyForHostPayout,
   getHostPayoutStatus,
@@ -185,6 +186,26 @@ router.get("/events/:eventId/payments/verify/:reference", async (req, res) => {
   } catch (error) {
     return res.status(error.status || 500).json({
       message: error.message || "Failed to verify payment",
+    });
+  }
+});
+
+router.post("/events/:eventId/payments/refund/:reference", async (req, res) => {
+  try {
+    const { eventId, reference } = req.params;
+    const { requesterUserId, amount, reason = "", refundType = "ticket_only" } = req.body;
+    const result = await createRefund({
+      eventId,
+      reference,
+      requesterUserId,
+      amount,
+      reason,
+      refundType,
+    });
+    return res.status(200).json(result);
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      message: error.message || "Failed to create refund",
     });
   }
 });

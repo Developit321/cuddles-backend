@@ -33,6 +33,12 @@ class PaystackProvider extends PaymentProvider {
     };
   }
 
+  async refundTransaction() {
+    const err = new Error("Paystack refunds are not wired yet");
+    err.status = 501;
+    throw err;
+  }
+
   verifyWebhookSignature(rawBody, signature, secretKey) {
     if (!signature || !secretKey) return false;
     const hash = crypto
