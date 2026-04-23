@@ -49,6 +49,10 @@ class StitchProvider extends PaymentProvider {
     return (process.env.STITCH_PAYMENT_BY_ID_PATH || "/api/v1/payment/{id}").trim();
   }
 
+  getRefundPathTemplate() {
+    return (process.env.STITCH_REFUND_PATH || "/api/v1/payment/{id}/refund").trim();
+  }
+
   static tokenCache = {
     value: "",
     expiresAt: 0,
@@ -255,6 +259,57 @@ class StitchProvider extends PaymentProvider {
       reference: data.id || reference,
       status: this.mapPaymentStatus(data.status),
       paidAt: data.paidAt ? new Date(data.paidAt) : null,
+      payload: data,
+    };
+  }
+
+  async refundTransaction(payload = {}) {
+    const reference = String(payload.reference || "").trim();
+    if (!reference) {
+      const err = new Error("Stitch refund requires a payment reference");
+      err.status = 400;
+      throw err;
+    }
+
+    const amount = Number(payload.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      const err = new Error("Refund amount must be a positive number");
+      err.status = 400;
+      throw err;
+    }
+
+    const baseUrl = this.getBaseUrl();
+    const path = this.getRefundPathTemplate().replace("{id}", encodeURIComponent(reference));
+    const requestBody = {
+      amount: Math.round(amount),
+      reason: String(payload.reason || "Event refund").slice(0, 200),
+    };
+
+    let data;
+    try {
+      const response = await axios.post(`${baseUrl}${path}`, requestBody, {
+        timeout: 15000,
+        headers: await this.buildAuthHeaders(),
+      });
+      data = response?.data?.data || response?.data || {};
+    } catch (error) {
+      const detail =
+        error?.response?.data?.message ||
+        (error?.response?.data ? JSON.stringify(error.response.data) : "");
+      const providerError = new Error(
+        detail ||
+          `Stitch refund failed (${error?.response?.status || "unknown"}) at ${baseUrl}${path}`
+      );
+      providerError.status = error?.response?.status || 502;
+      throw providerError;
+    }
+
+    return {
+      provider: this.getName(),
+      reference,
+      status: "refunded",
+      refundedAt: data.refundedAt ? new Date(data.refundedAt) : new Date(),
+      amount: requestBody.amount,
       payload: data,
     };
   }

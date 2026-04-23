@@ -15,6 +15,10 @@ class PaymentProvider {
     throw new Error("verifyTransaction() must be implemented");
   }
 
+  async refundTransaction() {
+    throw new Error("refundTransaction() must be implemented");
+  }
+
   verifyWebhookSignature() {
     throw new Error("verifyWebhookSignature() must be implemented");
   }
