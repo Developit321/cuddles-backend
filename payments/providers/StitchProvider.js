@@ -122,12 +122,33 @@ class StitchProvider extends PaymentProvider {
     return String(candidate).trim().slice(0, 40);
   }
 
+  getRedirectBridgeUrl() {
+    return (process.env.STITCH_REDIRECT_BRIDGE_URL || "").trim();
+  }
+
+  normalizeCallbackUrl(callbackUrl) {
+    if (!callbackUrl) return "";
+    if (/^https?:\/\//i.test(callbackUrl)) return callbackUrl;
+
+    const bridge = this.getRedirectBridgeUrl();
+    if (!bridge) return "";
+    try {
+      const bridgeUrl = new URL(bridge);
+      bridgeUrl.searchParams.set("deep_link", callbackUrl);
+      return bridgeUrl.toString();
+    } catch (_) {
+      return "";
+    }
+  }
+
   withRedirectUrl(checkoutUrl, callbackUrl) {
-    if (!checkoutUrl || !callbackUrl) return checkoutUrl || "";
+    if (!checkoutUrl) return "";
+    const normalizedCallback = this.normalizeCallbackUrl(callbackUrl);
+    if (!normalizedCallback) return checkoutUrl;
     try {
       const url = new URL(checkoutUrl);
       if (!url.searchParams.get("redirect_url")) {
-        url.searchParams.set("redirect_url", callbackUrl);
+        url.searchParams.set("redirect_url", normalizedCallback);
       }
       return url.toString();
     } catch (_) {
