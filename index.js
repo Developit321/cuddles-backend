@@ -1201,6 +1201,45 @@ function requireAuth(req, res, next) {
 
 app.use("/", createPaymentRoutes(requireAuth));
 
+// HTTPS redirect bridge for payment providers that require http/https redirects.
+// Usage example:
+// https://your-api-domain/stitch/redirect?deep_link=cuddles-events://event/123
+app.get("/stitch/redirect", (req, res) => {
+  const deepLink = String(req.query.deep_link || "").trim();
+  if (!deepLink) {
+    return res
+      .status(400)
+      .send("Missing deep_link query parameter for app redirect.");
+  }
+
+  const escapedDeepLink = deepLink.replace(/'/g, "\\'");
+  return res
+    .status(200)
+    .set("Content-Type", "text/html; charset=utf-8")
+    .send(`<!doctype html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Returning to Cuddles</title>
+    <style>
+      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 24px; color: #111; }
+      button { border: 0; border-radius: 10px; padding: 12px 16px; background: #111827; color: #fff; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <p>Returning you to the app...</p>
+    <button onclick="window.location.href='${escapedDeepLink}'">Open Cuddles</button>
+    <script>
+      window.location.href = '${escapedDeepLink}';
+      setTimeout(function () {
+        var btn = document.querySelector('button');
+        if (btn) btn.style.display = 'inline-block';
+      }, 1200);
+    </script>
+  </body>
+</html>`);
+});
+
 //login user
 
 app.post("/login", async (req, res) => {
