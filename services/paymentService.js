@@ -24,6 +24,38 @@ function normalizeHostPayoutStatus(value) {
 
 const QUOTE_TTL_MS = 10 * 60 * 1000;
 const quoteStore = new Map();
+const ACTIVE_CHECKOUT_STATUSES = new Set(["initialized", "pending"]);
+const SUCCESS_STATES = new Set(["paid", "success", "completed"]);
+
+const grantAdmissionForPaidPayment = async (payment) => {
+  if (!payment || payment.admissionStatus !== "pending_payment") return;
+  const event = await Event.findById(payment.eventId);
+  if (!event) return;
+
+  if (!Array.isArray(event.participants)) {
+    event.participants = [];
+  }
+
+  const participantIndex = event.participants.findIndex(
+    (p) => p?.userId?.toString() === payment.userId.toString()
+  );
+
+  if (participantIndex === -1) {
+    event.participants.push({
+      userId: payment.userId,
+      status: "going",
+      joinedAt: new Date(),
+    });
+  } else {
+    event.participants[participantIndex].status = "going";
+    if (!event.participants[participantIndex].joinedAt) {
+      event.participants[participantIndex].joinedAt = new Date();
+    }
+  }
+
+  await event.save();
+  payment.admissionStatus = "admitted";
+};
 
 const ensureFeePolicy = async () => {
   return FeePolicy.findOneAndUpdate(
@@ -123,6 +155,25 @@ const readValidQuote = ({ quoteId, eventId, userId }) => {
   return record;
 };
 
+const normalizePaymentStatus = (value) => {
+  const raw = String(value || "").toLowerCase();
+  if (SUCCESS_STATES.has(raw)) return "paid";
+  if (raw === "failed") return "failed";
+  if (raw === "expired") return "expired";
+  return "pending";
+};
+
+const findActiveCheckout = async ({ eventId, userId }) => {
+  const now = new Date();
+  return EventPayment.findOne({
+    eventId,
+    userId,
+    status: { $in: Array.from(ACTIVE_CHECKOUT_STATUSES) },
+    "providerPayload.holdOnly": { $ne: true },
+    $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
+  }).sort({ createdAt: -1 });
+};
+
 const initializePayment = async ({ eventId, userId, quoteId, callbackUrl }) => {
   if (!mongoose.Types.ObjectId.isValid(eventId) || !mongoose.Types.ObjectId.isValid(userId)) {
     const err = new Error("Invalid ID format");
@@ -156,6 +207,24 @@ const initializePayment = async ({ eventId, userId, quoteId, callbackUrl }) => {
     throw err;
   }
 
+  const activeCheckout = await findActiveCheckout({ eventId, userId });
+  if (activeCheckout) {
+    return {
+      paymentId: activeCheckout._id,
+      provider: activeCheckout.provider,
+      reference: activeCheckout.providerReference,
+      authorizationUrl:
+        activeCheckout.providerPayload?.link ||
+        activeCheckout.providerPayload?.checkoutUrl ||
+        activeCheckout.providerPayload?.authorizationUrl ||
+        activeCheckout.providerPayload?.url ||
+        "",
+      accessCode: activeCheckout.providerPayload?.accessCode || "",
+      status: activeCheckout.status,
+      reused: true,
+    };
+  }
+
   const user = await User.findById(userId).select("email name").lean();
   if (!user) {
     const err = new Error("User not found");
@@ -171,6 +240,7 @@ const initializePayment = async ({ eventId, userId, quoteId, callbackUrl }) => {
     amount: quote.totalAmount,
     currency: quote.currency,
     email: user.email,
+    name: user.name || "",
     callbackUrl: callbackUrl || "",
     subaccountCode: hostPayoutProfile.providerAccountCode || "",
   });
@@ -192,6 +262,16 @@ const initializePayment = async ({ eventId, userId, quoteId, callbackUrl }) => {
     quoteId,
     providerPayload: providerResult.payload || null,
     expiresAt: new Date(quote.expiresAt),
+    admissionStatus:
+      event.requiresApproval &&
+      Array.isArray(event.participants) &&
+      event.participants.some(
+        (participant) =>
+          participant?.userId?.toString() === userId.toString() &&
+          participant?.status === "interested"
+      )
+        ? "pending_payment"
+        : "none",
   });
 
   return {
@@ -228,11 +308,15 @@ const verifyPayment = async ({ eventId, reference }) => {
 
   const provider = getPaymentProvider(payment.provider);
   const verification = await provider.verifyTransaction(reference);
-  const normalizedStatus = verification.status === "paid" || verification.status === "success" ? "paid" : "pending";
+  const normalizedStatus = normalizePaymentStatus(verification.status);
 
   payment.status = normalizedStatus;
   if (normalizedStatus === "paid") {
     payment.paidAt = verification.paidAt || new Date();
+    await grantAdmissionForPaidPayment(payment);
+  } else if (normalizedStatus === "expired") {
+    payment.admissionStatus =
+      payment.admissionStatus === "pending_payment" ? "expired" : payment.admissionStatus;
   }
   payment.providerPayload = verification.payload || payment.providerPayload;
   await payment.save();
@@ -436,7 +520,12 @@ const handleProviderWebhook = async ({
   parsedBody,
 }) => {
   const provider = getPaymentProvider(providerName || getActiveProviderName());
-  const secret = provider.getName() === "paystack" ? process.env.PAYSTACK_SECRET_KEY : "mock";
+  const secret =
+    provider.getName() === "paystack"
+      ? process.env.PAYSTACK_SECRET_KEY
+      : provider.getName() === "stitch"
+        ? process.env.STITCH_WEBHOOK_SECRET
+        : "mock";
   const isValid = provider.verifyWebhookSignature(rawBody, signature, secret);
   if (!isValid) {
     const err = new Error("Invalid webhook signature");
@@ -461,13 +550,18 @@ const handleProviderWebhook = async ({
     return { processed: false, reason: "duplicate", reference: event.reference };
   }
 
-  const successStates = new Set(["paid", "success", "completed"]);
-  if (successStates.has(String(event.status).toLowerCase())) {
+  const normalizedStatus = normalizePaymentStatus(event.status);
+  if (normalizedStatus === "paid") {
     payment.status = "paid";
     payment.paidAt = payment.paidAt || new Date();
-  } else if (String(event.status).toLowerCase() === "failed") {
+    await grantAdmissionForPaidPayment(payment);
+  } else if (normalizedStatus === "failed") {
     payment.status = "failed";
     payment.failedAt = new Date();
+  } else if (normalizedStatus === "expired") {
+    payment.status = "expired";
+    payment.admissionStatus =
+      payment.admissionStatus === "pending_payment" ? "expired" : payment.admissionStatus;
   }
   payment.webhookEventId = `${event.eventType}:${event.reference}`;
   payment.providerPayload = event.payload || payment.providerPayload;
@@ -480,11 +574,41 @@ const handleProviderWebhook = async ({
   };
 };
 
+const getPaymentStatus = async ({ eventId, userId }) => {
+  if (!mongoose.Types.ObjectId.isValid(eventId) || !mongoose.Types.ObjectId.isValid(userId)) {
+    const err = new Error("Invalid ID format");
+    err.status = 400;
+    throw err;
+  }
+
+  const payment = await EventPayment.findOne({ eventId, userId }).sort({ createdAt: -1 }).lean();
+  if (!payment) {
+    return {
+      hasPayment: false,
+      status: "none",
+      admissionStatus: "none",
+      expiresAt: null,
+      paidAt: null,
+      reference: "",
+    };
+  }
+
+  return {
+    hasPayment: true,
+    status: payment.status,
+    admissionStatus: payment.admissionStatus || "none",
+    expiresAt: payment.expiresAt,
+    paidAt: payment.paidAt,
+    reference: payment.providerReference,
+  };
+};
+
 module.exports = {
   ensureFeePolicy,
   createQuote,
   initializePayment,
   verifyPayment,
+  getPaymentStatus,
   applyForHostPayout,
   getHostPayoutStatus,
   approveHostPayout,

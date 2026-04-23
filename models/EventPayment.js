@@ -22,7 +22,7 @@ const eventPaymentSchema = new mongoose.Schema(
     },
     provider: {
       type: String,
-      enum: ["mock", "paystack"],
+      enum: ["mock", "paystack", "stitch"],
       default: "mock",
       index: true,
     },
@@ -60,11 +60,18 @@ const eventPaymentSchema = new mongoose.Schema(
     failedAt: { type: Date, default: null },
     refundedAt: { type: Date, default: null },
     expiresAt: { type: Date, default: null },
+    admissionStatus: {
+      type: String,
+      enum: ["none", "pending_payment", "admitted", "expired"],
+      default: "none",
+      index: true,
+    },
   },
   { timestamps: true }
 );
 
 eventPaymentSchema.index({ eventId: 1, userId: 1, createdAt: -1 });
 eventPaymentSchema.index({ provider: 1, providerReference: 1 }, { unique: true });
+eventPaymentSchema.index({ eventId: 1, userId: 1, status: 1, admissionStatus: 1 });
 
 module.exports = mongoose.model("EventPayment", eventPaymentSchema);

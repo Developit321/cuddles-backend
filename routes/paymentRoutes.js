@@ -3,6 +3,7 @@ const {
   createQuote,
   initializePayment,
   verifyPayment,
+  getPaymentStatus,
   applyForHostPayout,
   getHostPayoutStatus,
   approveHostPayout,
@@ -145,7 +146,7 @@ router.get("/admin/host-payouts", requireAuth, async (req, res) => {
   }
 });
 
-router.post("/events/:eventId/payments/quote", ...requireOwnBodyUser, async (req, res) => {
+router.post("/events/:eventId/payments/quote", async (req, res) => {
   try {
     const { eventId } = req.params;
     const { userId, couponCode = "" } = req.body;
@@ -158,7 +159,7 @@ router.post("/events/:eventId/payments/quote", ...requireOwnBodyUser, async (req
   }
 });
 
-router.post("/events/:eventId/payments/initialize", ...requireOwnBodyUser, async (req, res) => {
+router.post("/events/:eventId/payments/initialize", async (req, res) => {
   try {
     const { eventId } = req.params;
     const { userId, quoteId, callbackUrl = "" } = req.body;
@@ -176,7 +177,7 @@ router.post("/events/:eventId/payments/initialize", ...requireOwnBodyUser, async
   }
 });
 
-router.get("/events/:eventId/payments/verify/:reference", requireAuth, async (req, res) => {
+router.get("/events/:eventId/payments/verify/:reference", async (req, res) => {
   try {
     const { eventId, reference } = req.params;
     const result = await verifyPayment({ eventId, reference });
@@ -188,13 +189,29 @@ router.get("/events/:eventId/payments/verify/:reference", requireAuth, async (re
   }
 });
 
+router.get(
+  "/events/:eventId/payments/status/:userId",
+  async (req, res) => {
+    try {
+      const { eventId, userId } = req.params;
+      const result = await getPaymentStatus({ eventId, userId });
+      return res.status(200).json(result);
+    } catch (error) {
+      return res.status(error.status || 500).json({
+        message: error.message || "Failed to fetch payment status",
+      });
+    }
+  }
+);
+
 router.post("/webhooks/payments/:provider", async (req, res) => {
   try {
     const providerName = req.params.provider;
     const rawBody =
       req.rawBody ||
       (typeof req.body === "string" ? req.body : JSON.stringify(req.body || {}));
-    const signature = req.headers["x-paystack-signature"] || "";
+    const signature =
+      req.headers["x-stitch-signature"] || req.headers["x-paystack-signature"] || "";
     const result = await handleProviderWebhook({
       providerName,
       rawBody,

@@ -13,6 +13,7 @@ const SharedQuestion = require("./models/SharedQuestion");
 const Question = require("./models/ Question");
 const Message = require("./models/message");
 const Event = require("./models/Event");
+const EventPayment = require("./models/EventPayment");
 const HostPayoutProfile = require("./models/HostPayoutProfile");
 const EventMessage = require("./models/EventMessage");
 const Notification = require("./models/Notification");
@@ -6496,14 +6497,18 @@ app.post("/events", async (req, res) => {
       priceAmount: normalizedIsPaid ? Math.round(normalizedPriceAmount) : 0,
       currency: normalizedCurrency,
       paymentPolicy: normalizedPaymentPolicy,
-      // For suggestions, don't add participants yet (wait for acceptance)
-      participants: isSuggestion ? [] : [
-        {
-          userId: hostId,
-          status: "going",
-          joinedAt: new Date(),
-        },
-      ],
+      // For paid events, keep host out initially so they can run full pay-and-join testing.
+      // For free events, preserve existing behavior and auto-join host.
+      participants:
+        isSuggestion || normalizedIsPaid
+          ? []
+          : [
+              {
+                userId: hostId,
+                status: "going",
+                joinedAt: new Date(),
+              },
+            ],
       status: isSuggestion ? "suggested" : "upcoming",
       suggestedToUserId: isSingleSuggestion ? suggestedToUserId : undefined,
       suggestedToUserIds: isGroupSuggestion ? suggestedToUserIds : undefined,
@@ -7225,6 +7230,58 @@ const hasUserInList = (list = [], targetUserId) => {
   });
 };
 
+const PAYMENT_HOLD_MS = 2 * 60 * 60 * 1000;
+
+const expirePendingPaidAdmissions = async (event) => {
+  if (!event?.isPaid || !Array.isArray(event.participants)) {
+    return { removedCount: 0 };
+  }
+
+  const now = new Date();
+  const pendingParticipantIds = event.participants
+    .filter((p) => p?.status === "interested")
+    .map((p) => p.userId?.toString())
+    .filter(Boolean);
+
+  if (!pendingParticipantIds.length) {
+    return { removedCount: 0 };
+  }
+
+  const expiredPayments = await EventPayment.find({
+    eventId: event._id,
+    userId: { $in: pendingParticipantIds },
+    admissionStatus: "pending_payment",
+    expiresAt: { $ne: null, $lte: now },
+  }).select("_id userId");
+
+  if (!expiredPayments.length) {
+    return { removedCount: 0 };
+  }
+
+  const expiredUserIds = new Set(expiredPayments.map((p) => p.userId.toString()));
+  event.participants = event.participants.filter(
+    (p) => !expiredUserIds.has(p.userId?.toString())
+  );
+
+  await EventPayment.updateMany(
+    {
+      _id: { $in: expiredPayments.map((p) => p._id) },
+      admissionStatus: "pending_payment",
+    },
+    {
+      $set: {
+        status: "expired",
+        admissionStatus: "expired",
+      },
+    }
+  );
+
+  event.status = computeNextEventStatus(event);
+  await event.save();
+
+  return { removedCount: expiredUserIds.size };
+};
+
 const promoteNextWaitlistedUser = async (event) => {
   if (event.requiresApproval) {
     return { handled: false, promoted: false };
@@ -7366,6 +7423,7 @@ app.post("/events/:eventId/join", async (req, res) => {
     if (!Array.isArray(event.waitlist)) {
       event.waitlist = [];
     }
+    await expirePendingPaidAdmissions(event);
 
     const existingParticipant = event.participants.find((p) =>
       hasUserInList([p], userId)
@@ -7395,6 +7453,26 @@ app.post("/events/:eventId/join", async (req, res) => {
       });
     }
 
+    // Paid events without host approval require payment before join.
+    if (event.isPaid && !event.requiresApproval) {
+      const settledPayment = await EventPayment.findOne({
+        eventId: event._id,
+        userId,
+        status: "paid",
+      })
+        .sort({ paidAt: -1, createdAt: -1 })
+        .lean();
+
+      if (!settledPayment) {
+        return res.status(402).json({
+          message: "Payment required before joining this event",
+          code: "payment_required",
+        });
+      }
+    }
+
+    const isHostSelfJoin = event.hostId.toString() === userId;
+
     // Check if user is blocked by host
     const host = await User.findById(event.hostId).select("blockedBy preferredLanguage");
     const blockedByHost = (host?.blockedBy || []).some(
@@ -7423,7 +7501,7 @@ app.post("/events/:eventId/join", async (req, res) => {
     }
 
     // If event requires host approval, create a join request instead of adding participant
-    if (event.requiresApproval) {
+    if (event.requiresApproval && !isHostSelfJoin) {
       event.joinRequests.push({
         userId,
         createdAt: new Date(),
@@ -7962,12 +8040,53 @@ app.post(
       // Remove from pending requests
       event.joinRequests.splice(requestIndex, 1);
 
-      // Add as participant with going status
-      event.participants.push({
-        userId,
-        status: "going",
-        joinedAt: new Date(),
-      });
+      await expirePendingPaidAdmissions(event);
+
+      const alreadyParticipant = hasUserInList(event.participants, userId);
+      const now = new Date();
+
+      if (!alreadyParticipant) {
+        event.participants.push({
+          userId,
+          status: event.isPaid ? "interested" : "going",
+          joinedAt: now,
+        });
+      }
+
+      if (event.isPaid) {
+        const holdExpiresAt = new Date(Date.now() + PAYMENT_HOLD_MS);
+        await EventPayment.findOneAndUpdate(
+          {
+            eventId: event._id,
+            userId,
+            admissionStatus: "pending_payment",
+            status: { $in: ["initialized", "pending"] },
+          },
+          {
+            $setOnInsert: {
+              eventId: event._id,
+              userId,
+              hostId: event.hostId,
+              provider: "mock",
+              providerReference: `HOLD_${event._id}_${userId}_${Date.now()}`,
+              amount: event.priceAmount || 0,
+              currency: event.currency || "ZAR",
+              baseAmount: event.priceAmount || 0,
+              appFeeAmount: 0,
+              processingFeeAmount: 0,
+              taxAmount: 0,
+              quoteId: "",
+              providerPayload: { holdOnly: true },
+            },
+            $set: {
+              expiresAt: holdExpiresAt,
+              admissionStatus: "pending_payment",
+              status: "pending",
+            },
+          },
+          { upsert: true, new: true }
+        );
+      }
 
       await event.save();
 
@@ -7977,8 +8096,10 @@ app.post(
         await createNotificationWithCaps({
           userId,
           type: "event_joined",
-          title: "You're in!",
-          message: `Your request to join "${event.title}" was approved.`,
+          title: event.isPaid ? "Approved - payment pending" : "You're in!",
+          message: event.isPaid
+            ? `Your request to join "${event.title}" was approved. Complete payment within 2 hours to keep your seat.`
+            : `Your request to join "${event.title}" was approved.`,
           eventId: event._id,
           eventName: event.title,
           actorId: event.hostId,
@@ -7988,7 +8109,11 @@ app.post(
         console.error("Error creating join approval notification:", notifError);
       }
 
-      return res.status(200).json({ message: "Join request approved" });
+      return res.status(200).json({
+        message: event.isPaid
+          ? "Join request approved. User must pay within 2 hours."
+          : "Join request approved",
+      });
     } catch (error) {
       console.error("Error approving join request:", error);
       return res
@@ -8339,6 +8464,8 @@ app.get("/events/:eventId", async (req, res) => {
     if (!event) {
       return res.status(404).json({ message: "Event not found" });
     }
+
+    await expirePendingPaidAdmissions(event);
 
     // Update status if needed
     event = await updateEventStatus(event);

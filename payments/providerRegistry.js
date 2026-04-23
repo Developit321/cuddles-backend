@@ -1,9 +1,11 @@
 const MockProvider = require("./providers/MockProvider");
 const PaystackProvider = require("./providers/PaystackProvider");
+const StitchProvider = require("./providers/StitchProvider");
 
 const PROVIDERS = {
   mock: () => new MockProvider(),
   paystack: () => new PaystackProvider(),
+  stitch: () => new StitchProvider(),
 };
 
 function getActiveProviderName() {
