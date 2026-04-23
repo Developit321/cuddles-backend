@@ -22,7 +22,7 @@ const eventPaymentSchema = new mongoose.Schema(
     },
     provider: {
       type: String,
-      enum: ["mock", "paystack", "stitch"],
+      enum: ["mock", "paystack", "stitch", "yoco"],
       default: "mock",
       index: true,
     },

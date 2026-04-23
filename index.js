@@ -14,6 +14,11 @@ const Question = require("./models/ Question");
 const Message = require("./models/message");
 const Event = require("./models/Event");
 const EventPayment = require("./models/EventPayment");
+const {
+  countOccupiedSeats,
+  computeNextEventStatus,
+  expirePendingPaidAdmissions,
+} = require("./services/eventSeatHold");
 const HostPayoutProfile = require("./models/HostPayoutProfile");
 const EventMessage = require("./models/EventMessage");
 const Notification = require("./models/Notification");
@@ -31,8 +36,17 @@ const Chat = require("./models/message");
 const http = require("http").createServer(app);
 const io = require("socket.io")(http); // Pass the HTTP server instance
 const bcrypt = require("bcryptjs");
-const { sendNotification, sendNotificationBatch } = require("./notifications/pushNotifications");
-const { getQueue, enqueueNearbyEvent, enqueueNearby60Fill, enqueueCapetownWeekend, enqueueCampaign } = require("./queues/nearbyNotifications");
+const {
+  sendNotification,
+  sendNotificationBatch,
+} = require("./notifications/pushNotifications");
+const {
+  getQueue,
+  enqueueNearbyEvent,
+  enqueueNearby60Fill,
+  enqueueCapetownWeekend,
+  enqueueCampaign,
+} = require("./queues/nearbyNotifications");
 const notificationStrings = require("./notifications/notificationStrings");
 const {
   uploadImageBufferToR2,
@@ -53,24 +67,36 @@ const {
 const { ObjectId } = require("mongodb");
 const { updateUserCountry } = require("./Controllers/userController");
 const RegionalCampaign = require("./models/RegionalCampaign");
-const { executeCampaign, buildGeoQuery } = require("./campaigns/executeCampaign");
+const {
+  executeCampaign,
+  buildGeoQuery,
+} = require("./campaigns/executeCampaign");
 
 // Returns the notification strings for the given language, falling back to English
-const getStrings = (lang) => notificationStrings[lang] || notificationStrings["en"];
+const getStrings = (lang) =>
+  notificationStrings[lang] || notificationStrings["en"];
 
 // Replaces {token} placeholders in a string with values from a params object
 const interpolate = (str, params = {}) =>
-  Object.entries(params).reduce((s, [k, v]) => s.replace(new RegExp(`\\{${k}\\}`, "g"), v), str);
+  Object.entries(params).reduce(
+    (s, [k, v]) => s.replace(new RegExp(`\\{${k}\\}`, "g"), v),
+    str,
+  );
 
 // Map to store user socket connections
 const userSockets = new Map();
 
 const userRoutes = require("./routes/userRoutes");
 const createPaymentRoutes = require("./routes/paymentRoutes");
-const { createRefund } = require("./services/paymentService");
+const {
+  createRefund,
+  markEventPayoutsEligible,
+} = require("./services/paymentService");
 const MISSION_STATS_SINGLETON_KEY = "global";
 const DEFAULT_MISSION_GOAL =
-  Number(process.env.MISSION_GOAL) > 0 ? Number(process.env.MISSION_GOAL) : 1000000;
+  Number(process.env.MISSION_GOAL) > 0
+    ? Number(process.env.MISSION_GOAL)
+    : 1000000;
 
 const ensureMissionStats = async () =>
   MissionStats.findOneAndUpdate(
@@ -81,14 +107,15 @@ const ensureMissionStats = async () =>
         goal: DEFAULT_MISSION_GOAL,
       },
     },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
+    { upsert: true, new: true, setDefaultsOnInsert: true },
   );
 
 const incrementMissionStats = async ({
   tablesCreatedDelta = 0,
   strangersConnectedDelta = 0,
 }) => {
-  const hasIncrement = tablesCreatedDelta !== 0 || strangersConnectedDelta !== 0;
+  const hasIncrement =
+    tablesCreatedDelta !== 0 || strangersConnectedDelta !== 0;
   if (!hasIncrement) return ensureMissionStats();
 
   return MissionStats.findOneAndUpdate(
@@ -103,7 +130,7 @@ const incrementMissionStats = async ({
         strangersConnectedTotal: strangersConnectedDelta,
       },
     },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
+    { upsert: true, new: true, setDefaultsOnInsert: true },
   );
 };
 
@@ -128,7 +155,10 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
 const isValidExpoPushToken = (token) => {
   if (!token || typeof token !== "string") return false;
   const t = token.trim();
-  return t.length > 0 && (t.startsWith("ExponentPushToken[") || t.startsWith("ExpoPushToken["));
+  return (
+    t.length > 0 &&
+    (t.startsWith("ExponentPushToken[") || t.startsWith("ExpoPushToken["))
+  );
 };
 
 // Helper function to create and send notifications
@@ -165,7 +195,7 @@ const createNotification = async ({
     await notification.save();
 
     console.log(
-      `[Notification] Saved ${type} notification (id=${notification._id}) for user ${userId} (eventId=${eventId || "none"})`
+      `[Notification] Saved ${type} notification (id=${notification._id}) for user ${userId} (eventId=${eventId || "none"})`,
     );
 
     // 2. Send push unless skipPush (e.g. worker will batch-send later)
@@ -175,11 +205,11 @@ const createNotification = async ({
       console.log(
         `[Notification] Push check for user=${userId}, type=${type}, token=${
           token ? `${String(token).slice(0, 20)}...` : "NONE"
-        }`
+        }`,
       );
       if (isValidExpoPushToken(token)) {
         console.log(
-          `[Notification] Sending push for type=${type} to user=${userId}`
+          `[Notification] Sending push for type=${type} to user=${userId}`,
         );
         try {
           await sendNotification(token, title, message, {
@@ -190,22 +220,22 @@ const createNotification = async ({
         } catch (pushError) {
           console.error(
             `[Notification] Failed to send push to user ${userId}:`,
-            pushError?.message || pushError
+            pushError?.message || pushError,
           );
         }
       } else if (token) {
         console.log(
-          `[Notification] User ${userId} has no valid Expo push token, skipping push`
+          `[Notification] User ${userId} has no valid Expo push token, skipping push`,
         );
       } else {
         console.log(
-          `[Notification] User ${userId} has no pushToken stored, skipping push`
+          `[Notification] User ${userId} has no pushToken stored, skipping push`,
         );
       }
     }
 
     console.log(
-      `[Notification] Created ${type} notification for user ${userId}`
+      `[Notification] Created ${type} notification for user ${userId}`,
     );
     return notification;
   } catch (error) {
@@ -219,12 +249,18 @@ const createNotification = async ({
 const createNotificationWithCaps = async (payload) => {
   const { userId, type } = payload;
   const category = getCategoryForType(type);
-  if (category === "transactional" || category === "discovery" || category === "post_experience") {
+  if (
+    category === "transactional" ||
+    category === "discovery" ||
+    category === "post_experience"
+  ) {
     return createNotification({ ...payload, category });
   }
   const { allowed, reason } = await shouldSendNotification(userId, category);
   if (!allowed) {
-    console.log(`[Notification] Skipping ${type} for user ${userId}: ${reason || "cap"}`);
+    console.log(
+      `[Notification] Skipping ${type} for user ${userId}: ${reason || "cap"}`,
+    );
     return null;
   }
   return createNotification({ ...payload, category });
@@ -237,8 +273,13 @@ const MIN_FRESH_RECIPIENTS = 30;
 // Only ios-events populates event flows; ios-cuddles populates lookingFor and availability.
 const EVENTS_ONLY_QUERY = {
   $and: [
-    { $or: [ { lookingFor: { $exists: false } }, { lookingFor: { $size: 0 } } ] },
-    { $or: [ { availability: { $exists: false } }, { availability: { $size: 0 } } ] },
+    { $or: [{ lookingFor: { $exists: false } }, { lookingFor: { $size: 0 } }] },
+    {
+      $or: [
+        { availability: { $exists: false } },
+        { availability: { $size: 0 } },
+      ],
+    },
   ],
 };
 
@@ -248,7 +289,9 @@ if (nearbyQueue) {
   nearbyQueue.process(1, async (job) => {
     const { type, eventId } = job.data || {};
     if (type === "event_nearby") {
-      const event = await Event.findById(eventId).populate("hostId", "name").lean();
+      const event = await Event.findById(eventId)
+        .populate("hostId", "name")
+        .lean();
       if (!event) {
         console.warn("[Nearby Queue] event_nearby: event not found", eventId);
         return;
@@ -260,8 +303,9 @@ if (nearbyQueue) {
       const audienceQuery = {};
       if (event.audience === "women_only") audienceQuery.gender = "female";
       else if (event.audience === "men_only") audienceQuery.gender = "male";
-      const recentlyNotifiedIds = (await getRecentlyNotifiedUserIds("event_nearby", DISCOVERY_COOLDOWN_MS))
-        .map((id) => new mongoose.Types.ObjectId(id));
+      const recentlyNotifiedIds = (
+        await getRecentlyNotifiedUserIds("event_nearby", DISCOVERY_COOLDOWN_MS)
+      ).map((id) => new mongoose.Types.ObjectId(id));
       // Tier A: prefer users who haven't received event_nearby in the cooldown window.
       const tierAUsers = await User.aggregate([
         {
@@ -273,9 +317,13 @@ if (nearbyQueue) {
             query: {
               $and: [
                 { _id: { $ne: new mongoose.Types.ObjectId(hostId) } },
-                ...(recentlyNotifiedIds.length ? [{ _id: { $nin: recentlyNotifiedIds } }] : []),
+                ...(recentlyNotifiedIds.length
+                  ? [{ _id: { $nin: recentlyNotifiedIds } }]
+                  : []),
                 { pushToken: { $exists: true, $ne: null } },
-                ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                ...(audienceQuery.gender
+                  ? [{ gender: audienceQuery.gender }]
+                  : []),
                 ...EVENTS_ONLY_QUERY.$and,
               ],
             },
@@ -288,7 +336,10 @@ if (nearbyQueue) {
       let nearbyUsers = tierAUsers;
 
       // Tier B fallback: if the fresh pool is too small, fill from recently-notified users so we never hit 0 recipients.
-      if (nearbyUsers.length < MIN_FRESH_RECIPIENTS && recentlyNotifiedIds.length > 0) {
+      if (
+        nearbyUsers.length < MIN_FRESH_RECIPIENTS &&
+        recentlyNotifiedIds.length > 0
+      ) {
         const remaining = Math.max(0, NEARBY_NOTIFY_LIMIT - nearbyUsers.length);
         if (remaining > 0) {
           const tierBUsers = await User.aggregate([
@@ -303,7 +354,9 @@ if (nearbyQueue) {
                     { _id: { $ne: new mongoose.Types.ObjectId(hostId) } },
                     { _id: { $in: recentlyNotifiedIds } },
                     { pushToken: { $exists: true, $ne: null } },
-                    ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                    ...(audienceQuery.gender
+                      ? [{ gender: audienceQuery.gender }]
+                      : []),
                     ...EVENTS_ONLY_QUERY.$and,
                   ],
                 },
@@ -318,7 +371,11 @@ if (nearbyQueue) {
       const eventNearbyStr = getStrings("en").eventNearby;
       const spotsOpen = Math.max(0, (event.capacity || 6) - 1);
       const title = interpolate(eventNearbyStr.title, {});
-      const body = interpolate(eventNearbyStr.body, { name: hostName, activity: event.title || "", spotsOpen: String(spotsOpen) });
+      const body = interpolate(eventNearbyStr.body, {
+        name: hostName,
+        activity: event.title || "",
+        spotsOpen: String(spotsOpen),
+      });
       const messages = [];
       for (const u of nearbyUsers) {
         const { allowed } = await shouldSendNotification(u._id, "discovery");
@@ -334,30 +391,52 @@ if (nearbyQueue) {
           actorName: hostName,
           skipPush: true,
         });
-        if (u.pushToken) messages.push({ to: u.pushToken, title, body, data: { type: "event_nearby", eventId: event._id.toString() } });
+        if (u.pushToken)
+          messages.push({
+            to: u.pushToken,
+            title,
+            body,
+            data: { type: "event_nearby", eventId: event._id.toString() },
+          });
       }
       await sendNotificationBatch(messages);
-      console.log(`[Nearby Queue] event_nearby: sent ${messages.length} notifications for event ${eventId}`);
+      console.log(
+        `[Nearby Queue] event_nearby: sent ${messages.length} notifications for event ${eventId}`,
+      );
     } else if (type === "event_nearby_60") {
       const event = await Event.findById(eventId).lean();
       if (!event) {
-        console.warn("[Nearby Queue] event_nearby_60: event not found", eventId);
+        console.warn(
+          "[Nearby Queue] event_nearby_60: event not found",
+          eventId,
+        );
         return;
       }
       const host = await User.findById(event.hostId).select("name").lean();
       const hostName = host?.name || "Someone";
-      const participantIds = (event.participants || []).map((p) => (p.userId && p.userId._id ? p.userId._id : p.userId));
-      const excludeIds = [event.hostId, ...participantIds].filter(Boolean).map((id) => (id && id._id ? id._id : id));
+      const participantIds = (event.participants || []).map((p) =>
+        p.userId && p.userId._id ? p.userId._id : p.userId,
+      );
+      const excludeIds = [event.hostId, ...participantIds]
+        .filter(Boolean)
+        .map((id) => (id && id._id ? id._id : id));
       const [lng, lat] = event.location?.coordinates || [];
       if (lng == null || lat == null || excludeIds.length === 0) {
-        await Event.updateOne({ _id: eventId }, { sixtyPercentNotifSent: true });
+        await Event.updateOne(
+          { _id: eventId },
+          { sixtyPercentNotifSent: true },
+        );
         return;
       }
       const audienceQuery = {};
       if (event.audience === "women_only") audienceQuery.gender = "female";
       else if (event.audience === "men_only") audienceQuery.gender = "male";
-      const recentlyNotifiedIds60 = (await getRecentlyNotifiedUserIds("table_filling_fast", DISCOVERY_COOLDOWN_MS))
-        .map((id) => new mongoose.Types.ObjectId(id));
+      const recentlyNotifiedIds60 = (
+        await getRecentlyNotifiedUserIds(
+          "table_filling_fast",
+          DISCOVERY_COOLDOWN_MS,
+        )
+      ).map((id) => new mongoose.Types.ObjectId(id));
       const allExcludeIds = [
         ...excludeIds.map((id) => new mongoose.Types.ObjectId(id)),
         ...recentlyNotifiedIds60,
@@ -373,7 +452,9 @@ if (nearbyQueue) {
               $and: [
                 { _id: { $nin: allExcludeIds } },
                 { pushToken: { $exists: true, $ne: null } },
-                ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                ...(audienceQuery.gender
+                  ? [{ gender: audienceQuery.gender }]
+                  : []),
                 ...EVENTS_ONLY_QUERY.$and,
               ],
             },
@@ -387,8 +468,15 @@ if (nearbyQueue) {
       for (const u of nearbyNotJoined) {
         const { allowed } = await shouldSendNotification(u._id, "fomo");
         if (!allowed) continue;
-        const str = (u.preferredLanguage && getStrings(u.preferredLanguage).tableFillingFast) ? getStrings(u.preferredLanguage).tableFillingFast : fillStrEn;
-        const notifTitle = interpolate(str.title, { name: hostName, activity: event.title || "" });
+        const str =
+          u.preferredLanguage &&
+          getStrings(u.preferredLanguage).tableFillingFast
+            ? getStrings(u.preferredLanguage).tableFillingFast
+            : fillStrEn;
+        const notifTitle = interpolate(str.title, {
+          name: hostName,
+          activity: event.title || "",
+        });
         const notifBody = str.body || "";
         await createNotificationWithCaps({
           userId: u._id,
@@ -401,11 +489,19 @@ if (nearbyQueue) {
           actorName: hostName,
           skipPush: true,
         });
-        if (u.pushToken) messages.push({ to: u.pushToken, title: notifTitle, body: notifBody, data: { type: "table_filling_fast", eventId: event._id.toString() } });
+        if (u.pushToken)
+          messages.push({
+            to: u.pushToken,
+            title: notifTitle,
+            body: notifBody,
+            data: { type: "table_filling_fast", eventId: event._id.toString() },
+          });
       }
       await sendNotificationBatch(messages);
       await Event.updateOne({ _id: eventId }, { sixtyPercentNotifSent: true });
-      console.log(`[Nearby Queue] event_nearby_60: sent ${messages.length} notifications for event ${eventId}`);
+      console.log(
+        `[Nearby Queue] event_nearby_60: sent ${messages.length} notifications for event ${eventId}`,
+      );
     } else if (type === "capetown_weekend") {
       const capetownStr = getStrings("en").capetownWeekend;
       if (!capetownStr) return;
@@ -431,7 +527,10 @@ if (nearbyQueue) {
       ]);
       const messages = [];
       for (const u of users) {
-        const { allowed } = await shouldSendNotification(u._id, "re_engagement");
+        const { allowed } = await shouldSendNotification(
+          u._id,
+          "re_engagement",
+        );
         if (!allowed) continue;
         await createNotificationWithCaps({
           userId: u._id,
@@ -440,17 +539,32 @@ if (nearbyQueue) {
           message: body,
           skipPush: true,
         });
-        if (u.pushToken) messages.push({ to: u.pushToken, title, body, data: { type: "capetown_weekend" } });
+        if (u.pushToken)
+          messages.push({
+            to: u.pushToken,
+            title,
+            body,
+            data: { type: "capetown_weekend" },
+          });
       }
       if (messages.length > 0) {
         await sendNotificationBatch(messages);
-        console.log(`[Nearby Queue] capetown_weekend: sent ${messages.length} notifications`);
+        console.log(
+          `[Nearby Queue] capetown_weekend: sent ${messages.length} notifications`,
+        );
       }
     } else if (type === "regional_campaign") {
       const { campaignId } = job.data;
-      console.log(`[Nearby Queue] regional_campaign: executing campaign ${campaignId}`);
-      await executeCampaign(campaignId, { shouldSendNotification, createNotificationWithCaps });
-      console.log(`[Nearby Queue] regional_campaign: finished campaign ${campaignId}`);
+      console.log(
+        `[Nearby Queue] regional_campaign: executing campaign ${campaignId}`,
+      );
+      await executeCampaign(campaignId, {
+        shouldSendNotification,
+        createNotificationWithCaps,
+      });
+      console.log(
+        `[Nearby Queue] regional_campaign: finished campaign ${campaignId}`,
+      );
     } else {
       console.warn("[Nearby Queue] Unknown job type:", type);
     }
@@ -465,7 +579,7 @@ app.use(
     verify: (req, _res, buf) => {
       req.rawBody = buf.toString("utf8");
     },
-  })
+  }),
 );
 // Routes
 app.use("/api/users", userRoutes);
@@ -473,8 +587,12 @@ app.use("/api/users", userRoutes);
 app.get("/public/mission-stats", async (req, res) => {
   try {
     const stats = await ensureMissionStats();
-    const goal = Number(stats.goal) > 0 ? Number(stats.goal) : DEFAULT_MISSION_GOAL;
-    const strangersConnected = Math.max(0, Number(stats.strangersConnectedTotal) || 0);
+    const goal =
+      Number(stats.goal) > 0 ? Number(stats.goal) : DEFAULT_MISSION_GOAL;
+    const strangersConnected = Math.max(
+      0,
+      Number(stats.strangersConnectedTotal) || 0,
+    );
     const tablesCreated = Math.max(0, Number(stats.tablesCreatedTotal) || 0);
     const progressPercent =
       goal > 0 ? Math.min((strangersConnected / goal) * 100, 100) : 0;
@@ -507,7 +625,7 @@ const imageUpload = multer({
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
   fileFilter: (req, file, cb) => {
     const ok = ALLOWED_INPUT_MIME_TYPES.has(
-      String(file?.mimetype || "").toLowerCase()
+      String(file?.mimetype || "").toLowerCase(),
     );
     if (!ok) return cb(new Error("Only jpeg/png/webp images are allowed"));
     cb(null, true);
@@ -532,7 +650,7 @@ cloudinary.config({
 // MongoDB connection
 mongoose
   .connect(
-    "mongodb://cuddles:LNum9ZwrrcNDyl5c@ac-r0ymzab-shard-00-00.bdtblda.mongodb.net:27017,ac-r0ymzab-shard-00-01.bdtblda.mongodb.net:27017,ac-r0ymzab-shard-00-02.bdtblda.mongodb.net:27017/?ssl=true&replicaSet=atlas-ll9zih-shard-0&authSource=admin&retryWrites=true&w=majority"
+    "mongodb://cuddles:LNum9ZwrrcNDyl5c@ac-r0ymzab-shard-00-00.bdtblda.mongodb.net:27017,ac-r0ymzab-shard-00-01.bdtblda.mongodb.net:27017,ac-r0ymzab-shard-00-02.bdtblda.mongodb.net:27017/?ssl=true&replicaSet=atlas-ll9zih-shard-0&authSource=admin&retryWrites=true&w=majority",
   )
   .then(async () => {
     console.log("Connected to the Database");
@@ -606,7 +724,7 @@ io.on("connection", (socket) => {
       }
 
       const isParticipant = event.participants.some(
-        (p) => p.userId.toString() === userId
+        (p) => p.userId.toString() === userId,
       );
       if (!isParticipant) {
         socket.emit("joinEventChatError", {
@@ -674,7 +792,7 @@ io.on("connection", (socket) => {
         }
 
         const isParticipant = event.participants.some(
-          (p) => p.userId.toString() === senderId
+          (p) => p.userId.toString() === senderId,
         );
         if (!isParticipant) {
           socket.emit("sendEventMessageError", {
@@ -698,7 +816,7 @@ io.on("connection", (socket) => {
 
         // Populate sender info
         const populatedMessage = await EventMessage.findById(
-          newEventMessage._id
+          newEventMessage._id,
         ).populate("senderId", "name profileImages");
 
         // Emit to all users in the event room
@@ -725,8 +843,8 @@ io.on("connection", (socket) => {
           type === "image"
             ? `${sender.name} sent an image`
             : message.length > 50
-            ? `${message.substring(0, 50)}...`
-            : message;
+              ? `${message.substring(0, 50)}...`
+              : message;
 
         for (const participant of participantsToNotify) {
           try {
@@ -734,12 +852,12 @@ io.on("connection", (socket) => {
               participant.pushToken,
               `${event.title}`,
               `${sender.name}: ${notificationMessage}`,
-              { type: "event_chat", eventId: eventId.toString() }
+              { type: "event_chat", eventId: eventId.toString() },
             );
           } catch (notifError) {
             console.error(
               "Error sending event message notification:",
-              notifError
+              notifError,
             );
           }
         }
@@ -750,7 +868,7 @@ io.on("connection", (socket) => {
           message: "Error sending message",
         });
       }
-    }
+    },
   );
 
   // Send system message to event chat (e.g., "John joined the table")
@@ -826,7 +944,7 @@ io.on("connection", (socket) => {
           receiver.pushToken,
           sender.name,
           notificationMessage,
-          { type: "dm", senderId: senderId.toString() }
+          { type: "dm", senderId: senderId.toString() },
         );
       }
 
@@ -841,7 +959,7 @@ io.on("connection", (socket) => {
             },
           },
         },
-        { upsert: true }
+        { upsert: true },
       );
 
       // Update or create conversation for the receiver
@@ -855,7 +973,7 @@ io.on("connection", (socket) => {
             },
           },
         },
-        { upsert: true }
+        { upsert: true },
       );
     } catch (error) {
       console.error("Error handling message:", error);
@@ -869,7 +987,7 @@ io.on("connection", (socket) => {
       const updatedUser = await User.findOneAndUpdate(
         { _id: senderId, "conversations.receiverId": userId },
         { $set: { "conversations.$.unreadMessagesCount": 0 } },
-        { new: true }
+        { new: true },
       );
 
       // Optionally, you can emit an update event to the sender or other relevant clients
@@ -916,7 +1034,7 @@ io.on("connection", (socket) => {
           ],
         },
         { $set: { read: true } },
-        { multi: true } // Update multiple documents
+        { multi: true }, // Update multiple documents
       );
 
       if (updatedMessages.nModified === 0) {
@@ -927,7 +1045,7 @@ io.on("connection", (socket) => {
       const user = await User.findOneAndUpdate(
         { _id: userId, "conversations.receiverId": senderId },
         { $set: { "conversations.$.unreadMessagesCount": 0 } },
-        { new: true }
+        { new: true },
       );
 
       if (!user) {
@@ -962,9 +1080,10 @@ app.post("/register", async (req, res) => {
 
     // Validate and normalize platform
     const validPlatforms = ["ios", "android", "unknown"];
-    const normalizedPlatform = platform && validPlatforms.includes(platform.toLowerCase()) 
-      ? platform.toLowerCase() 
-      : "unknown";
+    const normalizedPlatform =
+      platform && validPlatforms.includes(platform.toLowerCase())
+        ? platform.toLowerCase()
+        : "unknown";
 
     // Validate required fields for all users
     if (!name || !email || !age) {
@@ -1122,7 +1241,7 @@ const sendEmailWithRetry = async (mailOptions, maxRetries = 3) => {
       const result = await transporter.sendMail(mailOptions);
       console.log(
         `Email sent successfully on attempt ${attempt}:`,
-        result.messageId
+        result.messageId,
       );
       return { success: true, messageId: result.messageId };
     } catch (error) {
@@ -1132,7 +1251,7 @@ const sendEmailWithRetry = async (mailOptions, maxRetries = 3) => {
       }
       // Wait before retrying (exponential backoff)
       await new Promise((resolve) =>
-        setTimeout(resolve, Math.pow(2, attempt) * 1000)
+        setTimeout(resolve, Math.pow(2, attempt) * 1000),
       );
     }
   }
@@ -1177,22 +1296,25 @@ app.get("/verify/:token", async (req, res) => {
   }
 });
 
-const secretKey =
-  process.env.JWT_SECRET || "dev-local-jwt-secret-change-me";
+const secretKey = process.env.JWT_SECRET || "dev-local-jwt-secret-change-me";
 if (!process.env.JWT_SECRET) {
   console.warn(
-    "[Auth] JWT_SECRET is not set; using development fallback secret."
+    "[Auth] JWT_SECRET is not set; using development fallback secret.",
   );
 }
 
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
   const match = auth.match(/^Bearer\s+(.+)$/i);
-  if (!match) return res.status(401).json({ message: "Missing Authorization Bearer token" });
+  if (!match)
+    return res
+      .status(401)
+      .json({ message: "Missing Authorization Bearer token" });
 
   try {
     const decoded = jwt.verify(match[1], secretKey);
-    if (!decoded?.userId) return res.status(401).json({ message: "Invalid token payload" });
+    if (!decoded?.userId)
+      return res.status(401).json({ message: "Invalid token payload" });
     req.authUserId = decoded.userId;
     return next();
   } catch (err) {
@@ -1214,9 +1336,7 @@ app.get("/stitch/redirect", (req, res) => {
   }
 
   const escapedDeepLink = deepLink.replace(/'/g, "\\'");
-  return res
-    .status(200)
-    .set("Content-Type", "text/html; charset=utf-8")
+  return res.status(200).set("Content-Type", "text/html; charset=utf-8")
     .send(`<!doctype html>
 <html>
   <head>
@@ -1287,7 +1407,7 @@ app.put("/users/:userId/gender", async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { gender: gender },
-      { new: true }
+      { new: true },
     );
 
     if (!user) {
@@ -1309,7 +1429,7 @@ app.put("/users/:userId/preferences", async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { preferences: preferences },
-      { new: true }
+      { new: true },
     );
 
     if (!user) {
@@ -1330,7 +1450,7 @@ app.put("/users/:userId/description", async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { description: description },
-      { new: true }
+      { new: true },
     );
     if (!user) {
       return res.status(404).json({ message: "user not found" });
@@ -1352,7 +1472,7 @@ app.put("/users/:userId/instagram", async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { instagramUrl: instagramUrl || "" },
-      { new: true }
+      { new: true },
     );
     if (!user) {
       return res.status(404).json({ message: "User not found" });
@@ -1373,7 +1493,7 @@ app.put("/users/:userId/interests/add", async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { $addToSet: { interests: interests } },
-      { new: true }
+      { new: true },
     );
 
     if (!user) {
@@ -1397,7 +1517,7 @@ app.delete("/users/:userId/interests/remove", async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { $pull: { interests: interest } }, // Remove a single interest
-      { new: true }
+      { new: true },
     );
 
     if (!user) {
@@ -1437,7 +1557,7 @@ app.put("/users/:userId/lookingfor/add", async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { $addToSet: { lookingFor: { $each: lookingFor } } },
-      { new: true }
+      { new: true },
     );
 
     if (!user) {
@@ -1475,7 +1595,7 @@ app.put("/users/:userId/availability/add", async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { $addToSet: { availability: { $each: availability } } },
-      { new: true }
+      { new: true },
     );
 
     if (!user) {
@@ -1518,7 +1638,7 @@ app.put("/users/:userId/cuddle-preference", async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { expectations },
-      { new: true, runValidators: true }
+      { new: true, runValidators: true },
     );
 
     if (!user) {
@@ -1561,7 +1681,7 @@ app.put("/users/:userId/marriage-timeline", async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { marriageTimeline },
-      { new: true, runValidators: true }
+      { new: true, runValidators: true },
     );
 
     if (!user) {
@@ -1603,7 +1723,7 @@ app.put("/users/:userId/children-preference", async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { childrenPreference },
-      { new: true, runValidators: true }
+      { new: true, runValidators: true },
     );
 
     if (!user) {
@@ -1640,7 +1760,7 @@ app.put("/users/:userId/relocation-openness", async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { relocationOpenness },
-      { new: true, runValidators: true }
+      { new: true, runValidators: true },
     );
 
     if (!user) {
@@ -1676,7 +1796,7 @@ app.delete("/users/:userId/lookingfor/remove", async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { $pull: { lookingFor: lookingForItem } },
-      { new: true }
+      { new: true },
     );
 
     if (!user) {
@@ -1724,10 +1844,10 @@ app.get("/users/:userId/relationship/:otherUserId", async (req, res) => {
     }
 
     const currentUser = await User.findById(userId).select(
-      "Matches crushes recievedLikes"
+      "Matches crushes recievedLikes",
     );
     const otherUser = await User.findById(otherUserId).select(
-      "Matches crushes recievedLikes"
+      "Matches crushes recievedLikes",
     );
 
     if (!currentUser || !otherUser) {
@@ -1736,17 +1856,17 @@ app.get("/users/:userId/relationship/:otherUserId", async (req, res) => {
 
     // Check if users are matched (mutual)
     const isMatched = currentUser.Matches.some(
-      (id) => id.toString() === otherUserId
+      (id) => id.toString() === otherUserId,
     );
 
     // Check if current user is following (has liked) the other user
     const isFollowing = currentUser.crushes.some(
-      (id) => id.toString() === otherUserId
+      (id) => id.toString() === otherUserId,
     );
 
     // Check if other user is following (has liked) the current user
     const isFollowedBy = otherUser.crushes.some(
-      (id) => id.toString() === userId
+      (id) => id.toString() === userId,
     );
 
     return res.status(200).json({
@@ -1781,7 +1901,7 @@ app.get("/users/:userId/connect-eligibility/:otherUserId", async (req, res) => {
     }
 
     const canConnect = (user.coAttendees || []).some(
-      (id) => id.toString() === otherUserId
+      (id) => id.toString() === otherUserId,
     );
 
     return res.status(200).json({ canConnect });
@@ -1808,7 +1928,7 @@ app.post("/users/:userId/upload", imageUploadSingle, async (req, res) => {
     try {
       normalized = await normalizeProfileImageToJpeg(
         req.file.buffer,
-        req.file.mimetype
+        req.file.mimetype,
       );
     } catch (e) {
       return res.status(400).json({ error: e?.message || "Invalid image" });
@@ -1833,7 +1953,7 @@ app.post("/users/:userId/upload", imageUploadSingle, async (req, res) => {
       const user = await User.findByIdAndUpdate(
         userId,
         { $addToSet: { profileImages: imageUrl } },
-        { new: true }
+        { new: true },
       );
 
       if (!user) {
@@ -1895,7 +2015,7 @@ app.get("/profiles", async (req, res) => {
     const matchIds = (currentUser.Matches || []).map((id) => id.toString());
     const crushIds = (currentUser.crushes || []).map((id) => id.toString());
     const dislikeIds = (currentUser.profileDislikes || []).map((id) =>
-      id.toString()
+      id.toString(),
     );
 
     // All IDs to exclude
@@ -1903,7 +2023,9 @@ app.get("/profiles", async (req, res) => {
 
     // Convert back to ObjectIds for MongoDB
     const excludedObjectIds = excludedIds.map((id) =>
-      mongoose.Types.ObjectId.isValid(id) ? new mongoose.Types.ObjectId(id) : id
+      mongoose.Types.ObjectId.isValid(id)
+        ? new mongoose.Types.ObjectId(id)
+        : id,
     );
 
     // Determine gender filter
@@ -1922,9 +2044,9 @@ app.get("/profiles", async (req, res) => {
         $gte: minAge.toString(),
         $lte: maxAge.toString(),
       },
-      profileImages: { $exists: true, $ne: [] },  // Faster than $not: { $size: 0 }
-      anonymous: { $ne: true },                    // Simpler than $or with $exists
-      flagged: { $ne: true },                      // Simpler than $and/$or with $exists
+      profileImages: { $exists: true, $ne: [] }, // Faster than $not: { $size: 0 }
+      anonymous: { $ne: true }, // Simpler than $or with $exists
+      flagged: { $ne: true }, // Simpler than $and/$or with $exists
       // Recency is based on account creation time
       createdAt: { $gte: recentAccountThreshold },
     };
@@ -2002,8 +2124,10 @@ app.get("/profiles", async (req, res) => {
 
       // If we don't have enough profiles, use $facet to get both priority and newest in one query
       if (countryProfiles.length < 20) {
-        const existingProfileIds = countryProfiles.map((p) => 
-          mongoose.Types.ObjectId.isValid(p._id) ? new mongoose.Types.ObjectId(p._id) : p._id
+        const existingProfileIds = countryProfiles.map((p) =>
+          mongoose.Types.ObjectId.isValid(p._id)
+            ? new mongoose.Types.ObjectId(p._id)
+            : p._id,
         );
         const neededProfiles = 20 - countryProfiles.length;
 
@@ -2048,9 +2172,11 @@ app.get("/profiles", async (req, res) => {
           // Add newest non-priority users that aren't already included
           const stillNeeded = 20 - countryProfiles.length;
           if (stillNeeded > 0) {
-            const existingIds = new Set(countryProfiles.map((p) => p._id.toString()));
+            const existingIds = new Set(
+              countryProfiles.map((p) => p._id.toString()),
+            );
             const uniqueNonPriority = nonPriorityUsers.filter(
-              (p) => !existingIds.has(p._id.toString())
+              (p) => !existingIds.has(p._id.toString()),
             );
             countryProfiles.push(...uniqueNonPriority.slice(0, stillNeeded));
           }
@@ -2111,7 +2237,7 @@ app.get("/profiles", async (req, res) => {
         } catch (countryErr) {
           console.error(
             "Failed to resolve user country in background:",
-            countryErr?.message || countryErr
+            countryErr?.message || countryErr,
           );
         }
       }
@@ -2130,7 +2256,7 @@ app.get("/profiles", async (req, res) => {
             parsedLat,
             parsedLong,
             profile.location.coordinates[1],
-            profile.location.coordinates[0]
+            profile.location.coordinates[0],
           );
         }
       });
@@ -2140,13 +2266,22 @@ app.get("/profiles", async (req, res) => {
     if (rankedProfiles.length > 0) {
       try {
         const now = new Date();
-        const boostedIds = rankedProfiles.map((p) => p._id?.toString()).filter(Boolean);
+        const boostedIds = rankedProfiles
+          .map((p) => p._id?.toString())
+          .filter(Boolean);
         await Boost.updateMany(
-          { userId: { $in: boostedIds }, status: "active", expiresAt: { $gt: now } },
-          { $inc: { impressionCount: 1 } }
+          {
+            userId: { $in: boostedIds },
+            status: "active",
+            expiresAt: { $gt: now },
+          },
+          { $inc: { impressionCount: 1 } },
         );
       } catch (impressionErr) {
-        console.error("[Boost] Impression tracking error:", impressionErr?.message);
+        console.error(
+          "[Boost] Impression tracking error:",
+          impressionErr?.message,
+        );
       }
     }
 
@@ -2156,7 +2291,7 @@ app.get("/profiles", async (req, res) => {
       nearbyCount: rankedProfiles.filter((p) => p.distance != null).length,
       userCountry: userCountry || "Unknown",
       sameCountryCount: rankedProfiles.filter(
-        (p) => p.location?.country === userCountry
+        (p) => p.location?.country === userCountry,
       ).length,
     });
   } catch (error) {
@@ -2179,15 +2314,19 @@ app.post("/likeprofile", async (req, res) => {
     // Find the current user and selected user
     const currentUser = await User.findById(currentUserId);
     const selectedUser = await User.findById(selectedUserId).select(
-      "pushToken recievedLikes"
+      "pushToken recievedLikes",
     );
 
     // Gate: must have attended at least one shared activity (coAttendees)
-    if (currentUser && !(currentUser.coAttendees || []).some(
-      (id) => id.toString() === selectedUserId
-    )) {
+    if (
+      currentUser &&
+      !(currentUser.coAttendees || []).some(
+        (id) => id.toString() === selectedUserId,
+      )
+    ) {
       return res.status(403).json({
-        message: "You need to have attended at least 1 activity with this person before you can connect with them.",
+        message:
+          "You need to have attended at least 1 activity with this person before you can connect with them.",
       });
     }
 
@@ -2257,24 +2396,26 @@ app.get("/recievedLikes/:userId/info", async (req, res) => {
 
     // Extract the IDs of the current user's disliked profiles
     const deslikedProfileId = (currentUser.profileDislikes || []).map(
-      (profileDeslike) => profileDeslike.toString()
+      (profileDeslike) => profileDeslike.toString(),
     );
 
     // Find users in the recievedLikes array but exclude disliked profiles
     const recievedLikesArray = await User.find({
       _id: { $in: currentUser.recievedLikes, $nin: deslikedProfileId },
-    }).select(
-      "_id name age gender profileImages location interests verified lastActiveAt updatedAt"
-    ).lean();
+    })
+      .select(
+        "_id name age gender profileImages location interests verified lastActiveAt updatedAt",
+      )
+      .lean();
 
     // Add mutual interests and format response for premium features
     const formattedLikes = recievedLikesArray.map((user) => {
       const userInterests = user.interests || [];
       const currentUserInterests = currentUser.interests || [];
-      const mutualInterests = userInterests.filter(
-        (interest) => currentUserInterests.includes(interest)
+      const mutualInterests = userInterests.filter((interest) =>
+        currentUserInterests.includes(interest),
       );
-      
+
       return {
         ...user,
         mutualInterests,
@@ -2333,18 +2474,28 @@ app.post("/super-wave", async (req, res) => {
     const { senderId, receiverId } = req.body;
 
     if (!senderId || !receiverId) {
-      return res.status(400).json({ message: "senderId and receiverId are required" });
+      return res
+        .status(400)
+        .json({ message: "senderId and receiverId are required" });
     }
 
-    const sender = await User.findById(senderId).select("name profileImages crushes coAttendees").lean();
-    const receiver = await User.findById(receiverId).select("pushToken recievedLikes").lean();
+    const sender = await User.findById(senderId)
+      .select("name profileImages crushes coAttendees")
+      .lean();
+    const receiver = await User.findById(receiverId)
+      .select("pushToken recievedLikes")
+      .lean();
 
     // Gate: must have attended at least one shared activity (coAttendees)
-    if (sender && !(sender.coAttendees || []).some(
-      (id) => id.toString() === receiverId.toString()
-    )) {
+    if (
+      sender &&
+      !(sender.coAttendees || []).some(
+        (id) => id.toString() === receiverId.toString(),
+      )
+    ) {
       return res.status(403).json({
-        message: "You need to have attended at least 1 activity with this person before you can connect with them.",
+        message:
+          "You need to have attended at least 1 activity with this person before you can connect with them.",
       });
     }
 
@@ -2354,7 +2505,7 @@ app.post("/super-wave", async (req, res) => {
 
     // Check if already liked to avoid duplicates
     const alreadyLiked = receiver.recievedLikes?.some(
-      (id) => id.toString() === senderId.toString()
+      (id) => id.toString() === senderId.toString(),
     );
 
     if (!alreadyLiked) {
@@ -2380,7 +2531,10 @@ app.post("/super-wave", async (req, res) => {
           actorImage: sender.profileImages?.[0] || null,
         });
       } catch (notifErr) {
-        console.error("[Super Wave] profile_like notification failed (wave still succeeded):", notifErr?.message || notifErr);
+        console.error(
+          "[Super Wave] profile_like notification failed (wave still succeeded):",
+          notifErr?.message || notifErr,
+        );
       }
     }
 
@@ -2396,10 +2550,15 @@ app.post("/super-wave", async (req, res) => {
         actorImage: sender.profileImages?.[0] || null,
       });
     } catch (notifErr) {
-      console.error("[Super Wave] super_wave notification failed (wave still succeeded):", notifErr?.message || notifErr);
+      console.error(
+        "[Super Wave] super_wave notification failed (wave still succeeded):",
+        notifErr?.message || notifErr,
+      );
     }
 
-    console.log(`Super Wave sent from ${senderId} to ${receiverId}${alreadyLiked ? ' (already liked)' : ' (like added)'}`);
+    console.log(
+      `Super Wave sent from ${senderId} to ${receiverId}${alreadyLiked ? " (already liked)" : " (like added)"}`,
+    );
     res.status(200).json({ message: "Super Wave sent successfully" });
   } catch (error) {
     console.error("Error sending super wave:", error);
@@ -2415,19 +2574,39 @@ app.post("/super-flirts", async (req, res) => {
     const { senderId, receiverId, message } = req.body;
 
     if (!senderId || !receiverId) {
-      return res.status(400).json({ message: "senderId and receiverId are required" });
+      return res
+        .status(400)
+        .json({ message: "senderId and receiverId are required" });
     }
 
-    if (!message || typeof message !== "string" || message.trim().length === 0) {
-      return res.status(400).json({ message: "message is required and cannot be empty" });
+    if (
+      !message ||
+      typeof message !== "string" ||
+      message.trim().length === 0
+    ) {
+      return res
+        .status(400)
+        .json({ message: "message is required and cannot be empty" });
     }
 
     if (message.length > 150) {
-      return res.status(400).json({ message: "message must be 150 characters or fewer" });
+      return res
+        .status(400)
+        .json({ message: "message must be 150 characters or fewer" });
     }
 
     const now = new Date();
-    const startOfTodayUTC = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+    const startOfTodayUTC = new Date(
+      Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate(),
+        0,
+        0,
+        0,
+        0,
+      ),
+    );
     const sentToday = await SuperFlirt.countDocuments({
       senderId,
       createdAt: { $gte: startOfTodayUTC },
@@ -2438,8 +2617,12 @@ app.post("/super-flirts", async (req, res) => {
       });
     }
 
-    const sender = await User.findById(senderId).select("name profileImages crushes").lean();
-    const receiver = await User.findById(receiverId).select("pushToken preferredLanguage recievedLikes").lean();
+    const sender = await User.findById(senderId)
+      .select("name profileImages crushes")
+      .lean();
+    const receiver = await User.findById(receiverId)
+      .select("pushToken preferredLanguage recievedLikes")
+      .lean();
 
     if (!sender || !receiver) {
       return res.status(404).json({ message: "User not found" });
@@ -2453,7 +2636,7 @@ app.post("/super-flirts", async (req, res) => {
     await superFlirt.save();
 
     const alreadyLiked = receiver.recievedLikes?.some(
-      (id) => id.toString() === senderId.toString()
+      (id) => id.toString() === senderId.toString(),
     );
 
     if (!alreadyLiked) {
@@ -2466,9 +2649,15 @@ app.post("/super-flirts", async (req, res) => {
     }
 
     try {
-      const sfStrings = getStrings(receiver.preferredLanguage).superFlirtReceived;
-      const sfTitle = interpolate(sfStrings.title, { name: sender.name || "Someone" });
-      const sfBody = interpolate(sfStrings.body, { name: sender.name || "Someone" });
+      const sfStrings = getStrings(
+        receiver.preferredLanguage,
+      ).superFlirtReceived;
+      const sfTitle = interpolate(sfStrings.title, {
+        name: sender.name || "Someone",
+      });
+      const sfBody = interpolate(sfStrings.body, {
+        name: sender.name || "Someone",
+      });
 
       await createNotificationWithCaps({
         userId: receiverId,
@@ -2487,11 +2676,19 @@ app.post("/super-flirts", async (req, res) => {
         });
       }
     } catch (notifErr) {
-      console.error("[Super Flirt] notification failed:", notifErr?.message || notifErr);
+      console.error(
+        "[Super Flirt] notification failed:",
+        notifErr?.message || notifErr,
+      );
     }
 
     console.log(`Super Flirt sent from ${senderId} to ${receiverId}`);
-    res.status(200).json({ message: "Super Flirt sent successfully", superFlirtId: superFlirt._id });
+    res
+      .status(200)
+      .json({
+        message: "Super Flirt sent successfully",
+        superFlirtId: superFlirt._id,
+      });
   } catch (error) {
     console.error("Error sending super flirt:", error);
     res.status(500).json({ message: "Failed to send Super Flirt" });
@@ -2514,11 +2711,15 @@ app.post("/super-flirts/:id/match", async (req, res) => {
     }
 
     if (superFlirt.receiverId.toString() !== currentUserId.toString()) {
-      return res.status(403).json({ message: "Not authorized to match this Super Flirt" });
+      return res
+        .status(403)
+        .json({ message: "Not authorized to match this Super Flirt" });
     }
 
     if (superFlirt.status !== "pending") {
-      return res.status(400).json({ message: "Super Flirt has already been actioned" });
+      return res
+        .status(400)
+        .json({ message: "Super Flirt has already been actioned" });
     }
 
     superFlirt.status = "matched";
@@ -2547,16 +2748,28 @@ app.post("/super-flirts/:id/match", async (req, res) => {
     await openerMessage.save();
 
     // Send match push notification to the original sender
-    const senderUser = await User.findById(senderId).select("pushToken preferredLanguage").lean();
+    const senderUser = await User.findById(senderId)
+      .select("pushToken preferredLanguage")
+      .lean();
     if (senderUser?.pushToken) {
       try {
-        const sfMatch = getStrings(senderUser.preferredLanguage).superFlirtMatched;
-        await sendNotification(senderUser.pushToken, sfMatch.title, sfMatch.body, {
-          type: "super_flirt_match",
-          actorId: currentUserId.toString(),
-        });
+        const sfMatch = getStrings(
+          senderUser.preferredLanguage,
+        ).superFlirtMatched;
+        await sendNotification(
+          senderUser.pushToken,
+          sfMatch.title,
+          sfMatch.body,
+          {
+            type: "super_flirt_match",
+            actorId: currentUserId.toString(),
+          },
+        );
       } catch (pushErr) {
-        console.error("[Super Flirt Match] push notification failed:", pushErr?.message || pushErr);
+        console.error(
+          "[Super Flirt Match] push notification failed:",
+          pushErr?.message || pushErr,
+        );
       }
     }
 
@@ -2584,11 +2797,15 @@ app.post("/super-flirts/:id/pass", async (req, res) => {
     }
 
     if (superFlirt.receiverId.toString() !== currentUserId.toString()) {
-      return res.status(403).json({ message: "Not authorized to pass this Super Flirt" });
+      return res
+        .status(403)
+        .json({ message: "Not authorized to pass this Super Flirt" });
     }
 
     if (superFlirt.status !== "pending") {
-      return res.status(400).json({ message: "Super Flirt has already been actioned" });
+      return res
+        .status(400)
+        .json({ message: "Super Flirt has already been actioned" });
     }
 
     superFlirt.status = "passed";
@@ -2623,7 +2840,10 @@ app.get("/boosts/status", async (req, res) => {
     const user = await User.findById(userId).select("boostCredits").lean();
     if (!user) return res.status(404).json({ message: "User not found" });
 
-    const activeBoost = await Boost.findOne({ userId, status: "active" }).lean();
+    const activeBoost = await Boost.findOne({
+      userId,
+      status: "active",
+    }).lean();
 
     res.status(200).json({
       active: !!activeBoost,
@@ -2647,16 +2867,25 @@ app.post("/boosts/activate", async (req, res) => {
     }
 
     if (!hasAccess) {
-      return res.status(403).json({ message: "Priority Boost requires a Flirt Gold subscription" });
+      return res
+        .status(403)
+        .json({ message: "Priority Boost requires a Flirt Gold subscription" });
     }
 
     // Enforce one active boost at a time
     const existingActive = await Boost.findOne({ userId, status: "active" });
     if (existingActive) {
-      return res.status(409).json({ message: "You already have an active Priority Boost", expires_at: existingActive.expiresAt });
+      return res
+        .status(409)
+        .json({
+          message: "You already have an active Priority Boost",
+          expires_at: existingActive.expiresAt,
+        });
     }
 
-    const user = await User.findById(userId).select("boostCredits pushToken preferredLanguage name").lean();
+    const user = await User.findById(userId)
+      .select("boostCredits pushToken preferredLanguage name")
+      .lean();
     if (!user) return res.status(404).json({ message: "User not found" });
 
     const creditsRemaining = user.boostCredits?.remaining ?? 0;
@@ -2683,11 +2912,19 @@ app.post("/boosts/activate", async (req, res) => {
     const boostActivatedStr = getStrings(user.preferredLanguage).boostActivated;
     if (user.pushToken) {
       try {
-        await sendNotification(user.pushToken, boostActivatedStr.title, boostActivatedStr.body, {
-          type: "boost_activated",
-        });
+        await sendNotification(
+          user.pushToken,
+          boostActivatedStr.title,
+          boostActivatedStr.body,
+          {
+            type: "boost_activated",
+          },
+        );
       } catch (notifErr) {
-        console.error("[Boost] Activation notification failed:", notifErr?.message);
+        console.error(
+          "[Boost] Activation notification failed:",
+          notifErr?.message,
+        );
       }
     }
 
@@ -2703,7 +2940,9 @@ app.post("/boosts/activate", async (req, res) => {
       console.error("[Boost] In-app notification failed:", notifErr?.message);
     }
 
-    console.log(`[Boost] Activated for user ${userId}, expires ${expiresAt.toISOString()}`);
+    console.log(
+      `[Boost] Activated for user ${userId}, expires ${expiresAt.toISOString()}`,
+    );
     res.status(200).json({
       message: "Priority Boost activated",
       boost_id: boost._id,
@@ -2728,7 +2967,7 @@ app.post("/boosts/reset-credits", async (req, res) => {
     const user = await User.findByIdAndUpdate(
       userId,
       { boostCredits: { remaining: BOOST_CREDITS_PER_CYCLE, resetAt } },
-      { new: true }
+      { new: true },
     ).select("pushToken preferredLanguage");
 
     if (!user) return res.status(404).json({ message: "User not found" });
@@ -2737,11 +2976,19 @@ app.post("/boosts/reset-credits", async (req, res) => {
 
     if (user.pushToken) {
       try {
-        await sendNotification(user.pushToken, boostResetStr.title, boostResetStr.body, {
-          type: "boost_credits_reset",
-        });
+        await sendNotification(
+          user.pushToken,
+          boostResetStr.title,
+          boostResetStr.body,
+          {
+            type: "boost_credits_reset",
+          },
+        );
       } catch (notifErr) {
-        console.error("[Boost] Credits reset notification failed:", notifErr?.message);
+        console.error(
+          "[Boost] Credits reset notification failed:",
+          notifErr?.message,
+        );
       }
     }
 
@@ -2753,11 +3000,20 @@ app.post("/boosts/reset-credits", async (req, res) => {
         message: boostResetStr.body,
       });
     } catch (notifErr) {
-      console.error("[Boost] Credits reset in-app notification failed:", notifErr?.message);
+      console.error(
+        "[Boost] Credits reset in-app notification failed:",
+        notifErr?.message,
+      );
     }
 
     console.log(`[Boost] Credits reset for user ${userId}`);
-    res.status(200).json({ message: "Boost credits reset", credits_remaining: BOOST_CREDITS_PER_CYCLE, credits_reset_at: resetAt });
+    res
+      .status(200)
+      .json({
+        message: "Boost credits reset",
+        credits_remaining: BOOST_CREDITS_PER_CYCLE,
+        credits_reset_at: resetAt,
+      });
   } catch (error) {
     console.error("Error resetting boost credits:", error);
     res.status(500).json({ message: "Failed to reset boost credits" });
@@ -2784,7 +3040,7 @@ app.post("/create-match", async (req, res) => {
 
     // Fetch the selected user's expo push token
     const selectedUser = await User.findById(selectedUserId).select(
-      "pushToken preferredLanguage"
+      "pushToken preferredLanguage",
     );
 
     // Only send notification if the expoPushToken is available
@@ -2822,7 +3078,7 @@ app.get("/matches/:userId/info", async (req, res) => {
 
     // Filter out matches that have the current user in their blockedBy array
     const filteredMatches = matches.filter(
-      (match) => !match.blockedBy.includes(userId)
+      (match) => !match.blockedBy.includes(userId),
     );
 
     // Populate each match with the latest message details and unread count
@@ -2832,7 +3088,7 @@ app.get("/matches/:userId/info", async (req, res) => {
 
         // Find the conversation for the current match
         const conversation = user.conversations.find(
-          (conv) => conv.receiverId.toString() === match._id.toString()
+          (conv) => conv.receiverId.toString() === match._id.toString(),
         );
 
         return {
@@ -2842,7 +3098,7 @@ app.get("/matches/:userId/info", async (req, res) => {
           typing: latestMessage?.typing || false,
           unreadCount: conversation ? conversation.unreadMessagesCount : 0, // Get unread count from conversations
         };
-      })
+      }),
     );
 
     // Sort matches by the timestamp of the latest message
@@ -2923,7 +3179,7 @@ app.delete("/users/:userId/images", async (req, res) => {
     console.log(
       `Image deleted from user ${userId} for reason: ${
         reason || "No reason provided"
-      }`
+      }`,
     );
 
     return res.status(200).json({
@@ -2997,8 +3253,12 @@ app.put("/push-notification-token/:userId", async (req, res) => {
     const { pushToken, language } = req.body;
 
     if (!pushToken && !language) {
-      console.log("🔔 [PUSH TOKEN API] ❌ No pushToken or language provided in request body");
-      return res.status(400).json({ message: "pushToken or language is required" });
+      console.log(
+        "🔔 [PUSH TOKEN API] ❌ No pushToken or language provided in request body",
+      );
+      return res
+        .status(400)
+        .json({ message: "pushToken or language is required" });
     }
 
     const supportedLanguages = ["en", "es", "ja", "de", "fr"];
@@ -3008,7 +3268,9 @@ app.put("/push-notification-token/:userId", async (req, res) => {
       updateData.preferredLanguage = language;
     }
 
-    const user = await User.findByIdAndUpdate(userId, updateData, { new: true });
+    const user = await User.findByIdAndUpdate(userId, updateData, {
+      new: true,
+    });
 
     if (!user) {
       console.log("🔔 [PUSH TOKEN API] ❌ User not found:", userId);
@@ -3017,12 +3279,18 @@ app.put("/push-notification-token/:userId", async (req, res) => {
 
     return res
       .status(200)
-      .json({ message: "user pushToken updated successfully", savedToken: user.pushToken });
+      .json({
+        message: "user pushToken updated successfully",
+        savedToken: user.pushToken,
+      });
   } catch (error) {
     console.error("🔔 [PUSH TOKEN API] ❌ ERROR:", error.message);
     res
       .status(500)
-      .json({ message: "Error updating users push token ", error: error.message });
+      .json({
+        message: "Error updating users push token ",
+        error: error.message,
+      });
   }
 });
 
@@ -3031,11 +3299,11 @@ app.post("/admin/migrate-user-platforms", async (req, res) => {
   try {
     const result = await User.updateMany(
       { platform: { $exists: false } },
-      { $set: { platform: "unknown" } }
+      { $set: { platform: "unknown" } },
     );
-    res.json({ 
-      message: "Migration completed", 
-      updated: result.modifiedCount 
+    res.json({
+      message: "Migration completed",
+      updated: result.modifiedCount,
     });
   } catch (error) {
     console.error("Error migrating user platforms:", error);
@@ -3078,7 +3346,7 @@ app.post("/user/:userId/update-location", async (req, res) => {
           },
         },
       },
-      { new: true }
+      { new: true },
     );
 
     if (!user) {
@@ -3141,23 +3409,23 @@ app.get("/nearby-users", async (req, res) => {
     // Fetch user data upfront (like /profiles endpoint) - optimized for performance
     let excludedIds = [];
     let genderFilter = null;
-    
+
     if (userId && mongoose.Types.ObjectId.isValid(userId)) {
       const currentUser = await User.findById(userId)
         .select("gender blockedBy")
         .lean();
-      
+
       if (currentUser) {
         // Exclude current user
         excludedIds.push(new mongoose.Types.ObjectId(userId));
-        
+
         // Exclude users who have blocked the current user
         if (currentUser.blockedBy?.length > 0) {
           excludedIds = excludedIds.concat(
-            currentUser.blockedBy.map(id => new mongoose.Types.ObjectId(id))
+            currentUser.blockedBy.map((id) => new mongoose.Types.ObjectId(id)),
           );
         }
-        
+
         // iOS Cuddles specific: Filter by opposite gender (dating app)
         if (currentUser.gender === "male") {
           genderFilter = "female";
@@ -3211,8 +3479,9 @@ app.get("/nearby-users", async (req, res) => {
     ]).option({ maxTimeMS: 5000 });
 
     res.status(200).json({
-      message: nearbyUsers.length > 0 ? "Nearby users found" : "No users found nearby",
-      users: nearbyUsers 
+      message:
+        nearbyUsers.length > 0 ? "Nearby users found" : "No users found nearby",
+      users: nearbyUsers,
     });
   } catch (error) {
     console.error("Error finding nearby users:", error);
@@ -3247,14 +3516,12 @@ app.delete("/users/:userId", async (req, res) => {
     const selfieUrl = userToDelete.profileVerification?.selfieUrl;
     if (selfieUrl) urls.push(selfieUrl);
 
-    const keys = urls
-      .map((u) => keyFromPublicUrl(u))
-      .filter(Boolean);
+    const keys = urls.map((u) => keyFromPublicUrl(u)).filter(Boolean);
 
     const failedR2Deletes = [];
     if (keys.length > 0) {
       const results = await Promise.allSettled(
-        keys.map((key) => deleteObjectFromR2(key))
+        keys.map((key) => deleteObjectFromR2(key)),
       );
       results.forEach((r, idx) => {
         if (r.status === "rejected") {
@@ -3280,7 +3547,7 @@ app.delete("/users/:userId", async (req, res) => {
     // Remove user from all event participants so they no longer appear in any activities
     await Event.updateMany(
       { "participants.userId": objectId },
-      { $pull: { participants: { userId: objectId } } }
+      { $pull: { participants: { userId: objectId } } },
     );
 
     return res.status(200).json({
@@ -3317,12 +3584,10 @@ app.put(
       try {
         normalized = await normalizeProfileImageToJpeg(
           req.file.buffer,
-          req.file.mimetype
+          req.file.mimetype,
         );
       } catch (e) {
-        return res
-          .status(400)
-          .json({ message: e?.message || "Invalid image" });
+        return res.status(400).json({ message: e?.message || "Invalid image" });
       }
 
       const key = buildUserImageKey({
@@ -3344,7 +3609,7 @@ app.put(
       const updatedUser = await User.findOneAndUpdate(
         { _id: userId },
         { $set: { "profileImages.0": imageUrl } }, // Replace the first image
-        { new: true }
+        { new: true },
       );
 
       if (!updatedUser) {
@@ -3359,7 +3624,7 @@ app.put(
       console.error("Error updating profile image:", error);
       res.status(500).json({ message: "Server error", error });
     }
-  }
+  },
 );
 
 app.put("/change-username/:userId", async (req, res) => {
@@ -3483,7 +3748,7 @@ app.post("/addToCrushes", async (req, res) => {
 
     // Check if the current user already has the selected user in their crushes
     const alreadyCrush = currentUser.crushes.some((crush) =>
-      crush.equals(selectedUser._id)
+      crush.equals(selectedUser._id),
     );
 
     if (alreadyCrush) {
@@ -3529,7 +3794,7 @@ app.post("/addToDislikes", async (req, res) => {
 
     // Check if the current user already has the selected user in their dislikes
     const alreadyDisliked = currentUser.profileDislikes.some(
-      (profileDislikes) => profileDislikes.equals(selectedUser._id)
+      (profileDislikes) => profileDislikes.equals(selectedUser._id),
     );
 
     if (alreadyDisliked) {
@@ -3575,7 +3840,7 @@ app.post("/blockUser", async (req, res) => {
 
     // Check if the current user already has the selected user in their dislikes
     const alreadyBlocked = selectedUser.blockedBy.some((blockedBy) =>
-      blockedBy.equals(currentUser)
+      blockedBy.equals(currentUser),
     );
 
     // Add the selected user's ObjectId to the current user's dislikes
@@ -3590,14 +3855,19 @@ app.post("/blockUser", async (req, res) => {
 });
 
 app.post("/report", async (req, res) => {
-  const { reporterId, reportedUserId, reportedEventId, reason, message } = req.body;
+  const { reporterId, reportedUserId, reportedEventId, reason, message } =
+    req.body;
 
   if (!reporterId || !message) {
-    return res.status(400).json({ error: "reporterId and message are required." });
+    return res
+      .status(400)
+      .json({ error: "reporterId and message are required." });
   }
 
   if (!reportedUserId && !reportedEventId) {
-    return res.status(400).json({ error: "reportedUserId or reportedEventId is required." });
+    return res
+      .status(400)
+      .json({ error: "reportedUserId or reportedEventId is required." });
   }
 
   try {
@@ -3905,7 +4175,7 @@ app.put("/user/:userId/name", async (req, res) => {
     const updatedUser = await User.findByIdAndUpdate(
       userId,
       { name },
-      { new: true } // Return the updated document
+      { new: true }, // Return the updated document
     );
 
     if (!updatedUser) {
@@ -3938,7 +4208,7 @@ app.put("/user/:userId/age", async (req, res) => {
     const updatedUser = await User.findByIdAndUpdate(
       userId,
       { age },
-      { new: true } // Return the updated document
+      { new: true }, // Return the updated document
     );
 
     if (!updatedUser) {
@@ -3964,7 +4234,7 @@ app.get("/by-date-range", async (req, res) => {
     const { startDate, endDate, page = 1, limit = 10 } = req.query;
 
     console.log(
-      `Fetching users between ${startDate} and ${endDate}, page ${page}, limit ${limit}`
+      `Fetching users between ${startDate} and ${endDate}, page ${page}, limit ${limit}`,
     );
 
     if (!startDate || !endDate) {
@@ -4052,7 +4322,9 @@ app.post("/admin/send-notification", async (req, res) => {
 
     for (const user of users) {
       try {
-        await sendNotification(user.pushToken, title, body, { type: "admin_broadcast" });
+        await sendNotification(user.pushToken, title, body, {
+          type: "admin_broadcast",
+        });
 
         // Update last notification timestamp
         await User.findByIdAndUpdate(user._id, {
@@ -4068,7 +4340,7 @@ app.post("/admin/send-notification", async (req, res) => {
         });
         console.error(
           `[Notification Endpoint] Failed to send notification to user ${user._id}:`,
-          error
+          error,
         );
       }
     }
@@ -4094,7 +4366,8 @@ app.post("/admin/send-notification", async (req, res) => {
 // ─── Regional Campaigns ───────────────────────────────────────────────────────
 
 function localTimeToUTC(localDateStr, tz) {
-  if (!localDateStr || !tz || tz === "UTC") return localDateStr ? new Date(localDateStr) : null;
+  if (!localDateStr || !tz || tz === "UTC")
+    return localDateStr ? new Date(localDateStr) : null;
   const [datePart, timePart] = localDateStr.split("T");
   if (!datePart || !timePart) return new Date(localDateStr);
   const [year, month, day] = datePart.split("-").map(Number);
@@ -4115,14 +4388,26 @@ app.get("/admin/regional-campaigns/preview-count", async (req, res) => {
     const gender = req.query.gender || null;
 
     if (isNaN(lat) || isNaN(lng) || isNaN(radiusM)) {
-      return res.status(400).json({ error: "lat, lng, and radiusM are required numbers" });
+      return res
+        .status(400)
+        .json({ error: "lat, lng, and radiusM are required numbers" });
     }
 
     const matchConditions = [{ pushToken: { $exists: true, $ne: null } }];
     if (eventsOnly) {
       matchConditions.push(
-        { $or: [{ lookingFor: { $exists: false } }, { lookingFor: { $size: 0 } }] },
-        { $or: [{ availability: { $exists: false } }, { availability: { $size: 0 } }] }
+        {
+          $or: [
+            { lookingFor: { $exists: false } },
+            { lookingFor: { $size: 0 } },
+          ],
+        },
+        {
+          $or: [
+            { availability: { $exists: false } },
+            { availability: { $size: 0 } },
+          ],
+        },
       );
     }
     if (gender) matchConditions.push({ gender });
@@ -4142,7 +4427,10 @@ app.get("/admin/regional-campaigns/preview-count", async (req, res) => {
 
     res.json({ count: result[0]?.count || 0 });
   } catch (err) {
-    console.error("[Regional Campaigns] Preview count error:", err?.message || err);
+    console.error(
+      "[Regional Campaigns] Preview count error:",
+      err?.message || err,
+    );
     res.status(500).json({ error: "Failed to get preview count" });
   }
 });
@@ -4152,7 +4440,8 @@ app.get("/admin/regional-campaigns", async (req, res) => {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
     const statusFilter = req.query.status;
-    const query = statusFilter && statusFilter !== "all" ? { status: statusFilter } : {};
+    const query =
+      statusFilter && statusFilter !== "all" ? { status: statusFilter } : {};
 
     const [campaigns, total] = await Promise.all([
       RegionalCampaign.find(query)
@@ -4173,30 +4462,56 @@ app.get("/admin/regional-campaigns", async (req, res) => {
 app.post("/admin/regional-campaigns", async (req, res) => {
   try {
     const {
-      name, regionType, country, center, radiusM,
-      title, message, timezone, scheduleAt,
-      requirePushToken, eventsOnly, audience, testUser,
+      name,
+      regionType,
+      country,
+      center,
+      radiusM,
+      title,
+      message,
+      timezone,
+      scheduleAt,
+      requirePushToken,
+      eventsOnly,
+      audience,
+      testUser,
     } = req.body;
 
     if (!name || !regionType || !title || !message) {
-      return res.status(400).json({ error: "name, regionType, title, and message are required" });
+      return res
+        .status(400)
+        .json({ error: "name, regionType, title, and message are required" });
     }
 
     if (testUser) {
       const lookup = testUser.trim();
       let foundUser;
       if (mongoose.Types.ObjectId.isValid(lookup)) {
-        foundUser = await User.findById(lookup).select("_id email name pushToken").lean();
+        foundUser = await User.findById(lookup)
+          .select("_id email name pushToken")
+          .lean();
       } else if (lookup.includes("@")) {
-        foundUser = await User.findOne({ email: lookup.toLowerCase() }).select("_id email name pushToken").lean();
+        foundUser = await User.findOne({ email: lookup.toLowerCase() })
+          .select("_id email name pushToken")
+          .lean();
       } else {
-        foundUser = await User.findOne({ name: { $regex: new RegExp(`^${lookup}$`, "i") } }).select("_id email name pushToken").lean();
+        foundUser = await User.findOne({
+          name: { $regex: new RegExp(`^${lookup}$`, "i") },
+        })
+          .select("_id email name pushToken")
+          .lean();
       }
       if (!foundUser) {
-        return res.status(400).json({ error: `Test user "${lookup}" not found` });
+        return res
+          .status(400)
+          .json({ error: `Test user "${lookup}" not found` });
       }
       if (!foundUser.pushToken) {
-        return res.status(400).json({ error: `Test user "${foundUser.email || foundUser.name}" has no push token` });
+        return res
+          .status(400)
+          .json({
+            error: `Test user "${foundUser.email || foundUser.name}" has no push token`,
+          });
       }
     }
 
@@ -4248,13 +4563,25 @@ app.put("/admin/regional-campaigns/:id", async (req, res) => {
     const campaign = await RegionalCampaign.findById(req.params.id);
     if (!campaign) return res.status(404).json({ error: "Campaign not found" });
     if (campaign.status !== "draft") {
-      return res.status(400).json({ error: "Only draft campaigns can be edited" });
+      return res
+        .status(400)
+        .json({ error: "Only draft campaigns can be edited" });
     }
 
     const {
-      name, regionType, country, center, radiusM,
-      title, message, timezone, scheduleAt,
-      requirePushToken, eventsOnly, audience, testUser,
+      name,
+      regionType,
+      country,
+      center,
+      radiusM,
+      title,
+      message,
+      timezone,
+      scheduleAt,
+      requirePushToken,
+      eventsOnly,
+      audience,
+      testUser,
     } = req.body;
 
     const updates = {};
@@ -4265,7 +4592,10 @@ app.put("/admin/regional-campaigns/:id", async (req, res) => {
     if (message != null) updates.message = message;
     if (timezone != null) updates.timezone = timezone;
     const updateTz = timezone || campaign.timezone || "UTC";
-    if (scheduleAt !== undefined) updates.scheduleAt = scheduleAt ? localTimeToUTC(scheduleAt, updateTz) : null;
+    if (scheduleAt !== undefined)
+      updates.scheduleAt = scheduleAt
+        ? localTimeToUTC(scheduleAt, updateTz)
+        : null;
     if (requirePushToken != null) updates.requirePushToken = requirePushToken;
     if (eventsOnly != null) updates.eventsOnly = eventsOnly;
     if (audience != null) updates.audience = audience;
@@ -4274,17 +4604,31 @@ app.put("/admin/regional-campaigns/:id", async (req, res) => {
         const lookup = testUser.trim();
         let foundUser;
         if (mongoose.Types.ObjectId.isValid(lookup)) {
-          foundUser = await User.findById(lookup).select("_id email name pushToken").lean();
+          foundUser = await User.findById(lookup)
+            .select("_id email name pushToken")
+            .lean();
         } else if (lookup.includes("@")) {
-          foundUser = await User.findOne({ email: lookup.toLowerCase() }).select("_id email name pushToken").lean();
+          foundUser = await User.findOne({ email: lookup.toLowerCase() })
+            .select("_id email name pushToken")
+            .lean();
         } else {
-          foundUser = await User.findOne({ name: { $regex: new RegExp(`^${lookup}$`, "i") } }).select("_id email name pushToken").lean();
+          foundUser = await User.findOne({
+            name: { $regex: new RegExp(`^${lookup}$`, "i") },
+          })
+            .select("_id email name pushToken")
+            .lean();
         }
         if (!foundUser) {
-          return res.status(400).json({ error: `Test user "${lookup}" not found` });
+          return res
+            .status(400)
+            .json({ error: `Test user "${lookup}" not found` });
         }
         if (!foundUser.pushToken) {
-          return res.status(400).json({ error: `Test user "${foundUser.email || foundUser.name}" has no push token` });
+          return res
+            .status(400)
+            .json({
+              error: `Test user "${foundUser.email || foundUser.name}" has no push token`,
+            });
         }
       }
       updates.testUser = testUser || null;
@@ -4294,7 +4638,11 @@ app.put("/admin/regional-campaigns/:id", async (req, res) => {
       updates.center = { type: "Point", coordinates: [center.lng, center.lat] };
     }
 
-    const updated = await RegionalCampaign.findByIdAndUpdate(req.params.id, updates, { new: true }).lean();
+    const updated = await RegionalCampaign.findByIdAndUpdate(
+      req.params.id,
+      updates,
+      { new: true },
+    ).lean();
     res.json(updated);
   } catch (err) {
     console.error("[Regional Campaigns] Update error:", err?.message || err);
@@ -4318,22 +4666,32 @@ app.post("/admin/regional-campaigns/:id/schedule", async (req, res) => {
     const campaign = await RegionalCampaign.findById(req.params.id);
     if (!campaign) return res.status(404).json({ error: "Campaign not found" });
     if (campaign.status !== "draft") {
-      return res.status(400).json({ error: "Only draft campaigns can be scheduled" });
+      return res
+        .status(400)
+        .json({ error: "Only draft campaigns can be scheduled" });
     }
 
     const scheduleTz = campaign.timezone || "UTC";
-    const scheduleAt = req.body.scheduleAt ? localTimeToUTC(req.body.scheduleAt, scheduleTz) : campaign.scheduleAt;
+    const scheduleAt = req.body.scheduleAt
+      ? localTimeToUTC(req.body.scheduleAt, scheduleTz)
+      : campaign.scheduleAt;
     if (!scheduleAt) {
-      return res.status(400).json({ error: "scheduleAt is required (set on campaign or in request)" });
+      return res
+        .status(400)
+        .json({
+          error: "scheduleAt is required (set on campaign or in request)",
+        });
     }
 
     const updated = await RegionalCampaign.findByIdAndUpdate(
       req.params.id,
       { status: "scheduled", scheduleAt },
-      { new: true }
+      { new: true },
     ).lean();
 
-    console.log(`[Regional Campaigns] Campaign "${campaign.name}" scheduled for ${scheduleAt}`);
+    console.log(
+      `[Regional Campaigns] Campaign "${campaign.name}" scheduled for ${scheduleAt}`,
+    );
     res.json(updated);
   } catch (err) {
     console.error("[Regional Campaigns] Schedule error:", err?.message || err);
@@ -4346,13 +4704,15 @@ app.post("/admin/regional-campaigns/:id/cancel", async (req, res) => {
     const campaign = await RegionalCampaign.findById(req.params.id);
     if (!campaign) return res.status(404).json({ error: "Campaign not found" });
     if (campaign.status !== "scheduled") {
-      return res.status(400).json({ error: "Only scheduled campaigns can be cancelled" });
+      return res
+        .status(400)
+        .json({ error: "Only scheduled campaigns can be cancelled" });
     }
 
     const updated = await RegionalCampaign.findByIdAndUpdate(
       req.params.id,
       { status: "cancelled" },
-      { new: true }
+      { new: true },
     ).lean();
 
     console.log(`[Regional Campaigns] Campaign "${campaign.name}" cancelled`);
@@ -4370,7 +4730,9 @@ app.post("/admin/regional-campaigns/:id/test", async (req, res) => {
 
     const { userId, userEmail, userName } = req.body;
     if (!userId && !userEmail && !userName) {
-      return res.status(400).json({ error: "Provide userId, userEmail, or userName" });
+      return res
+        .status(400)
+        .json({ error: "Provide userId, userEmail, or userName" });
     }
 
     let user;
@@ -4379,7 +4741,9 @@ app.post("/admin/regional-campaigns/:id/test", async (req, res) => {
     } else if (userEmail) {
       user = await User.findOne({ email: userEmail.toLowerCase().trim() });
     } else if (userName) {
-      user = await User.findOne({ name: { $regex: new RegExp(`^${userName.trim()}$`, "i") } });
+      user = await User.findOne({
+        name: { $regex: new RegExp(`^${userName.trim()}$`, "i") },
+      });
     }
 
     if (!user) return res.status(404).json({ error: "User not found" });
@@ -4397,7 +4761,9 @@ app.post("/admin/regional-campaigns/:id/test", async (req, res) => {
       message: campaign.message,
     });
 
-    console.log(`[Regional Campaigns] Test notification sent to ${user.email || user.name} for campaign "${campaign.name}"`);
+    console.log(
+      `[Regional Campaigns] Test notification sent to ${user.email || user.name} for campaign "${campaign.name}"`,
+    );
     res.json({
       success: true,
       recipient: { _id: user._id, email: user.email, name: user.name },
@@ -4415,7 +4781,9 @@ app.post("/admin/regional-campaigns/quick-test", async (req, res) => {
       return res.status(400).json({ error: "title and message are required" });
     }
     if (!userId && !userEmail && !userName) {
-      return res.status(400).json({ error: "Provide userId, userEmail, or userName" });
+      return res
+        .status(400)
+        .json({ error: "Provide userId, userEmail, or userName" });
     }
 
     let user;
@@ -4424,7 +4792,9 @@ app.post("/admin/regional-campaigns/quick-test", async (req, res) => {
     } else if (userEmail) {
       user = await User.findOne({ email: userEmail.toLowerCase().trim() });
     } else if (userName) {
-      user = await User.findOne({ name: { $regex: new RegExp(`^${userName.trim()}$`, "i") } });
+      user = await User.findOne({
+        name: { $regex: new RegExp(`^${userName.trim()}$`, "i") },
+      });
     }
 
     if (!user) return res.status(404).json({ error: "User not found" });
@@ -4433,13 +4803,18 @@ app.post("/admin/regional-campaigns/quick-test", async (req, res) => {
     }
 
     await sendNotification(user.pushToken, title, message);
-    console.log(`[Regional Campaigns] Quick test sent to ${user.email || user.name}: "${title}"`);
+    console.log(
+      `[Regional Campaigns] Quick test sent to ${user.email || user.name}: "${title}"`,
+    );
     res.json({
       success: true,
       recipient: { _id: user._id, email: user.email, name: user.name },
     });
   } catch (err) {
-    console.error("[Regional Campaigns] Quick test error:", err?.message || err);
+    console.error(
+      "[Regional Campaigns] Quick test error:",
+      err?.message || err,
+    );
     res.status(500).json({ error: "Failed to send test notification" });
   }
 });
@@ -4461,7 +4836,7 @@ app.post(
     try {
       const normalized = await normalizeProfileImageToJpeg(
         req.file.buffer,
-        req.file.mimetype
+        req.file.mimetype,
       );
 
       const key = buildUserImageKey({
@@ -4480,7 +4855,7 @@ app.post(
       const updatedUser = await User.findByIdAndUpdate(
         userId,
         { $addToSet: { profileImages: imageUrl } },
-        { new: true }
+        { new: true },
       ).select("_id name email profileImages");
 
       if (!updatedUser) {
@@ -4496,7 +4871,7 @@ app.post(
       console.error("R2 file upload failed:", error);
       return res.status(500).json({ error: "File upload failed" });
     }
-  }
+  },
 );
 
 // Endpoint to update user's anonymous mode
@@ -4514,7 +4889,7 @@ app.put("/users/:userId/anonymous", async (req, res) => {
     const updatedUser = await User.findByIdAndUpdate(
       userId,
       { anonymous },
-      { new: true }
+      { new: true },
     );
 
     if (!updatedUser) {
@@ -4569,12 +4944,12 @@ app.put("/set-priority/:userId", async (req, res) => {
     const updatedUser = await User.findByIdAndUpdate(
       userId,
       { priority: newPriority },
-      { new: true }
+      { new: true },
     );
 
     console.log(
       `Priority ${newPriority === 1 ? "set" : "removed"} for user:`,
-      updatedUser.name
+      updatedUser.name,
     );
     return res.status(200).json({
       message:
@@ -4621,7 +4996,7 @@ app.put("/users/:userId/flag", async (req, res) => {
         flagged: flagged,
         flagReason: flagged ? reason || "Flagged by admin" : "",
       },
-      { new: true }
+      { new: true },
     );
 
     if (!updatedUser) {
@@ -4687,7 +5062,7 @@ app.get("/admin/flagged-profiles", async (req, res) => {
     // Find all flagged users
     const flaggedUsers = await User.find({ flagged: true })
       .select(
-        "name email age gender profileImages flagged flagReason createdAt pushToken location.country"
+        "name email age gender profileImages flagged flagReason createdAt pushToken location.country",
       )
       .sort(sortOptions)
       .skip(skip)
@@ -4728,7 +5103,7 @@ app.post("/admin/users/bulk-delete", async (req, res) => {
 
     // Validate all IDs are valid ObjectIds
     const validIds = userIds.filter((id) =>
-      mongoose.Types.ObjectId.isValid(id)
+      mongoose.Types.ObjectId.isValid(id),
     );
 
     if (validIds.length !== userIds.length) {
@@ -4748,7 +5123,7 @@ app.post("/admin/users/bulk-delete", async (req, res) => {
     if (result.deletedCount > 0) {
       await Event.updateMany(
         { "participants.userId": { $in: objectIds } },
-        { $pull: { participants: { userId: { $in: objectIds } } } }
+        { $pull: { participants: { userId: { $in: objectIds } } } },
       );
     }
 
@@ -4784,7 +5159,7 @@ app.post("/admin/users/bulk-unflag", async (req, res) => {
 
     // Validate all IDs are valid ObjectIds
     const validIds = userIds.filter((id) =>
-      mongoose.Types.ObjectId.isValid(id)
+      mongoose.Types.ObjectId.isValid(id),
     );
 
     if (validIds.length !== userIds.length) {
@@ -4800,7 +5175,7 @@ app.post("/admin/users/bulk-unflag", async (req, res) => {
     // Update multiple users to unflag them
     const result = await User.updateMany(
       { _id: { $in: objectIds } },
-      { $set: { flagged: false, flagReason: "" } }
+      { $set: { flagged: false, flagReason: "" } },
     );
 
     console.log(`Successfully unflagged ${result.modifiedCount} users`);
@@ -4953,11 +5328,11 @@ app.get("/users-with-nearby", async (req, res) => {
         } catch (error) {
           console.error(
             `Error finding nearby users for user ${user._id}:`,
-            error
+            error,
           );
           return { ...user, nearbyUsers: [], nearbyCount: 0 };
         }
-      })
+      }),
     );
 
     // 3. Filter and sort users by nearby count
@@ -5033,7 +5408,7 @@ app.post("/admin/send-nearby-email", async (req, res) => {
     }
 
     console.log(
-      `Starting to send emails to ${users.length} users (${recentlyNotifiedCount} filtered out due to recent notifications)`
+      `Starting to send emails to ${users.length} users (${recentlyNotifiedCount} filtered out due to recent notifications)`,
     );
 
     // Send emails to all found users
@@ -5042,7 +5417,7 @@ app.post("/admin/send-nearby-email", async (req, res) => {
         "{count}",
         nearbyUserCounts && nearbyUserCounts[user._id.toString()]
           ? nearbyUserCounts[user._id.toString()].toString()
-          : "0"
+          : "0",
       );
 
       // Default template if none provided
@@ -5066,7 +5441,7 @@ app.post("/admin/send-nearby-email", async (req, res) => {
             "{count}",
             nearbyUserCounts && nearbyUserCounts[user._id.toString()]
               ? nearbyUserCounts[user._id.toString()].toString()
-              : "0"
+              : "0",
           );
       }
 
@@ -5113,7 +5488,7 @@ app.post("/admin/send-nearby-email", async (req, res) => {
     const failureCount = emailResults.length - successCount;
 
     console.log(
-      `Email sending complete: ${successCount} succeeded, ${failureCount} failed, ${recentlyNotifiedCount} skipped (recently notified)`
+      `Email sending complete: ${successCount} succeeded, ${failureCount} failed, ${recentlyNotifiedCount} skipped (recently notified)`,
     );
 
     res.status(200).json({
@@ -5218,7 +5593,7 @@ app.get("/admin/users", async (req, res) => {
     // Fetch users with query and pagination
     const users = await User.find(query)
       .select(
-        "name email age gender profileImages flagged flagReason priority createdAt pushToken location.country"
+        "name email age gender profileImages flagged flagReason priority createdAt pushToken location.country",
       )
       .sort(sortOptions)
       .skip(skip)
@@ -5260,7 +5635,7 @@ app.post(
       try {
         normalized = await normalizeProfileImageToJpeg(
           req.file.buffer,
-          req.file.mimetype
+          req.file.mimetype,
         );
       } catch (e) {
         return res.status(400).json({ error: e?.message || "Invalid image" });
@@ -5293,11 +5668,9 @@ app.post(
           updateData.instagramUrl = req.body.instagramUrl;
         }
 
-        const user = await User.findByIdAndUpdate(
-          userId,
-          updateData,
-          { new: true }
-        );
+        const user = await User.findByIdAndUpdate(userId, updateData, {
+          new: true,
+        });
 
         if (!user) {
           return res.status(404).json({ error: "User not found" });
@@ -5313,7 +5686,7 @@ app.post(
       console.error("Verification selfie upload failed:", error);
       res.status(500).json({ error: "Verification selfie upload failed" });
     }
-  }
+  },
 );
 
 // Endpoint to check verification status
@@ -5359,7 +5732,7 @@ app.put("/admin/users/:userId/verification-status", async (req, res) => {
         "profileVerification.reviewedBy": adminId,
         "profileVerification.notes": notes,
       },
-      { new: true }
+      { new: true },
     );
 
     if (!user) {
@@ -5399,7 +5772,7 @@ app.get("/admin/verifications/pending", async (req, res) => {
       "profileVerification.selfieUrl": { $ne: null },
     })
       .select(
-        "_id name email profileVerification.selfieUrl profileVerification.submittedAt profileImages"
+        "_id name email profileVerification.selfieUrl profileVerification.submittedAt profileImages",
       )
       .sort({ "profileVerification.submittedAt": -1 })
       .skip(skip)
@@ -5434,7 +5807,7 @@ const sendPushNotification = async (receiverId, title, body, data = {}) => {
 
     if (!user.pushToken) {
       console.log(
-        `[Push Notification] No push token found for user ${receiverId}`
+        `[Push Notification] No push token found for user ${receiverId}`,
       );
       return;
     }
@@ -5444,20 +5817,20 @@ const sendPushNotification = async (receiverId, title, body, data = {}) => {
       !user.pushToken.endsWith("]")
     ) {
       console.log(
-        `[Push Notification] Invalid push token format for user ${receiverId}`
+        `[Push Notification] Invalid push token format for user ${receiverId}`,
       );
       return;
     }
 
     console.log(
-      `[Push Notification] Sending message notification to user ${receiverId}`
+      `[Push Notification] Sending message notification to user ${receiverId}`,
     );
     await sendNotification(user.pushToken, title, body, data);
     console.log(`[Push Notification] Successfully sent to user ${receiverId}`);
   } catch (error) {
     console.error(
       `[Push Notification] Error sending to user ${receiverId}:`,
-      error
+      error,
     );
   }
 };
@@ -5518,7 +5891,7 @@ app.get("/admin/users-with-likes", async (req, res) => {
               gender: 1,
               profileImages: { $slice: 1 },
               pushToken: 1,
-            }
+            },
           ).lean();
 
           return {
@@ -5529,11 +5902,11 @@ app.get("/admin/users-with-likes", async (req, res) => {
         } catch (error) {
           console.error(
             `Error fetching like details for user ${user._id}:`,
-            error
+            error,
           );
           return { ...user, likedBy: [], likesCount: 0 };
         }
-      })
+      }),
     );
 
     // Filter and sort users by likes count
@@ -5611,12 +5984,12 @@ app.post("/admin/send-likes-notification", async (req, res) => {
             const lastSentDate = new Date(user.lastNotificationSent);
             const now = new Date();
             const daysSinceLastNotification = Math.floor(
-              (now - lastSentDate) / (1000 * 60 * 60 * 24)
+              (now - lastSentDate) / (1000 * 60 * 60 * 24),
             );
 
             if (daysSinceLastNotification < 7) {
               console.log(
-                `Skipping user ${userId} due to weekly notification limit`
+                `Skipping user ${userId} due to weekly notification limit`,
               );
               skippedCount++;
               return;
@@ -5642,17 +6015,19 @@ app.post("/admin/send-likes-notification", async (req, res) => {
               const title = "You have new likes!";
               const body = customMessage.replace(
                 "{likesCount}",
-                likesCount.toString()
+                likesCount.toString(),
               );
 
-              await sendNotification(user.pushToken, title, body, { type: "likes_campaign" });
+              await sendNotification(user.pushToken, title, body, {
+                type: "likes_campaign",
+              });
               pushCount++;
               notificationSent = true;
               console.log(`Push notification sent to user ${userId}`);
             } catch (pushError) {
               console.error(
                 `Error sending push notification to user ${userId}:`,
-                pushError
+                pushError,
               );
             }
           }
@@ -5671,7 +6046,7 @@ app.post("/admin/send-likes-notification", async (req, res) => {
                 to: user.email,
                 subject: emailSubject.replace(
                   /{likesCount}/g,
-                  likesCount.toString()
+                  likesCount.toString(),
                 ),
                 html: emailBody,
               };
@@ -5682,18 +6057,18 @@ app.post("/admin/send-likes-notification", async (req, res) => {
                 emailCount++;
                 notificationSent = true;
                 console.log(
-                  `Email notification sent to user ${userId} at ${user.email}`
+                  `Email notification sent to user ${userId} at ${user.email}`,
                 );
               } else {
                 console.error(
                   `Failed to send email to user ${userId}:`,
-                  emailResult.error
+                  emailResult.error,
                 );
               }
             } catch (emailError) {
               console.error(
                 `Error sending email to user ${userId}:`,
-                emailError
+                emailError,
               );
             }
           }
@@ -5713,7 +6088,7 @@ app.post("/admin/send-likes-notification", async (req, res) => {
           console.error(`Error sending notification to user ${userId}:`, error);
           failureCount++;
         }
-      })
+      }),
     );
 
     // Return the response with counts
@@ -5818,57 +6193,30 @@ app.post("/support-email", async (req, res) => {
 // OPEN TABLES / EVENTS ENDPOINTS
 // ============================================================
 
-/** Pure status transition logic (mirrors previous updateEventStatus behavior). */
-const computeNextEventStatus = (event) => {
-  const now = new Date();
-  let newStatus = event.status;
-
-  if (event.status === "cancelled" || event.status === "ended") {
-    return event.status;
-  }
-
-  const startTime =
-    event.startTime instanceof Date ? event.startTime : new Date(event.startTime);
-  const endTime = event.endTime
-    ? event.endTime instanceof Date
-      ? event.endTime
-      : new Date(event.endTime)
-    : null;
-  const capacity = event.capacity != null ? event.capacity : 6;
-
-  if (startTime <= now && event.status === "upcoming") {
-    newStatus = "live";
-  }
-
-  if (endTime && endTime <= now) {
-    newStatus = "ended";
-  }
-
-  const fourHoursAfterStart = new Date(startTime.getTime() + 4 * 60 * 60 * 1000);
-  if (now >= fourHoursAfterStart && newStatus !== "ended") {
-    newStatus = "ended";
-  }
-
-  const participants = event.participants || [];
-  const goingCount = participants.filter(
-    (p) => p && (p.status === "going" || p.status === "checked_in")
-  ).length;
-  if (goingCount >= capacity && newStatus !== "ended") {
-    newStatus = "full";
-  } else if (goingCount < capacity && event.status === "full") {
-    newStatus = startTime <= now ? "live" : "upcoming";
-  }
-
-  return newStatus;
-};
-
 // Helper function to update event status based on time
 const updateEventStatus = async (event) => {
+  const previousStatus = event.status;
   const newStatus = computeNextEventStatus(event);
 
   if (newStatus !== event.status) {
     event.status = newStatus;
     await event.save();
+    if (previousStatus !== "ended" && newStatus === "ended") {
+      try {
+        const payoutUpdate = await markEventPayoutsEligible({
+          eventId: event._id.toString(),
+        });
+        console.log("[EventStatus] Marked host payout ledger rows eligible", {
+          eventId: event._id.toString(),
+          ...payoutUpdate,
+        });
+      } catch (error) {
+        console.error("[EventStatus] Failed to mark payouts eligible", {
+          eventId: event._id.toString(),
+          message: error?.message,
+        });
+      }
+    }
   }
 
   return event;
@@ -5882,9 +6230,13 @@ const syncEventStatusesBatch = async () => {
   }).cursor();
 
   const bulkOps = [];
+  const transitionedToEnded = [];
   for await (const doc of cursor) {
     const next = computeNextEventStatus(doc);
     if (next !== doc.status) {
+      if (doc.status !== "ended" && next === "ended") {
+        transitionedToEnded.push(doc._id.toString());
+      }
       bulkOps.push({
         updateOne: {
           filter: { _id: doc._id },
@@ -5898,27 +6250,43 @@ const syncEventStatusesBatch = async () => {
     await Event.bulkWrite(bulkOps, { ordered: false });
   }
 
+  for (const eventId of transitionedToEnded) {
+    try {
+      await markEventPayoutsEligible({ eventId });
+    } catch (error) {
+      console.error("[EventStatusSync] Failed to mark payouts eligible", {
+        eventId,
+        message: error?.message,
+      });
+    }
+  }
+
   console.log(
-    `[EventStatusSync] Done in ${Date.now() - started}ms, updated ${bulkOps.length} event(s)`
+    `[EventStatusSync] Done in ${Date.now() - started}ms, updated ${bulkOps.length} event(s)`,
   );
 };
 
 const cleanupExpiredEvents = async () => {
   try {
     const cutoffDate = new Date(Date.now() - 6 * 60 * 60 * 1000); // 6 hours ago
-    console.log(`[Event Cleanup] Starting cleanup at ${new Date().toISOString()}`);
-    console.log(`[Event Cleanup] Deleting events with startTime before: ${cutoffDate.toISOString()}`);
-
-    const eventsToDelete = await Event.find({ startTime: { $lte: cutoffDate } }).select(
-      "_id participants missionStatsCounted"
+    console.log(
+      `[Event Cleanup] Starting cleanup at ${new Date().toISOString()}`,
     );
+    console.log(
+      `[Event Cleanup] Deleting events with startTime before: ${cutoffDate.toISOString()}`,
+    );
+
+    const eventsToDelete = await Event.find({
+      startTime: { $lte: cutoffDate },
+    }).select("_id participants missionStatsCounted");
     for (const event of eventsToDelete) {
       if (event.missionStatsCounted) {
         continue;
       }
 
       const toCredit = (event.participants || []).filter(
-        (p) => p && (p.status === "going" || p.status === "checked_in") && p.userId
+        (p) =>
+          p && (p.status === "going" || p.status === "checked_in") && p.userId,
       );
       for (const p of toCredit) {
         const uid = p.userId._id || p.userId;
@@ -5926,7 +6294,11 @@ const cleanupExpiredEvents = async () => {
           try {
             await User.findByIdAndUpdate(uid, { $inc: { eventsAttended: 1 } });
           } catch (err) {
-            console.error("[Event Cleanup] Error incrementing eventsAttended for user:", uid, err);
+            console.error(
+              "[Event Cleanup] Error incrementing eventsAttended for user:",
+              uid,
+              err,
+            );
           }
         }
       }
@@ -5937,17 +6309,24 @@ const cleanupExpiredEvents = async () => {
 
       // Safety-net: backfill coAttendees for all checked-in pairs before deletion
       const checkedIn = (event.participants || []).filter(
-        (p) => p && p.status === "checked_in" && p.userId
+        (p) => p && p.status === "checked_in" && p.userId,
       );
       for (let i = 0; i < checkedIn.length; i++) {
         for (let j = i + 1; j < checkedIn.length; j++) {
           const idA = checkedIn[i].userId._id || checkedIn[i].userId;
           const idB = checkedIn[j].userId._id || checkedIn[j].userId;
           try {
-            await User.findByIdAndUpdate(idA, { $addToSet: { coAttendees: idB } });
-            await User.findByIdAndUpdate(idB, { $addToSet: { coAttendees: idA } });
+            await User.findByIdAndUpdate(idA, {
+              $addToSet: { coAttendees: idB },
+            });
+            await User.findByIdAndUpdate(idB, {
+              $addToSet: { coAttendees: idA },
+            });
           } catch (coErr) {
-            console.error("[Event Cleanup] Error backfilling coAttendees:", coErr);
+            console.error(
+              "[Event Cleanup] Error backfilling coAttendees:",
+              coErr,
+            );
           }
         }
       }
@@ -5958,11 +6337,11 @@ const cleanupExpiredEvents = async () => {
     }
 
     const result = await Event.deleteMany({
-      startTime: { $lte: cutoffDate }
+      startTime: { $lte: cutoffDate },
     });
 
     console.log(
-      `[Event Cleanup] Cleanup completed. Removed ${result.deletedCount} event(s)`
+      `[Event Cleanup] Cleanup completed. Removed ${result.deletedCount} event(s)`,
     );
 
     return result;
@@ -5974,7 +6353,9 @@ const cleanupExpiredEvents = async () => {
 
 // Schedule cleanup to run every hour
 cron.schedule("0 * * * *", () => {
-  console.log(`[Event Cleanup] Cron job triggered at ${new Date().toISOString()}`);
+  console.log(
+    `[Event Cleanup] Cron job triggered at ${new Date().toISOString()}`,
+  );
   cleanupExpiredEvents().catch((error) => {
     console.error("[Event Cleanup] Cron job error:", error);
   });
@@ -5997,7 +6378,9 @@ cleanupExpiredEvents().catch((error) => {
 const expireSuggestions = async () => {
   try {
     const now = new Date();
-    console.log(`[Suggestion Expiry] Starting expiry check at ${now.toISOString()}`);
+    console.log(
+      `[Suggestion Expiry] Starting expiry check at ${now.toISOString()}`,
+    );
 
     // Find suggestions that have expired
     const expiredSuggestions = await Event.find({
@@ -6009,7 +6392,9 @@ const expireSuggestions = async () => {
       return;
     }
 
-    console.log(`[Suggestion Expiry] Found ${expiredSuggestions.length} expired suggestions`);
+    console.log(
+      `[Suggestion Expiry] Found ${expiredSuggestions.length} expired suggestions`,
+    );
 
     for (const suggestion of expiredSuggestions) {
       try {
@@ -6028,13 +6413,20 @@ const expireSuggestions = async () => {
           });
         }
 
-        console.log(`[Suggestion Expiry] Expired suggestion: ${suggestion.title}`);
+        console.log(
+          `[Suggestion Expiry] Expired suggestion: ${suggestion.title}`,
+        );
       } catch (notifError) {
-        console.error(`[Suggestion Expiry] Error processing suggestion ${suggestion._id}:`, notifError);
+        console.error(
+          `[Suggestion Expiry] Error processing suggestion ${suggestion._id}:`,
+          notifError,
+        );
       }
     }
 
-    console.log(`[Suggestion Expiry] Processed ${expiredSuggestions.length} expired suggestions`);
+    console.log(
+      `[Suggestion Expiry] Processed ${expiredSuggestions.length} expired suggestions`,
+    );
   } catch (error) {
     console.error("[Suggestion Expiry] Error expiring suggestions:", error);
     throw error;
@@ -6043,14 +6435,18 @@ const expireSuggestions = async () => {
 
 // Schedule suggestion expiry to run every 15 minutes
 cron.schedule("*/15 * * * *", () => {
-  console.log(`[Suggestion Expiry] Cron job triggered at ${new Date().toISOString()}`);
+  console.log(
+    `[Suggestion Expiry] Cron job triggered at ${new Date().toISOString()}`,
+  );
   expireSuggestions().catch((error) => {
     console.error("[Suggestion Expiry] Cron job error:", error);
   });
 });
 
 // Run suggestion expiry on startup
-console.log(`[Suggestion Expiry] Running initial expiry check on server startup`);
+console.log(
+  `[Suggestion Expiry] Running initial expiry check on server startup`,
+);
 expireSuggestions().catch((error) => {
   console.error("[Suggestion Expiry] Initial expiry error:", error);
 });
@@ -6073,29 +6469,35 @@ const sendEventReminders = async () => {
     }
 
     console.log(
-      `[Event Reminder] Found ${upcomingEvents.length} events starting soon`
+      `[Event Reminder] Found ${upcomingEvents.length} events starting soon`,
     );
 
     for (const event of upcomingEvents) {
       // Calculate time until event starts
       const minutesUntilStart = Math.round(
-        (event.startTime - now) / (1000 * 60)
+        (event.startTime - now) / (1000 * 60),
       );
       const timeString =
         minutesUntilStart > 60
           ? "1 hour"
           : minutesUntilStart > 1
-          ? `${minutesUntilStart} minutes`
-          : "soon";
+            ? `${minutesUntilStart} minutes`
+            : "soon";
 
       const eventReminderStr = getStrings("en").eventReminder;
       // Send reminder to all participants
       for (const participant of event.participants) {
         try {
           const lang = participant.userId?.preferredLanguage;
-          const str = (lang && getStrings(lang).eventReminder) ? getStrings(lang).eventReminder : eventReminderStr;
+          const str =
+            lang && getStrings(lang).eventReminder
+              ? getStrings(lang).eventReminder
+              : eventReminderStr;
           const title = str.title;
-          const message = interpolate(str.body, { eventTitle: event.title, timeString });
+          const message = interpolate(str.body, {
+            eventTitle: event.title,
+            timeString,
+          });
           await createNotificationWithCaps({
             userId: participant.userId._id || participant.userId,
             type: "event_reminder",
@@ -6107,7 +6509,7 @@ const sendEventReminders = async () => {
         } catch (notifError) {
           console.error(
             `Error creating reminder notification for user ${participant.userId}:`,
-            notifError
+            notifError,
           );
         }
       }
@@ -6117,7 +6519,7 @@ const sendEventReminders = async () => {
       await event.save();
 
       console.log(
-        `[Event Reminder] Sent reminders for event "${event.title}" to ${event.participants.length} participants`
+        `[Event Reminder] Sent reminders for event "${event.title}" to ${event.participants.length} participants`,
       );
     }
   } catch (error) {
@@ -6129,7 +6531,7 @@ const sendEventReminders = async () => {
 cron.schedule("*/15 * * * *", sendEventReminders);
 // Run once on startup
 sendEventReminders().catch((error) =>
-  console.error("[Event Reminder] Error on startup:", error)
+  console.error("[Event Reminder] Error on startup:", error),
 );
 
 // Send rating reminders: 2 hours after table ends (plan); if no endTime, fallback to 4h after startTime
@@ -6142,17 +6544,27 @@ const sendRatingReminders = async () => {
     const endedEvents = await Event.find({
       status: "ended",
       ratingReminderSent: { $ne: true },
-    }).populate("participants.userId", "name pushToken preferredLanguage").populate("hostId", "name");
+    })
+      .populate("participants.userId", "name pushToken preferredLanguage")
+      .populate("hostId", "name");
 
     const readyForReminder = endedEvents.filter((e) => {
-      if (e.endTime && e.endTime.getTime() <= twoHoursAgo.getTime()) return true;
-      if (!e.endTime && e.startTime && e.startTime.getTime() <= fourHoursAgo.getTime()) return true;
+      if (e.endTime && e.endTime.getTime() <= twoHoursAgo.getTime())
+        return true;
+      if (
+        !e.endTime &&
+        e.startTime &&
+        e.startTime.getTime() <= fourHoursAgo.getTime()
+      )
+        return true;
       return false;
     });
 
     if (readyForReminder.length === 0) return;
 
-    console.log(`[Rating Reminder] Found ${readyForReminder.length} events needing rating reminders`);
+    console.log(
+      `[Rating Reminder] Found ${readyForReminder.length} events needing rating reminders`,
+    );
 
     for (const event of readyForReminder) {
       const hostId = (event.hostId._id || event.hostId).toString();
@@ -6161,12 +6573,19 @@ const sendRatingReminders = async () => {
         const pUserId = participant.userId?._id || participant.userId;
         if (!pUserId) continue;
         if (pUserId.toString() === hostId) continue;
-        if (participant.status !== "going" && participant.status !== "checked_in") continue;
+        if (
+          participant.status !== "going" &&
+          participant.status !== "checked_in"
+        )
+          continue;
 
         try {
           const hostName = event.hostId?.name || "your host";
           const lang = participant.userId?.preferredLanguage;
-          const str = (lang && getStrings(lang).rateHost) ? getStrings(lang).rateHost : getStrings("en").rateHost;
+          const str =
+            lang && getStrings(lang).rateHost
+              ? getStrings(lang).rateHost
+              : getStrings("en").rateHost;
           const title = str.title;
           const message = interpolate(str.body, { hostName });
           await createNotificationWithCaps({
@@ -6178,7 +6597,10 @@ const sendRatingReminders = async () => {
             eventName: event.title,
           });
         } catch (notifError) {
-          console.error(`[Rating Reminder] Error notifying user ${pUserId}:`, notifError);
+          console.error(
+            `[Rating Reminder] Error notifying user ${pUserId}:`,
+            notifError,
+          );
         }
       }
 
@@ -6193,7 +6615,7 @@ const sendRatingReminders = async () => {
 
 cron.schedule("*/30 * * * *", sendRatingReminders);
 sendRatingReminders().catch((error) =>
-  console.error("[Rating Reminder] Error on startup:", error)
+  console.error("[Rating Reminder] Error on startup:", error),
 );
 
 // Cape Town weekend nudge: users within 80km of Cape Town, re-engagement cap, batch send
@@ -6265,16 +6687,26 @@ cron.schedule("* * * * *", async () => {
       scheduleAt: { $lte: now },
     });
     for (const campaign of due) {
-      console.log(`[Campaign Cron] Dispatching campaign "${campaign.name}" (${campaign._id})`);
+      console.log(
+        `[Campaign Cron] Dispatching campaign "${campaign.name}" (${campaign._id})`,
+      );
       try {
         if (getQueue()) {
           enqueueCampaign(campaign._id);
-          console.log(`[Campaign Cron] Enqueued "${campaign.name}" to Bull queue`);
+          console.log(
+            `[Campaign Cron] Enqueued "${campaign.name}" to Bull queue`,
+          );
         } else {
-          await executeCampaign(campaign._id, { shouldSendNotification, createNotificationWithCaps });
+          await executeCampaign(campaign._id, {
+            shouldSendNotification,
+            createNotificationWithCaps,
+          });
         }
       } catch (err) {
-        console.error(`[Campaign Cron] Failed to dispatch "${campaign.name}":`, err?.message || err);
+        console.error(
+          `[Campaign Cron] Failed to dispatch "${campaign.name}":`,
+          err?.message || err,
+        );
       }
     }
   } catch (err) {
@@ -6298,10 +6730,17 @@ cron.schedule("*/5 * * * *", async () => {
     for (const boost of needWarning) {
       if (boost.userId?.pushToken) {
         try {
-          const warnStr = getStrings(boost.userId.preferredLanguage).boostWarning;
-          await sendNotification(boost.userId.pushToken, warnStr.title, warnStr.body, {
-            type: "boost_warning",
-          });
+          const warnStr = getStrings(
+            boost.userId.preferredLanguage,
+          ).boostWarning;
+          await sendNotification(
+            boost.userId.pushToken,
+            warnStr.title,
+            warnStr.body,
+            {
+              type: "boost_warning",
+            },
+          );
         } catch (e) {
           console.error("[Boost Cron] Warning notif failed:", e?.message);
         }
@@ -6315,13 +6754,18 @@ cron.schedule("*/5 * * * *", async () => {
       status: "active",
       expiresAt: { $lte: now },
       expiryNotifSent: false,
-    }).populate("userId", "pushToken preferredLanguage boostCredits coordinates");
+    }).populate(
+      "userId",
+      "pushToken preferredLanguage boostCredits coordinates",
+    );
 
     for (const boost of expired) {
       // Coverage % calculation: impressionCount / distinct active users in same radius
       let coverage = 0;
       try {
-        const userDoc = await User.findById(boost.userId._id).select("coordinates").lean();
+        const userDoc = await User.findById(boost.userId._id)
+          .select("coordinates")
+          .lean();
         const coords = userDoc?.coordinates?.coordinates;
         let activeUsersInRadius = 1;
         if (coords && coords.length === 2) {
@@ -6332,10 +6776,17 @@ cron.schedule("*/5 * * * *", async () => {
                 $centerSphere: [coords, 50 / 6378.1],
               },
             },
-            updatedAt: { $gte: new Date(boost.activatedAt.getTime() - 24 * 60 * 60 * 1000) },
+            updatedAt: {
+              $gte: new Date(boost.activatedAt.getTime() - 24 * 60 * 60 * 1000),
+            },
           });
         }
-        coverage = Math.min(95, Math.round((boost.impressionCount / Math.max(1, activeUsersInRadius)) * 100));
+        coverage = Math.min(
+          95,
+          Math.round(
+            (boost.impressionCount / Math.max(1, activeUsersInRadius)) * 100,
+          ),
+        );
       } catch (e) {
         console.error("[Boost Cron] Coverage calc failed:", e?.message);
       }
@@ -6349,7 +6800,9 @@ cron.schedule("*/5 * * * *", async () => {
       // Reset priority
       await User.findByIdAndUpdate(boost.userId._id, { priority: 0 });
 
-      const expiredStr = getStrings(boost.userId?.preferredLanguage).boostExpired;
+      const expiredStr = getStrings(
+        boost.userId?.preferredLanguage,
+      ).boostExpired;
       const expiredTitle = expiredStr.title;
       const expiredBody = interpolate(expiredStr.body, {
         coverage,
@@ -6359,9 +6812,14 @@ cron.schedule("*/5 * * * *", async () => {
 
       if (boost.userId?.pushToken) {
         try {
-          await sendNotification(boost.userId.pushToken, expiredTitle, expiredBody, {
-            type: "boost_expired",
-          });
+          await sendNotification(
+            boost.userId.pushToken,
+            expiredTitle,
+            expiredBody,
+            {
+              type: "boost_expired",
+            },
+          );
         } catch (e) {
           console.error("[Boost Cron] Expiry notif failed:", e?.message);
         }
@@ -6378,7 +6836,9 @@ cron.schedule("*/5 * * * *", async () => {
         console.error("[Boost Cron] Expiry in-app notif failed:", e?.message);
       }
 
-      console.log(`[Boost Cron] Expired boost ${boost._id} for user ${boost.userId._id}, coverage ${coverage}%`);
+      console.log(
+        `[Boost Cron] Expired boost ${boost._id} for user ${boost.userId._id}, coverage ${coverage}%`,
+      );
     }
   } catch (error) {
     console.error("[Boost Cron] Error:", error);
@@ -6454,26 +6914,37 @@ app.post("/events", async (req, res) => {
 
     // Validate host gender matches audience restriction
     if (audience === "women_only" && host.gender !== "female") {
-      return res.status(400).json({ message: "Only women can create women-only events" });
+      return res
+        .status(400)
+        .json({ message: "Only women can create women-only events" });
     }
     if (audience === "men_only" && host.gender !== "male") {
-      return res.status(400).json({ message: "Only men can create men-only events" });
+      return res
+        .status(400)
+        .json({ message: "Only men can create men-only events" });
     }
 
     const normalizedIsPaid = Boolean(isPaid);
     const normalizedPriceAmount = Number(priceAmount || 0);
     const normalizedCurrency = (currency || "ZAR").toUpperCase();
     const normalizedPaymentPolicy =
-      paymentPolicy === "pay_after_approval" ? "pay_after_approval" : "pay_before_join";
+      paymentPolicy === "pay_after_approval"
+        ? "pay_after_approval"
+        : "pay_before_join";
 
     if (normalizedIsPaid) {
-      if (!Number.isFinite(normalizedPriceAmount) || normalizedPriceAmount <= 0) {
+      if (
+        !Number.isFinite(normalizedPriceAmount) ||
+        normalizedPriceAmount <= 0
+      ) {
         return res.status(400).json({
           message: "Paid events require a valid priceAmount greater than 0",
         });
       }
 
-      const hostPayoutProfile = await HostPayoutProfile.findOne({ userId: hostId }).lean();
+      const hostPayoutProfile = await HostPayoutProfile.findOne({
+        userId: hostId,
+      }).lean();
       if (!hostPayoutProfile || hostPayoutProfile.status !== "active") {
         return res.status(403).json({
           message: "Host payout profile must be active to create paid events",
@@ -6482,16 +6953,24 @@ app.post("/events", async (req, res) => {
     }
 
     // Check if this is a suggestion (single or group)
-    const isGroupSuggestion = status === "suggested" && Array.isArray(suggestedToUserIds) && suggestedToUserIds.length > 0;
-    const isSingleSuggestion = status === "suggested" && suggestedToUserId && !isGroupSuggestion;
+    const isGroupSuggestion =
+      status === "suggested" &&
+      Array.isArray(suggestedToUserIds) &&
+      suggestedToUserIds.length > 0;
+    const isSingleSuggestion =
+      status === "suggested" && suggestedToUserId && !isGroupSuggestion;
     const isSuggestion = isGroupSuggestion || isSingleSuggestion;
 
     // Validate target users for suggestions
     let targetUsers = [];
     if (isGroupSuggestion) {
-      targetUsers = await User.find({ _id: { $in: suggestedToUserIds } }).select("_id name gender profileImages");
+      targetUsers = await User.find({
+        _id: { $in: suggestedToUserIds },
+      }).select("_id name gender profileImages");
       if (targetUsers.length !== suggestedToUserIds.length) {
-        return res.status(404).json({ message: "One or more suggested users not found" });
+        return res
+          .status(404)
+          .json({ message: "One or more suggested users not found" });
       }
     } else if (isSingleSuggestion) {
       const targetUser = await User.findById(suggestedToUserId);
@@ -6506,7 +6985,7 @@ app.post("/events", async (req, res) => {
       const genderMap = { women_only: "female", men_only: "male" };
       const requiredGender = genderMap[audience];
       if (requiredGender) {
-        const mismatch = targetUsers.find(u => u.gender !== requiredGender);
+        const mismatch = targetUsers.find((u) => u.gender !== requiredGender);
         if (mismatch) {
           return res.status(400).json({
             message: `Can't suggest a ${audience === "women_only" ? "women-only" : "men-only"} event to ${mismatch.name}`,
@@ -6567,7 +7046,7 @@ app.post("/events", async (req, res) => {
     try {
       populatedEvent = await Event.findById(newEvent._id).populate(
         "hostId",
-        "name profileImages"
+        "name profileImages",
       );
     } catch (populateError) {
       console.error("Error populating event:", populateError);
@@ -6578,8 +7057,10 @@ app.post("/events", async (req, res) => {
     // Send success response immediately after event is created
     const suggestionCount = targetUsers.length;
     res.status(201).json({
-      message: isSuggestion 
-        ? (suggestionCount > 1 ? `Activity suggestion sent to ${suggestionCount} people` : "Activity suggestion sent")
+      message: isSuggestion
+        ? suggestionCount > 1
+          ? `Activity suggestion sent to ${suggestionCount} people`
+          : "Activity suggestion sent"
         : "Event created successfully",
       event: populatedEvent,
     });
@@ -6595,7 +7076,7 @@ app.post("/events", async (req, res) => {
                 userId: targetUser._id,
                 type: "activity_suggestion",
                 title: "Activity Suggestion",
-                message: isGroupSuggestion 
+                message: isGroupSuggestion
                   ? `${host.name} invited you and ${suggestionCount - 1} others to "${title}"`
                   : `${host.name} wants to do "${title}" with you`,
                 eventId: newEvent._id,
@@ -6604,25 +7085,40 @@ app.post("/events", async (req, res) => {
                 actorName: host.name,
                 actorImage: host.profileImages?.[0],
               });
-              console.log(`[Suggestion] Sent activity suggestion notification to ${targetUser.name}`);
+              console.log(
+                `[Suggestion] Sent activity suggestion notification to ${targetUser.name}`,
+              );
             } catch (notifError) {
-              console.error(`Error creating suggestion notification for user ${targetUser._id}:`, notifError);
+              console.error(
+                `Error creating suggestion notification for user ${targetUser._id}:`,
+                notifError,
+              );
             }
           }
-          console.log(`[Suggestion] Completed sending ${suggestionCount} suggestion notifications`);
+          console.log(
+            `[Suggestion] Completed sending ${suggestionCount} suggestion notifications`,
+          );
         } else {
           // Regular event - notify nearby users (within 50km)
           if (process.env.REDIS_URL && getQueue()) {
             enqueueNearbyEvent(newEvent._id);
-            console.log(`[Event Nearby] Enqueued event_nearby for event ${newEvent._id}`);
+            console.log(
+              `[Event Nearby] Enqueued event_nearby for event ${newEvent._id}`,
+            );
           } else {
             const [eventLng, eventLat] = location.coordinates;
             const maxDistanceMeters = 50000; // 50km
             const audienceQuery = {};
-            if (newEvent.audience === "women_only") audienceQuery.gender = "female";
-            else if (newEvent.audience === "men_only") audienceQuery.gender = "male";
-            const recentlyNotifiedInline = (await getRecentlyNotifiedUserIds("event_nearby", DISCOVERY_COOLDOWN_MS))
-              .map((id) => new mongoose.Types.ObjectId(id));
+            if (newEvent.audience === "women_only")
+              audienceQuery.gender = "female";
+            else if (newEvent.audience === "men_only")
+              audienceQuery.gender = "male";
+            const recentlyNotifiedInline = (
+              await getRecentlyNotifiedUserIds(
+                "event_nearby",
+                DISCOVERY_COOLDOWN_MS,
+              )
+            ).map((id) => new mongoose.Types.ObjectId(id));
             // Tier A: prefer users who haven't received event_nearby in the cooldown window.
             const tierAUsers = await User.aggregate([
               {
@@ -6634,9 +7130,13 @@ app.post("/events", async (req, res) => {
                   query: {
                     $and: [
                       { _id: { $ne: new mongoose.Types.ObjectId(hostId) } },
-                      ...(recentlyNotifiedInline.length ? [{ _id: { $nin: recentlyNotifiedInline } }] : []),
+                      ...(recentlyNotifiedInline.length
+                        ? [{ _id: { $nin: recentlyNotifiedInline } }]
+                        : []),
                       { pushToken: { $exists: true, $ne: null } },
-                      ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                      ...(audienceQuery.gender
+                        ? [{ gender: audienceQuery.gender }]
+                        : []),
                       ...EVENTS_ONLY_QUERY.$and,
                     ],
                   },
@@ -6649,13 +7149,22 @@ app.post("/events", async (req, res) => {
             let nearbyUsers = tierAUsers;
 
             // Tier B fallback: if the fresh pool is too small, fill from recently-notified users so we never hit 0 recipients.
-            if (nearbyUsers.length < MIN_FRESH_RECIPIENTS && recentlyNotifiedInline.length > 0) {
-              const remaining = Math.max(0, NEARBY_NOTIFY_LIMIT - nearbyUsers.length);
+            if (
+              nearbyUsers.length < MIN_FRESH_RECIPIENTS &&
+              recentlyNotifiedInline.length > 0
+            ) {
+              const remaining = Math.max(
+                0,
+                NEARBY_NOTIFY_LIMIT - nearbyUsers.length,
+              );
               if (remaining > 0) {
                 const tierBUsers = await User.aggregate([
                   {
                     $geoNear: {
-                      near: { type: "Point", coordinates: [eventLng, eventLat] },
+                      near: {
+                        type: "Point",
+                        coordinates: [eventLng, eventLat],
+                      },
                       distanceField: "distance",
                       maxDistance: maxDistanceMeters,
                       spherical: true,
@@ -6664,7 +7173,9 @@ app.post("/events", async (req, res) => {
                           { _id: { $ne: new mongoose.Types.ObjectId(hostId) } },
                           { _id: { $in: recentlyNotifiedInline } },
                           { pushToken: { $exists: true, $ne: null } },
-                          ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                          ...(audienceQuery.gender
+                            ? [{ gender: audienceQuery.gender }]
+                            : []),
                           ...EVENTS_ONLY_QUERY.$and,
                         ],
                       },
@@ -6676,7 +7187,9 @@ app.post("/events", async (req, res) => {
                 nearbyUsers = [...nearbyUsers, ...tierBUsers];
               }
             }
-            console.log(`[Event Nearby] Found ${nearbyUsers.length} users near new event "${title}"`);
+            console.log(
+              `[Event Nearby] Found ${nearbyUsers.length} users near new event "${title}"`,
+            );
             const eventNearbyStr = getStrings("en").eventNearby;
             const spotsOpen = Math.max(0, (newEvent.capacity || 6) - 1);
             for (const nearbyUser of nearbyUsers) {
@@ -6698,7 +7211,10 @@ app.post("/events", async (req, res) => {
                   actorName: host.name,
                 });
               } catch (notifError) {
-                console.error(`Error creating nearby notification for user ${nearbyUser._id}:`, notifError);
+                console.error(
+                  `Error creating nearby notification for user ${nearbyUser._id}:`,
+                  notifError,
+                );
               }
             }
           }
@@ -6767,10 +7283,14 @@ app.put("/events/:eventId", async (req, res) => {
     if (audience && audience !== event.audience) {
       const host = await User.findById(userId).select("gender");
       if (audience === "women_only" && host.gender !== "female") {
-        return res.status(400).json({ message: "Only women can host women-only events" });
+        return res
+          .status(400)
+          .json({ message: "Only women can host women-only events" });
       }
       if (audience === "men_only" && host.gender !== "male") {
-        return res.status(400).json({ message: "Only men can host men-only events" });
+        return res
+          .status(400)
+          .json({ message: "Only men can host men-only events" });
       }
 
       const genderMap = { women_only: "female", men_only: "male" };
@@ -6778,11 +7298,12 @@ app.put("/events/:eventId", async (req, res) => {
       if (requiredGender && event.participants.length > 0) {
         await event.populate("participants.userId", "gender");
         const mismatch = event.participants.some(
-          (p) => p.userId?.gender !== requiredGender
+          (p) => p.userId?.gender !== requiredGender,
         );
         if (mismatch) {
           return res.status(400).json({
-            message: "Can't change audience — some participants don't match this gender group",
+            message:
+              "Can't change audience — some participants don't match this gender group",
           });
         }
       }
@@ -6805,12 +7326,17 @@ app.put("/events/:eventId", async (req, res) => {
     if (typeof isPaid === "boolean") {
       if (isPaid) {
         const normalizedPriceAmount = Number(priceAmount ?? event.priceAmount);
-        if (!Number.isFinite(normalizedPriceAmount) || normalizedPriceAmount <= 0) {
+        if (
+          !Number.isFinite(normalizedPriceAmount) ||
+          normalizedPriceAmount <= 0
+        ) {
           return res.status(400).json({
             message: "Paid events require a valid priceAmount greater than 0",
           });
         }
-        const hostPayoutProfile = await HostPayoutProfile.findOne({ userId }).lean();
+        const hostPayoutProfile = await HostPayoutProfile.findOne({
+          userId,
+        }).lean();
         if (!hostPayoutProfile || hostPayoutProfile.status !== "active") {
           return res.status(403).json({
             message: "Host payout profile must be active to enable paid events",
@@ -6820,7 +7346,9 @@ app.put("/events/:eventId", async (req, res) => {
         event.priceAmount = Math.round(normalizedPriceAmount);
         event.currency = (currency || event.currency || "ZAR").toUpperCase();
         event.paymentPolicy =
-          paymentPolicy === "pay_after_approval" ? "pay_after_approval" : "pay_before_join";
+          paymentPolicy === "pay_after_approval"
+            ? "pay_after_approval"
+            : "pay_before_join";
       } else {
         event.isPaid = false;
         event.priceAmount = 0;
@@ -6828,7 +7356,10 @@ app.put("/events/:eventId", async (req, res) => {
     } else {
       if (priceAmount !== undefined && event.isPaid) {
         const normalizedPriceAmount = Number(priceAmount);
-        if (!Number.isFinite(normalizedPriceAmount) || normalizedPriceAmount <= 0) {
+        if (
+          !Number.isFinite(normalizedPriceAmount) ||
+          normalizedPriceAmount <= 0
+        ) {
           return res.status(400).json({
             message: "Paid events require a valid priceAmount greater than 0",
           });
@@ -6840,7 +7371,9 @@ app.put("/events/:eventId", async (req, res) => {
       }
       if (paymentPolicy && event.isPaid) {
         event.paymentPolicy =
-          paymentPolicy === "pay_after_approval" ? "pay_after_approval" : "pay_before_join";
+          paymentPolicy === "pay_after_approval"
+            ? "pay_after_approval"
+            : "pay_before_join";
       }
     }
 
@@ -6929,6 +7462,11 @@ app.delete("/events/:eventId", async (req, res) => {
       })
         .sort({ paidAt: -1, createdAt: -1 })
         .lean();
+      console.log("[EventCancel][Refund] Paid event cancellation refund scan", {
+        eventId: event._id?.toString(),
+        hostUserId: userId,
+        paidRecords: paidPayments.length,
+      });
 
       // Refund each participant at most once (latest paid record per user).
       const latestPaidByUser = new Map();
@@ -6941,15 +7479,31 @@ app.delete("/events/:eventId", async (req, res) => {
 
       for (const [participantId, payment] of latestPaidByUser.entries()) {
         refundSummary.attempted += 1;
+        console.log(
+          "[EventCancel][Refund] Attempting full refund (host cancel)",
+          {
+            eventId: event._id?.toString(),
+            participantId,
+            reference: payment.providerReference,
+            amountPaid: payment.amount,
+            baseAmount: payment.baseAmount,
+          },
+        );
         try {
           const refund = await createRefund({
             eventId: event._id.toString(),
             reference: payment.providerReference,
             requesterUserId: userId,
-            refundType: "ticket_only",
+            refundType: "full",
             reason: "Host cancelled paid event",
           });
           refundSummary.successful += 1;
+          console.log("[EventCancel][Refund] Refund success", {
+            eventId: event._id?.toString(),
+            participantId,
+            reference: payment.providerReference,
+            refundedAmount: refund?.amount || 0,
+          });
           refundSummary.results.push({
             userId: participantId,
             reference: payment.providerReference,
@@ -6963,6 +7517,12 @@ app.delete("/events/:eventId", async (req, res) => {
             message.includes("Payment not found")
           ) {
             refundSummary.skipped += 1;
+            console.log("[EventCancel][Refund] Refund skipped", {
+              eventId: event._id?.toString(),
+              participantId,
+              reference: payment.providerReference,
+              reason: message,
+            });
             refundSummary.results.push({
               userId: participantId,
               reference: payment.providerReference,
@@ -6971,6 +7531,12 @@ app.delete("/events/:eventId", async (req, res) => {
             });
           } else {
             refundSummary.failed += 1;
+            console.error("[EventCancel][Refund] Refund failed", {
+              eventId: event._id?.toString(),
+              participantId,
+              reference: payment.providerReference,
+              reason: message || "Refund failed",
+            });
             refundSummary.results.push({
               userId: participantId,
               reference: payment.providerReference,
@@ -7002,7 +7568,7 @@ app.delete("/events/:eventId", async (req, res) => {
     try {
       const deleteMessagesResult = await EventMessage.deleteMany({ eventId });
       console.log(
-        `[Event Delete] Deleted ${deleteMessagesResult.deletedCount} messages for event ${eventId}`
+        `[Event Delete] Deleted ${deleteMessagesResult.deletedCount} messages for event ${eventId}`,
       );
     } catch (messageError) {
       console.error("Error deleting event messages:", messageError);
@@ -7015,6 +7581,11 @@ app.delete("/events/:eventId", async (req, res) => {
 
     res.status(200).json({
       message: "Event cancelled and deleted successfully",
+      refunds: refundSummary,
+    });
+    console.log("[EventCancel] Completed cancellation with refund summary", {
+      eventId,
+      hostUserId: userId,
       refunds: refundSummary,
     });
   } catch (error) {
@@ -7049,7 +7620,8 @@ app.get("/events/nearby", async (req, res) => {
     let blockedUserIds = [];
     let userGender = gender || null;
     if (userId && mongoose.Types.ObjectId.isValid(userId)) {
-      const currentUser = await User.findById(userId).select("blockedBy gender");
+      const currentUser =
+        await User.findById(userId).select("blockedBy gender");
       if (currentUser) {
         blockedUserIds = currentUser.blockedBy.map((id) => id.toString());
         if (!userGender) userGender = currentUser.gender;
@@ -7201,7 +7773,8 @@ app.get("/events/search", async (req, res) => {
     // Exclude blocked users and apply audience filter
     let userGender = gender || null;
     if (userId && mongoose.Types.ObjectId.isValid(userId)) {
-      const currentUser = await User.findById(userId).select("blockedBy gender");
+      const currentUser =
+        await User.findById(userId).select("blockedBy gender");
       if (currentUser) {
         if (currentUser.blockedBy.length > 0) {
           query.hostId = { $nin: currentUser.blockedBy };
@@ -7211,7 +7784,10 @@ app.get("/events/search", async (req, res) => {
     }
 
     // Audience filter
-    const audienceFilter = [{ audience: { $exists: false } }, { audience: "everyone" }];
+    const audienceFilter = [
+      { audience: { $exists: false } },
+      { audience: "everyone" },
+    ];
     if (userGender === "female") {
       audienceFilter.push({ audience: "women_only" });
     } else if (userGender === "male") {
@@ -7342,56 +7918,6 @@ const hasUserInList = (list = [], targetUserId) => {
 
 const PAYMENT_HOLD_MS = 2 * 60 * 60 * 1000;
 
-const expirePendingPaidAdmissions = async (event) => {
-  if (!event?.isPaid || !Array.isArray(event.participants)) {
-    return { removedCount: 0 };
-  }
-
-  const now = new Date();
-  const pendingParticipantIds = event.participants
-    .filter((p) => p?.status === "interested")
-    .map((p) => p.userId?.toString())
-    .filter(Boolean);
-
-  if (!pendingParticipantIds.length) {
-    return { removedCount: 0 };
-  }
-
-  const expiredPayments = await EventPayment.find({
-    eventId: event._id,
-    userId: { $in: pendingParticipantIds },
-    admissionStatus: "pending_payment",
-    expiresAt: { $ne: null, $lte: now },
-  }).select("_id userId");
-
-  if (!expiredPayments.length) {
-    return { removedCount: 0 };
-  }
-
-  const expiredUserIds = new Set(expiredPayments.map((p) => p.userId.toString()));
-  event.participants = event.participants.filter(
-    (p) => !expiredUserIds.has(p.userId?.toString())
-  );
-
-  await EventPayment.updateMany(
-    {
-      _id: { $in: expiredPayments.map((p) => p._id) },
-      admissionStatus: "pending_payment",
-    },
-    {
-      $set: {
-        status: "expired",
-        admissionStatus: "expired",
-      },
-    }
-  );
-
-  event.status = computeNextEventStatus(event);
-  await event.save();
-
-  return { removedCount: expiredUserIds.size };
-};
-
 const promoteNextWaitlistedUser = async (event) => {
   if (event.requiresApproval) {
     return { handled: false, promoted: false };
@@ -7426,16 +7952,22 @@ const promoteNextWaitlistedUser = async (event) => {
       .select("name gender profileImages")
       .lean();
     if (!candidate) continue;
-    if (!candidate.profileImages || candidate.profileImages.length === 0) continue;
+    if (!candidate.profileImages || candidate.profileImages.length === 0)
+      continue;
 
     if (event.audience && event.audience !== "everyone") {
       if (candidate.gender !== genderMap[event.audience]) continue;
     }
 
     const blockedByHost = (hostUser?.blockedBy || []).some(
-      (blockedId) => blockedId?.toString() === normalizedCandidateUserId
+      (blockedId) => blockedId?.toString() === normalizedCandidateUserId,
     );
     if (blockedByHost) continue;
+
+    const capWait = event.capacity != null ? event.capacity : 6;
+    if (countOccupiedSeats(event) >= capWait) {
+      break;
+    }
 
     event.participants.push({
       userId: normalizedCandidateUserId,
@@ -7467,7 +7999,7 @@ const promoteNextWaitlistedUser = async (event) => {
     } catch (notifError) {
       console.error(
         "Error sending waitlist promotion notification:",
-        notifError
+        notifError,
       );
     }
   }
@@ -7488,7 +8020,9 @@ app.post("/events/:eventId/join", async (req, res) => {
       return res.status(400).json({ message: "Invalid ID format" });
     }
 
-    const joiningUser = await User.findById(userId).select("name gender profileImages");
+    const joiningUser = await User.findById(userId).select(
+      "name gender profileImages",
+    );
     if (!joiningUser) {
       return res.status(404).json({ message: "User not found" });
     }
@@ -7536,16 +8070,50 @@ app.post("/events/:eventId/join", async (req, res) => {
     await expirePendingPaidAdmissions(event);
 
     const existingParticipant = event.participants.find((p) =>
-      hasUserInList([p], userId)
+      hasUserInList([p], userId),
     );
     if (existingParticipant) {
+      const st = existingParticipant.status;
+      if (st === "going" || st === "checked_in") {
+        const updatedEvent = await Event.findById(eventId)
+          .populate("hostId", "name profileImages")
+          .populate("participants.userId", "name profileImages")
+          .populate("waitlist.userId", "name profileImages");
+        return res.status(200).json({
+          message: "Successfully joined event",
+          event: updatedEvent,
+        });
+      }
+      if (st === "interested" && event.isPaid) {
+        const settledPayment = await EventPayment.findOne({
+          eventId: event._id,
+          userId,
+          status: "paid",
+        })
+          .sort({ paidAt: -1, createdAt: -1 })
+          .lean();
+        if (settledPayment) {
+          const updatedEvent = await Event.findById(eventId)
+            .populate("hostId", "name profileImages")
+            .populate("participants.userId", "name profileImages")
+            .populate("waitlist.userId", "name profileImages");
+          return res.status(200).json({
+            message: "Successfully joined event",
+            event: updatedEvent,
+          });
+        }
+        return res.status(402).json({
+          message: "Payment required before joining this event",
+          code: "payment_required",
+        });
+      }
       return res
         .status(400)
         .json({ message: "You have already joined this event" });
     }
 
     const existingRequest = event.joinRequests.find((r) =>
-      hasUserInList([r], userId)
+      hasUserInList([r], userId),
     );
     if (existingRequest) {
       return res
@@ -7554,7 +8122,7 @@ app.post("/events/:eventId/join", async (req, res) => {
     }
 
     const existingWaitlistEntry = event.waitlist.find((w) =>
-      hasUserInList([w], userId)
+      hasUserInList([w], userId),
     );
     if (existingWaitlistEntry) {
       return res.status(400).json({
@@ -7584,9 +8152,11 @@ app.post("/events/:eventId/join", async (req, res) => {
     const isHostSelfJoin = event.hostId.toString() === userId;
 
     // Check if user is blocked by host
-    const host = await User.findById(event.hostId).select("blockedBy preferredLanguage");
+    const host = await User.findById(event.hostId).select(
+      "blockedBy preferredLanguage",
+    );
     const blockedByHost = (host?.blockedBy || []).some(
-      (blockedId) => blockedId.toString() === userId
+      (blockedId) => blockedId.toString() === userId,
     );
     if (blockedByHost) {
       return res.status(403).json({ message: "You cannot join this event" });
@@ -7633,7 +8203,7 @@ app.post("/events/:eventId/join", async (req, res) => {
           actorImage: joiningUser.profileImages?.[0],
         });
         console.log(
-          `[JoinRequest] Created event_join_request notification for host=${event.hostId} from user=${userId} on event=${event._id}`
+          `[JoinRequest] Created event_join_request notification for host=${event.hostId} from user=${userId} on event=${event._id}`,
         );
       } catch (notifError) {
         console.error("Error creating join request notification:", notifError);
@@ -7651,11 +8221,13 @@ app.post("/events/:eventId/join", async (req, res) => {
       joinedAt: new Date(),
     });
 
-    // Update event status if now full
+    // Update event status if now full (paid events count payment-hold `interested`)
     const goingCount = event.participants.filter(
-      (p) => p.status === "going" || p.status === "checked_in"
+      (p) => p.status === "going" || p.status === "checked_in",
     ).length;
-    if (goingCount >= event.capacity) {
+    const occupiedAfterJoin = countOccupiedSeats(event);
+    const capacityJoin = event.capacity != null ? event.capacity : 6;
+    if (occupiedAfterJoin >= capacityJoin) {
       event.status = "full";
     }
 
@@ -7665,9 +8237,16 @@ app.post("/events/:eventId/join", async (req, res) => {
     const isFirstJoin = goingCount === 2;
     try {
       const hostLang = host?.preferredLanguage;
-      const str = (hostLang && getStrings(hostLang).firstJoin) ? getStrings(hostLang).firstJoin : getStrings("en").firstJoin;
-      const title = isFirstJoin ? interpolate(str.title, {}) : "New participant joined";
-      const message = isFirstJoin ? interpolate(str.body, { name: joiningUser.name }) : `${joiningUser.name} joined your event "${event.title}"`;
+      const str =
+        hostLang && getStrings(hostLang).firstJoin
+          ? getStrings(hostLang).firstJoin
+          : getStrings("en").firstJoin;
+      const title = isFirstJoin
+        ? interpolate(str.title, {})
+        : "New participant joined";
+      const message = isFirstJoin
+        ? interpolate(str.body, { name: joiningUser.name })
+        : `${joiningUser.name} joined your event "${event.title}"`;
       await createNotificationWithCaps({
         userId: event.hostId,
         type: "event_joined",
@@ -7683,23 +8262,32 @@ app.post("/events/:eventId/join", async (req, res) => {
     }
 
     // When event first reaches 60% capacity: notify host + nearby users who haven't joined (plan: table heating up / filling fast)
-    const atSixtyPercent = event.capacity > 0 && goingCount / event.capacity >= 0.6;
+    const atSixtyPercent =
+      event.capacity > 0 && goingCount / event.capacity >= 0.6;
     if (atSixtyPercent && !event.sixtyPercentNotifSent) {
       try {
-        const hostForNotif = await User.findById(event.hostId).select("name preferredLanguage").lean();
+        const hostForNotif = await User.findById(event.hostId)
+          .select("name preferredLanguage")
+          .lean();
         const taken = goingCount;
         const total = event.capacity;
         const left = Math.max(0, total - taken);
 
         // Host: "Your table is heating up"
-        const hostStr = (hostForNotif?.preferredLanguage && getStrings(hostForNotif.preferredLanguage).table60Full)
-          ? getStrings(hostForNotif.preferredLanguage).table60Full
-          : getStrings("en").table60Full;
+        const hostStr =
+          hostForNotif?.preferredLanguage &&
+          getStrings(hostForNotif.preferredLanguage).table60Full
+            ? getStrings(hostForNotif.preferredLanguage).table60Full
+            : getStrings("en").table60Full;
         await createNotificationWithCaps({
           userId: event.hostId,
           type: "table_60_full",
           title: hostStr.title,
-          message: interpolate(hostStr.body, { taken: String(taken), total: String(total), left: String(left) }),
+          message: interpolate(hostStr.body, {
+            taken: String(taken),
+            total: String(total),
+            left: String(left),
+          }),
           eventId: event._id,
           eventName: event.title,
         });
@@ -7708,19 +8296,33 @@ app.post("/events/:eventId/join", async (req, res) => {
         const useQueue = process.env.REDIS_URL && getQueue();
         if (useQueue) {
           enqueueNearby60Fill(event._id);
-          console.log(`[60% fill] Enqueued event_nearby_60 for event ${event._id}; worker will set sixtyPercentNotifSent`);
+          console.log(
+            `[60% fill] Enqueued event_nearby_60 for event ${event._id}; worker will set sixtyPercentNotifSent`,
+          );
         } else {
           const [eventLng, eventLat] = event.location?.coordinates || [];
           const participantIds = event.participants.map((p) => p.userId);
-          const excludeIds = [event.hostId, ...participantIds].map((id) => (id && id._id ? id._id : id));
+          const excludeIds = [event.hostId, ...participantIds].map((id) =>
+            id && id._id ? id._id : id,
+          );
           if (eventLng != null && eventLat != null && excludeIds.length > 0) {
             const audienceQuery = {};
-            if (event.audience === "women_only") audienceQuery.gender = "female";
-            else if (event.audience === "men_only") audienceQuery.gender = "male";
-            const recentlyNotified60Inline = (await getRecentlyNotifiedUserIds("table_filling_fast", DISCOVERY_COOLDOWN_MS))
-              .map((id) => new mongoose.Types.ObjectId(id));
+            if (event.audience === "women_only")
+              audienceQuery.gender = "female";
+            else if (event.audience === "men_only")
+              audienceQuery.gender = "male";
+            const recentlyNotified60Inline = (
+              await getRecentlyNotifiedUserIds(
+                "table_filling_fast",
+                DISCOVERY_COOLDOWN_MS,
+              )
+            ).map((id) => new mongoose.Types.ObjectId(id));
             const allExcludeIdsInline = [
-              ...excludeIds.map((id) => (id instanceof mongoose.Types.ObjectId ? id : new mongoose.Types.ObjectId(id))),
+              ...excludeIds.map((id) =>
+                id instanceof mongoose.Types.ObjectId
+                  ? id
+                  : new mongoose.Types.ObjectId(id),
+              ),
               ...recentlyNotified60Inline,
             ];
             const nearbyNotJoined = await User.aggregate([
@@ -7734,7 +8336,9 @@ app.post("/events/:eventId/join", async (req, res) => {
                     $and: [
                       { _id: { $nin: allExcludeIdsInline } },
                       { pushToken: { $exists: true, $ne: null } },
-                      ...(audienceQuery.gender ? [{ gender: audienceQuery.gender }] : []),
+                      ...(audienceQuery.gender
+                        ? [{ gender: audienceQuery.gender }]
+                        : []),
                       ...EVENTS_ONLY_QUERY.$and,
                     ],
                   },
@@ -7747,10 +8351,15 @@ app.post("/events/:eventId/join", async (req, res) => {
             const hostName = hostForNotif?.name || "Someone";
             for (const u of nearbyNotJoined) {
               try {
-                const str = (u.preferredLanguage && getStrings(u.preferredLanguage).tableFillingFast)
-                  ? getStrings(u.preferredLanguage).tableFillingFast
-                  : fillStrEn;
-                const title = interpolate(str.title, { name: hostName, activity: event.title });
+                const str =
+                  u.preferredLanguage &&
+                  getStrings(u.preferredLanguage).tableFillingFast
+                    ? getStrings(u.preferredLanguage).tableFillingFast
+                    : fillStrEn;
+                const title = interpolate(str.title, {
+                  name: hostName,
+                  activity: event.title,
+                });
                 const message = str.body;
                 await createNotificationWithCaps({
                   userId: u._id,
@@ -7763,16 +8372,25 @@ app.post("/events/:eventId/join", async (req, res) => {
                   actorName: hostName,
                 });
               } catch (e) {
-                console.error("[60% fill] Nearby notif failed for user", u._id, e?.message);
+                console.error(
+                  "[60% fill] Nearby notif failed for user",
+                  u._id,
+                  e?.message,
+                );
               }
             }
-            console.log(`[60% fill] Notified host + ${nearbyNotJoined.length} nearby users for "${event.title}"`);
+            console.log(
+              `[60% fill] Notified host + ${nearbyNotJoined.length} nearby users for "${event.title}"`,
+            );
           }
           event.sixtyPercentNotifSent = true;
           await event.save();
         }
       } catch (err) {
-        console.error("[60% fill] Error sending 60% notifications:", err?.message || err);
+        console.error(
+          "[60% fill] Error sending 60% notifications:",
+          err?.message || err,
+        );
       }
     }
 
@@ -7812,7 +8430,7 @@ app.post("/events/:eventId/join-request-by-email", async (req, res) => {
     }
 
     const joiningUser = await User.findOne({ email }).select(
-      "name gender profileImages"
+      "name gender profileImages",
     );
     if (!joiningUser) {
       return res.status(404).json({ message: "User not found for this email" });
@@ -7841,7 +8459,7 @@ app.post("/events/:eventId/join-request-by-email", async (req, res) => {
 
     // Make sure user is not already a participant
     const existingParticipant = event.participants.find((p) =>
-      hasUserInList([p], userId)
+      hasUserInList([p], userId),
     );
     if (existingParticipant) {
       return res
@@ -7856,7 +8474,7 @@ app.post("/events/:eventId/join-request-by-email", async (req, res) => {
 
     // Check for an existing pending request
     const existingRequest = event.joinRequests.find((r) =>
-      hasUserInList([r], userId)
+      hasUserInList([r], userId),
     );
     if (existingRequest) {
       return res.status(400).json({
@@ -7886,7 +8504,10 @@ app.post("/events/:eventId/join-request-by-email", async (req, res) => {
         actorImage: joiningUser.profileImages?.[0],
       });
     } catch (notifError) {
-      console.error("Error creating join request notification (test helper):", notifError);
+      console.error(
+        "Error creating join request notification (test helper):",
+        notifError,
+      );
     }
 
     return res.status(200).json({
@@ -7930,7 +8551,7 @@ app.put("/events/:eventId/rsvp", async (req, res) => {
 
     // Find participant
     const participantIndex = event.participants.findIndex(
-      (p) => p.userId.toString() === userId
+      (p) => p.userId.toString() === userId,
     );
     if (participantIndex === -1) {
       return res
@@ -7942,13 +8563,12 @@ app.put("/events/:eventId/rsvp", async (req, res) => {
     event.participants[participantIndex].status = status;
 
     // Update event status if needed
-    const goingCount = event.participants.filter(
-      (p) => p.status === "going" || p.status === "checked_in"
-    ).length;
+    const occupiedRsvp = countOccupiedSeats(event);
+    const capacityRsvp = event.capacity != null ? event.capacity : 6;
 
-    if (goingCount >= event.capacity && event.status !== "ended") {
+    if (occupiedRsvp >= capacityRsvp && event.status !== "ended") {
       event.status = "full";
-    } else if (goingCount < event.capacity && event.status === "full") {
+    } else if (occupiedRsvp < capacityRsvp && event.status === "full") {
       const now = new Date();
       event.status = event.startTime <= now ? "live" : "upcoming";
     }
@@ -8008,7 +8628,7 @@ app.post("/events/:eventId/check-in", async (req, res) => {
 
     // Find participant
     const participantIndex = event.participants.findIndex(
-      (p) => (p.userId && p.userId.toString()) === userId
+      (p) => (p.userId && p.userId.toString()) === userId,
     );
     if (participantIndex === -1) {
       return res
@@ -8017,7 +8637,11 @@ app.post("/events/:eventId/check-in", async (req, res) => {
     }
 
     // Validate event location
-    if (!event.location || !event.location.coordinates || event.location.coordinates.length < 2) {
+    if (
+      !event.location ||
+      !event.location.coordinates ||
+      event.location.coordinates.length < 2
+    ) {
       return res.status(400).json({
         message: "Event location is invalid; check-in is not available.",
       });
@@ -8032,7 +8656,8 @@ app.post("/events/:eventId/check-in", async (req, res) => {
     const distance = calculateDistance(userLat, userLng, eventLat, eventLng);
     if (distance == null || Number.isNaN(distance)) {
       return res.status(400).json({
-        message: "Invalid location for check-in. Please ensure location is enabled.",
+        message:
+          "Invalid location for check-in. Please ensure location is enabled.",
       });
     }
 
@@ -8042,7 +8667,7 @@ app.post("/events/:eventId/check-in", async (req, res) => {
     if (distanceInMeters > checkInRadius) {
       return res.status(400).json({
         message: `You must be within ${checkInRadius}m of the event location to check in. You are ${Math.round(
-          distanceInMeters
+          distanceInMeters,
         )}m away.`,
       });
     }
@@ -8054,15 +8679,17 @@ app.post("/events/:eventId/check-in", async (req, res) => {
     // Persist co-attendee ledger: mutual $addToSet for every other checked-in participant
     const otherCheckedIn = event.participants.filter(
       (p) =>
-        p.status === "checked_in" &&
-        p.userId &&
-        p.userId.toString() !== userId
+        p.status === "checked_in" && p.userId && p.userId.toString() !== userId,
     );
     for (const peer of otherCheckedIn) {
       const peerId = peer.userId._id || peer.userId;
       try {
-        await User.findByIdAndUpdate(userId, { $addToSet: { coAttendees: peerId } });
-        await User.findByIdAndUpdate(peerId, { $addToSet: { coAttendees: userId } });
+        await User.findByIdAndUpdate(userId, {
+          $addToSet: { coAttendees: peerId },
+        });
+        await User.findByIdAndUpdate(peerId, {
+          $addToSet: { coAttendees: userId },
+        });
       } catch (coErr) {
         console.error("[Check-in] Error updating coAttendees:", coErr);
       }
@@ -8080,9 +8707,17 @@ app.post("/events/:eventId/check-in", async (req, res) => {
 
     for (const participant of otherParticipants) {
       try {
-        const ciStr = getStrings(participant.preferredLanguage).eventCheckin || getStrings("en").eventCheckin;
-        const title = interpolate(ciStr.title, { name: checkedInUser.name, eventTitle: event.title });
-        const message = interpolate(ciStr.body, { name: checkedInUser.name, eventTitle: event.title });
+        const ciStr =
+          getStrings(participant.preferredLanguage).eventCheckin ||
+          getStrings("en").eventCheckin;
+        const title = interpolate(ciStr.title, {
+          name: checkedInUser.name,
+          eventTitle: event.title,
+        });
+        const message = interpolate(ciStr.body, {
+          name: checkedInUser.name,
+          eventTitle: event.title,
+        });
         await createNotificationWithCaps({
           userId: participant._id,
           type: "event_checkin",
@@ -8116,183 +8751,183 @@ app.post("/events/:eventId/check-in", async (req, res) => {
 });
 
 // Approve a pending join request (host only)
-app.post(
-  "/events/:eventId/join-requests/:userId/approve",
-  async (req, res) => {
-    try {
-      const { eventId, userId } = req.params;
+app.post("/events/:eventId/join-requests/:userId/approve", async (req, res) => {
+  try {
+    const { eventId, userId } = req.params;
 
-      if (
-        !mongoose.Types.ObjectId.isValid(eventId) ||
-        !mongoose.Types.ObjectId.isValid(userId)
-      ) {
-        return res.status(400).json({ message: "Invalid ID format" });
-      }
+    if (
+      !mongoose.Types.ObjectId.isValid(eventId) ||
+      !mongoose.Types.ObjectId.isValid(userId)
+    ) {
+      return res.status(400).json({ message: "Invalid ID format" });
+    }
 
-      const event = await Event.findById(eventId);
-      if (!event) {
-        return res.status(404).json({ message: "Event not found" });
-      }
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
 
-      if (!Array.isArray(event.joinRequests)) {
-        event.joinRequests = [];
-      }
+    if (!Array.isArray(event.joinRequests)) {
+      event.joinRequests = [];
+    }
 
-      const requestIndex = event.joinRequests.findIndex((r) =>
-        hasUserInList([r], userId)
-      );
-      if (requestIndex === -1) {
-        return res
-          .status(404)
-          .json({ message: "Join request not found for this user" });
-      }
+    const requestIndex = event.joinRequests.findIndex((r) =>
+      hasUserInList([r], userId),
+    );
+    if (requestIndex === -1) {
+      return res
+        .status(404)
+        .json({ message: "Join request not found for this user" });
+    }
 
-      // Remove from pending requests
-      event.joinRequests.splice(requestIndex, 1);
+    // Remove from pending requests
+    event.joinRequests.splice(requestIndex, 1);
 
-      await expirePendingPaidAdmissions(event);
+    await expirePendingPaidAdmissions(event);
 
-      const alreadyParticipant = hasUserInList(event.participants, userId);
-      const now = new Date();
+    const alreadyParticipant = hasUserInList(event.participants, userId);
+    const capacityApprove = event.capacity != null ? event.capacity : 6;
+    if (!alreadyParticipant && countOccupiedSeats(event) >= capacityApprove) {
+      return res.status(400).json({ message: "Event is full" });
+    }
 
-      if (!alreadyParticipant) {
-        event.participants.push({
+    const now = new Date();
+
+    if (!alreadyParticipant) {
+      event.participants.push({
+        userId,
+        status: event.isPaid ? "interested" : "going",
+        joinedAt: now,
+      });
+    }
+
+    if (event.isPaid) {
+      const holdExpiresAt = new Date(Date.now() + PAYMENT_HOLD_MS);
+      await EventPayment.findOneAndUpdate(
+        {
+          eventId: event._id,
           userId,
-          status: event.isPaid ? "interested" : "going",
-          joinedAt: now,
-        });
-      }
-
-      if (event.isPaid) {
-        const holdExpiresAt = new Date(Date.now() + PAYMENT_HOLD_MS);
-        await EventPayment.findOneAndUpdate(
-          {
+          admissionStatus: "pending_payment",
+          status: { $in: ["initialized", "pending"] },
+        },
+        {
+          $setOnInsert: {
             eventId: event._id,
             userId,
+            hostId: event.hostId,
+            provider: "mock",
+            providerReference: `HOLD_${event._id}_${userId}_${Date.now()}`,
+            amount: event.priceAmount || 0,
+            currency: event.currency || "ZAR",
+            baseAmount: event.priceAmount || 0,
+            appFeeAmount: 0,
+            processingFeeAmount: 0,
+            taxAmount: 0,
+            quoteId: "",
+            providerPayload: { holdOnly: true },
+          },
+          $set: {
+            expiresAt: holdExpiresAt,
             admissionStatus: "pending_payment",
-            status: { $in: ["initialized", "pending"] },
+            status: "pending",
           },
-          {
-            $setOnInsert: {
-              eventId: event._id,
-              userId,
-              hostId: event.hostId,
-              provider: "mock",
-              providerReference: `HOLD_${event._id}_${userId}_${Date.now()}`,
-              amount: event.priceAmount || 0,
-              currency: event.currency || "ZAR",
-              baseAmount: event.priceAmount || 0,
-              appFeeAmount: 0,
-              processingFeeAmount: 0,
-              taxAmount: 0,
-              quoteId: "",
-              providerPayload: { holdOnly: true },
-            },
-            $set: {
-              expiresAt: holdExpiresAt,
-              admissionStatus: "pending_payment",
-              status: "pending",
-            },
-          },
-          { upsert: true, new: true }
-        );
-      }
-
-      await event.save();
-
-      // Notify user that they were approved
-      try {
-        const joiningUser = await User.findById(userId).select("name");
-        await createNotificationWithCaps({
-          userId,
-          type: "event_joined",
-          title: event.isPaid ? "Approved - payment pending" : "You're in!",
-          message: event.isPaid
-            ? `Your request to join "${event.title}" was approved. Complete payment within 2 hours to keep your seat.`
-            : `Your request to join "${event.title}" was approved.`,
-          eventId: event._id,
-          eventName: event.title,
-          actorId: event.hostId,
-          actorName: joiningUser?.name,
-        });
-      } catch (notifError) {
-        console.error("Error creating join approval notification:", notifError);
-      }
-
-      return res.status(200).json({
-        message: event.isPaid
-          ? "Join request approved. User must pay within 2 hours."
-          : "Join request approved",
-      });
-    } catch (error) {
-      console.error("Error approving join request:", error);
-      return res
-        .status(500)
-        .json({ message: "Error approving join request", error: error.message });
+        },
+        { upsert: true, new: true },
+      );
     }
+
+    event.status = computeNextEventStatus(event);
+    await event.save();
+
+    // Notify user that they were approved
+    try {
+      const joiningUser = await User.findById(userId).select("name");
+      await createNotificationWithCaps({
+        userId,
+        type: "event_joined",
+        title: event.isPaid ? "Approved - payment pending" : "You're in!",
+        message: event.isPaid
+          ? `Your request to join "${event.title}" was approved. Complete payment within 2 hours to keep your seat.`
+          : `Your request to join "${event.title}" was approved.`,
+        eventId: event._id,
+        eventName: event.title,
+        actorId: event.hostId,
+        actorName: joiningUser?.name,
+      });
+    } catch (notifError) {
+      console.error("Error creating join approval notification:", notifError);
+    }
+
+    return res.status(200).json({
+      message: event.isPaid
+        ? "Join request approved. User must pay within 2 hours."
+        : "Join request approved",
+    });
+  } catch (error) {
+    console.error("Error approving join request:", error);
+    return res
+      .status(500)
+      .json({ message: "Error approving join request", error: error.message });
   }
-);
+});
 
 // Reject a pending join request (host only)
-app.post(
-  "/events/:eventId/join-requests/:userId/reject",
-  async (req, res) => {
-    try {
-      const { eventId, userId } = req.params;
+app.post("/events/:eventId/join-requests/:userId/reject", async (req, res) => {
+  try {
+    const { eventId, userId } = req.params;
 
-      if (
-        !mongoose.Types.ObjectId.isValid(eventId) ||
-        !mongoose.Types.ObjectId.isValid(userId)
-      ) {
-        return res.status(400).json({ message: "Invalid ID format" });
-      }
-
-      const event = await Event.findById(eventId);
-      if (!event) {
-        return res.status(404).json({ message: "Event not found" });
-      }
-
-      if (!Array.isArray(event.joinRequests)) {
-        event.joinRequests = [];
-      }
-
-      const requestIndex = event.joinRequests.findIndex((r) =>
-        hasUserInList([r], userId)
-      );
-      if (requestIndex === -1) {
-        return res
-          .status(404)
-          .json({ message: "Join request not found for this user" });
-      }
-
-      // Remove from pending requests
-      event.joinRequests.splice(requestIndex, 1);
-
-      await event.save();
-
-      // Optionally notify user about rejection
-      try {
-        await createNotificationWithCaps({
-          userId,
-          type: "event_join_request_rejected",
-          title: "Request declined",
-          message: `Your request to join "${event.title}" was declined.`,
-          eventId: event._id,
-          eventName: event.title,
-        });
-      } catch (notifError) {
-        console.error("Error creating join rejection notification:", notifError);
-      }
-
-      return res.status(200).json({ message: "Join request rejected" });
-    } catch (error) {
-      console.error("Error rejecting join request:", error);
-      return res
-        .status(500)
-        .json({ message: "Error rejecting join request", error: error.message });
+    if (
+      !mongoose.Types.ObjectId.isValid(eventId) ||
+      !mongoose.Types.ObjectId.isValid(userId)
+    ) {
+      return res.status(400).json({ message: "Invalid ID format" });
     }
+
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    if (!Array.isArray(event.joinRequests)) {
+      event.joinRequests = [];
+    }
+
+    const requestIndex = event.joinRequests.findIndex((r) =>
+      hasUserInList([r], userId),
+    );
+    if (requestIndex === -1) {
+      return res
+        .status(404)
+        .json({ message: "Join request not found for this user" });
+    }
+
+    // Remove from pending requests
+    event.joinRequests.splice(requestIndex, 1);
+
+    await event.save();
+
+    // Optionally notify user about rejection
+    try {
+      await createNotificationWithCaps({
+        userId,
+        type: "event_join_request_rejected",
+        title: "Request declined",
+        message: `Your request to join "${event.title}" was declined.`,
+        eventId: event._id,
+        eventName: event.title,
+      });
+    } catch (notifError) {
+      console.error("Error creating join rejection notification:", notifError);
+    }
+
+    return res.status(200).json({ message: "Join request rejected" });
+  } catch (error) {
+    console.error("Error rejecting join request:", error);
+    return res
+      .status(500)
+      .json({ message: "Error rejecting join request", error: error.message });
   }
-);
+});
 
 // Leave event
 app.delete("/events/:eventId/leave", async (req, res) => {
@@ -8319,7 +8954,9 @@ app.delete("/events/:eventId/leave", async (req, res) => {
       });
     }
 
-    const isParticipant = event.participants.some((p) => p.userId.toString() === userId);
+    const isParticipant = event.participants.some(
+      (p) => p.userId.toString() === userId,
+    );
     if (!isParticipant) {
       return res
         .status(404)
@@ -8333,8 +8970,13 @@ app.delete("/events/:eventId/leave", async (req, res) => {
         : null;
     const msUntilStart = startTime ? startTime.getTime() - now.getTime() : null;
     const eventAlreadyLive =
-      event.status === "live" || event.status === "ended" || (msUntilStart != null && msUntilStart <= 0);
-    const eligibleEarlyWindow = msUntilStart != null && msUntilStart > 24 * 60 * 60 * 1000;
+      event.status === "live" ||
+      event.status === "ended" ||
+      (msUntilStart != null && msUntilStart <= 0);
+    const guestRefundWindowMs = 48 * 60 * 60 * 1000;
+    const guestLeavePlatformFeeCents = 1500;
+    const eligibleEarlyWindow =
+      msUntilStart != null && msUntilStart > guestRefundWindowMs;
 
     let refundEligible = false;
     let refundProcessed = false;
@@ -8347,9 +8989,9 @@ app.delete("/events/:eventId/leave", async (req, res) => {
         refundReason = "live_no_refund";
       } else if (eligibleEarlyWindow) {
         refundEligible = true;
-        refundReason = "outside_24h_refund_window";
+        refundReason = "outside_48h_refund_window";
       } else {
-        refundReason = "within_24h_no_refund";
+        refundReason = "within_48h_no_refund";
       }
     }
 
@@ -8364,21 +9006,75 @@ app.delete("/events/:eventId/leave", async (req, res) => {
 
       if (!payment) {
         refundReason = "no_paid_record";
+        console.log("[EventLeave][Refund] Eligible but no paid record found", {
+          eventId: event._id?.toString(),
+          userId,
+        });
       } else {
         refundReference = payment.providerReference || "";
-        try {
-          const refundResult = await createRefund({
-            eventId: event._id.toString(),
-            reference: payment.providerReference,
-            requesterUserId: userId,
-            refundType: "ticket_only",
-            reason: "Attendee left event more than 24 hours before start",
-          });
-          refundProcessed = true;
-          refundAmount = Number(refundResult?.amount) || 0;
-          refundReason = "ticket_only_refund_processed";
-        } catch (refundError) {
-          refundReason = String(refundError?.message || "refund_failed");
+        const ticketCents = Math.max(
+          0,
+          Math.round(
+            Number.isFinite(Number(payment.baseAmount))
+              ? Number(payment.baseAmount)
+              : Number(payment.amount),
+          ),
+        );
+        const refundCents = Math.max(
+          0,
+          ticketCents - guestLeavePlatformFeeCents,
+        );
+        console.log(
+          "[EventLeave][Refund] Attempting guest refund (ticket less platform fee)",
+          {
+            eventId: event._id?.toString(),
+            userId,
+            reference: refundReference,
+            amountPaid: payment.amount,
+            baseAmount: payment.baseAmount,
+            ticketCents,
+            refundCents,
+          },
+        );
+        if (refundCents <= 0) {
+          refundReason = "ticket_below_platform_fee_threshold";
+          console.log(
+            "[EventLeave][Refund] Skipping provider refund (amount after fee is zero)",
+            {
+              eventId: event._id?.toString(),
+              userId,
+              ticketCents,
+            },
+          );
+        } else {
+          try {
+            const refundResult = await createRefund({
+              eventId: event._id.toString(),
+              reference: payment.providerReference,
+              requesterUserId: userId,
+              refundType: "ticket_only",
+              amount: refundCents,
+              reason:
+                "Attendee left event more than 48 hours before start (ticket less platform fee)",
+            });
+            refundProcessed = true;
+            refundAmount = Number(refundResult?.amount) || 0;
+            refundReason = "ticket_only_refund_processed";
+            console.log("[EventLeave][Refund] Refund success", {
+              eventId: event._id?.toString(),
+              userId,
+              reference: refundReference,
+              refundedAmount: refundAmount,
+            });
+          } catch (refundError) {
+            refundReason = String(refundError?.message || "refund_failed");
+            console.error("[EventLeave][Refund] Refund failed", {
+              eventId: event._id?.toString(),
+              userId,
+              reference: refundReference,
+              reason: refundReason,
+            });
+          }
         }
       }
     }
@@ -8389,11 +9085,28 @@ app.delete("/events/:eventId/leave", async (req, res) => {
     }
 
     const participantStillPresent = (targetEvent.participants || []).some(
-      (p) => p?.userId?.toString() === userId
+      (p) => p?.userId?.toString() === userId,
     );
     if (participantStillPresent) {
       targetEvent.participants = (targetEvent.participants || []).filter(
-        (p) => p?.userId?.toString() !== userId
+        (p) => p?.userId?.toString() !== userId,
+      );
+    }
+
+    if (targetEvent.isPaid) {
+      await EventPayment.updateMany(
+        {
+          eventId: targetEvent._id,
+          userId,
+          status: { $in: ["initialized", "pending"] },
+          admissionStatus: "pending_payment",
+        },
+        {
+          $set: {
+            status: "expired",
+            admissionStatus: "expired",
+          },
+        },
       );
     }
 
@@ -8401,7 +9114,8 @@ app.delete("/events/:eventId/leave", async (req, res) => {
     if (!waitlistResult.handled) {
       if (targetEvent.status === "full") {
         const statusNow = new Date();
-        targetEvent.status = targetEvent.startTime <= statusNow ? "live" : "upcoming";
+        targetEvent.status =
+          targetEvent.startTime <= statusNow ? "live" : "upcoming";
       }
       await targetEvent.save();
     }
@@ -8416,6 +9130,15 @@ app.delete("/events/:eventId/leave", async (req, res) => {
       waitlistPromotion: waitlistResult.promoted
         ? { userId: waitlistResult.promotedUser?.userId }
         : null,
+    });
+    console.log("[EventLeave] Completed leave flow", {
+      eventId,
+      userId,
+      refundEligible,
+      refundProcessed,
+      refundAmount,
+      refundReference,
+      refundReason,
     });
   } catch (error) {
     console.error("Error leaving event:", error);
@@ -8461,7 +9184,7 @@ app.delete("/events/:eventId/participants/:participantId", async (req, res) => {
 
     // Find and remove participant
     const participantIndex = event.participants.findIndex(
-      (p) => p.userId.toString() === participantId
+      (p) => p.userId.toString() === participantId,
     );
     if (participantIndex === -1) {
       return res
@@ -8481,9 +9204,14 @@ app.delete("/events/:eventId/participants/:participantId", async (req, res) => {
 
     // Notify removed participant (in-app + push)
     try {
-      const removedUser = await User.findById(participantId).select("preferredLanguage").lean();
+      const removedUser = await User.findById(participantId)
+        .select("preferredLanguage")
+        .lean();
       const lang = removedUser?.preferredLanguage;
-      const removeStr = (lang && getStrings(lang).eventRemoved) ? getStrings(lang).eventRemoved : getStrings("en").eventRemoved;
+      const removeStr =
+        lang && getStrings(lang).eventRemoved
+          ? getStrings(lang).eventRemoved
+          : getStrings("en").eventRemoved;
       const title = interpolate(removeStr.title, { eventTitle: event.title });
       const message = interpolate(removeStr.body, { eventTitle: event.title });
       await createNotificationWithCaps({
@@ -8531,7 +9259,7 @@ app.get("/events/:eventId/messages", async (req, res) => {
     // Check if user is a participant
     if (userId) {
       const isParticipant = event.participants.some(
-        (p) => p.userId.toString() === userId
+        (p) => p.userId.toString() === userId,
       );
       if (!isParticipant) {
         return res.status(403).json({
@@ -8594,7 +9322,7 @@ app.get("/admin/events", async (req, res) => {
     } = req.query;
 
     const query = {};
-    
+
     // Filter by status if provided
     if (status && status !== "all") {
       query.status = status;
@@ -8691,10 +9419,10 @@ app.get("/notifications/:userId", async (req, res) => {
     });
 
     const joinRequestCount = notifications.filter(
-      (n) => n.type === "event_join_request"
+      (n) => n.type === "event_join_request",
     ).length;
     console.log(
-      `[NotificationsAPI] user=${userId} page=${page} limit=${limit} -> total=${total}, unread=${unreadCount}, event_join_request=${joinRequestCount}`
+      `[NotificationsAPI] user=${userId} page=${page} limit=${limit} -> total=${total}, unread=${unreadCount}, event_join_request=${joinRequestCount}`,
     );
 
     res.status(200).json({
@@ -8719,13 +9447,15 @@ app.put("/notifications/:notificationId/read", async (req, res) => {
     const { notificationId } = req.params;
 
     if (!mongoose.Types.ObjectId.isValid(notificationId)) {
-      return res.status(400).json({ message: "Invalid notification ID format" });
+      return res
+        .status(400)
+        .json({ message: "Invalid notification ID format" });
     }
 
     const notification = await Notification.findByIdAndUpdate(
       notificationId,
       { read: true },
-      { new: true }
+      { new: true },
     );
 
     if (!notification) {
@@ -8756,7 +9486,7 @@ app.put("/notifications/:userId/read-all", async (req, res) => {
 
     const result = await Notification.updateMany(
       { userId, read: false },
-      { read: true }
+      { read: true },
     );
 
     res.status(200).json({
@@ -8778,7 +9508,9 @@ app.delete("/notifications/:notificationId", async (req, res) => {
     const { notificationId } = req.params;
 
     if (!mongoose.Types.ObjectId.isValid(notificationId)) {
-      return res.status(400).json({ message: "Invalid notification ID format" });
+      return res
+        .status(400)
+        .json({ message: "Invalid notification ID format" });
     }
 
     const notification = await Notification.findByIdAndDelete(notificationId);
@@ -8806,7 +9538,7 @@ app.delete("/notifications/:notificationId", async (req, res) => {
 // Helper function to format active status
 const formatActiveStatus = (lastActiveAt) => {
   if (!lastActiveAt) return "Active";
-  
+
   const now = new Date();
   const lastActive = new Date(lastActiveAt);
   const diffMs = now - lastActive;
@@ -8814,7 +9546,7 @@ const formatActiveStatus = (lastActiveAt) => {
   const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
   const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
   const diffMonths = Math.floor(diffDays / 30);
-  
+
   if (diffMins < 5) return "Active now";
   if (diffMins < 60) return `Active ${diffMins}m ago`;
   if (diffHours < 24) return `Active ${diffHours}h ago`;
@@ -8825,12 +9557,12 @@ const formatActiveStatus = (lastActiveAt) => {
 // GET /users/nearby/open - Fetch nearby users who are open to activities
 app.get("/users/nearby/open", async (req, res) => {
   try {
-    const { 
-      radius = 50000, 
-      userId, 
-      limit = 10, 
+    const {
+      radius = 50000,
+      userId,
+      limit = 10,
       skip = 0,
-      search = ""
+      search = "",
     } = req.query;
 
     // Require userId to get user's location from database
@@ -8841,8 +9573,10 @@ app.get("/users/nearby/open", async (req, res) => {
     }
 
     // Fetch user's location from database (IGNORE any client-sent lat/lng)
-    const currentUser = await User.findById(userId).select("location blockedBy name");
-    
+    const currentUser = await User.findById(userId).select(
+      "location blockedBy name",
+    );
+
     if (!currentUser) {
       console.log(`❌ [NEARBY/OPEN] User not found: ${userId}`);
       return res.status(404).json({
@@ -8852,14 +9586,20 @@ app.get("/users/nearby/open", async (req, res) => {
 
     // Check if user has valid location coordinates
     const userCoords = currentUser?.location?.coordinates;
-    if (!userCoords || 
-        !Array.isArray(userCoords) || 
-        userCoords.length !== 2 || 
-        (userCoords[0] === 0 && userCoords[1] === 0) ||
-        !userCoords[0] || !userCoords[1]) {
-      console.log(`❌ [NEARBY/OPEN] Invalid location for user ${currentUser.name}: ${JSON.stringify(userCoords)}`);
+    if (
+      !userCoords ||
+      !Array.isArray(userCoords) ||
+      userCoords.length !== 2 ||
+      (userCoords[0] === 0 && userCoords[1] === 0) ||
+      !userCoords[0] ||
+      !userCoords[1]
+    ) {
+      console.log(
+        `❌ [NEARBY/OPEN] Invalid location for user ${currentUser.name}: ${JSON.stringify(userCoords)}`,
+      );
       return res.status(400).json({
-        message: "User location not available. Please enable location services.",
+        message:
+          "User location not available. Please enable location services.",
         users: [],
         count: 0,
         hasMore: false,
@@ -8888,17 +9628,14 @@ app.get("/users/nearby/open", async (req, res) => {
     const queryConditions = [
       // Only show users with showInOpenTab true (or not set, defaulting to true)
       {
-        $or: [
-          { showInOpenTab: { $exists: false } },
-          { showInOpenTab: true }
-        ]
+        $or: [{ showInOpenTab: { $exists: false } }, { showInOpenTab: true }],
       },
       // Must have been active in last 90 days
       {
         $or: [
           { lastActiveAt: { $gte: ninetyDaysAgo } },
-          { updatedAt: { $gte: ninetyDaysAgo } } // Fallback for users without lastActiveAt
-        ]
+          { updatedAt: { $gte: ninetyDaysAgo } }, // Fallback for users without lastActiveAt
+        ],
       },
       // Must have valid location
       { "location.coordinates": { $exists: true, $ne: [0, 0] } },
@@ -8913,7 +9650,7 @@ app.get("/users/nearby/open", async (req, res) => {
     // Add search filter if provided
     if (searchTerm) {
       queryConditions.push({
-        name: { $regex: searchTerm, $options: "i" }
+        name: { $regex: searchTerm, $options: "i" },
       });
     }
 
@@ -8942,9 +9679,9 @@ app.get("/users/nearby/open", async (req, res) => {
       {
         $addFields: {
           effectiveLastActive: {
-            $ifNull: ["$lastActiveAt", "$updatedAt"]
-          }
-        }
+            $ifNull: ["$lastActiveAt", "$updatedAt"],
+          },
+        },
       },
       { $sort: { effectiveLastActive: -1, distance: 1 } },
       { $skip: querySkip },
@@ -8960,7 +9697,7 @@ app.get("/users/nearby/open", async (req, res) => {
     }
 
     // Format the response
-    const formattedUsers = users.map(user => ({
+    const formattedUsers = users.map((user) => ({
       _id: user._id,
       name: user.name,
       profileImages: user.profileImages,
@@ -8970,7 +9707,9 @@ app.get("/users/nearby/open", async (req, res) => {
       activeStatus: formatActiveStatus(user.effectiveLastActive),
     }));
 
-    console.log(`[NEARBY/OPEN] ${formattedUsers.length} users, hasMore=${hasMore}`);
+    console.log(
+      `[NEARBY/OPEN] ${formattedUsers.length} users, hasMore=${hasMore}`,
+    );
 
     res.status(200).json({
       users: formattedUsers,
@@ -8997,13 +9736,15 @@ app.put("/users/:userId/open-visibility", async (req, res) => {
     }
 
     if (typeof showInOpenTab !== "boolean") {
-      return res.status(400).json({ message: "showInOpenTab must be a boolean" });
+      return res
+        .status(400)
+        .json({ message: "showInOpenTab must be a boolean" });
     }
 
     const user = await User.findByIdAndUpdate(
       userId,
       { showInOpenTab },
-      { new: true }
+      { new: true },
     ).select("showInOpenTab");
 
     if (!user) {
@@ -9027,13 +9768,13 @@ app.put("/users/:userId/open-visibility", async (req, res) => {
 app.get("/users/:userId/debug-location", async (req, res) => {
   try {
     const { userId } = req.params;
-    
+
     if (!mongoose.Types.ObjectId.isValid(userId)) {
       return res.status(400).json({ message: "Invalid user ID format" });
     }
 
     const user = await User.findById(userId).select("name location updatedAt");
-    
+
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
@@ -9043,9 +9784,11 @@ app.get("/users/:userId/debug-location", async (req, res) => {
     const lat = coords?.[1];
 
     // Check if coords look like San Francisco (for debugging)
-    const isSanFrancisco = lat && lng && 
-      Math.abs(lat - 37.7749) < 0.5 && 
-      Math.abs(lng - (-122.4194)) < 0.5;
+    const isSanFrancisco =
+      lat &&
+      lng &&
+      Math.abs(lat - 37.7749) < 0.5 &&
+      Math.abs(lng - -122.4194) < 0.5;
 
     res.status(200).json({
       userId,
@@ -9054,13 +9797,15 @@ app.get("/users/:userId/debug-location", async (req, res) => {
       coordinates: { latitude: lat, longitude: lng },
       isSanFrancisco,
       lastUpdated: user.updatedAt,
-      message: isSanFrancisco 
-        ? "⚠️ Location appears to be San Francisco - may need to update from real device" 
+      message: isSanFrancisco
+        ? "⚠️ Location appears to be San Francisco - may need to update from real device"
         : "✅ Location looks valid",
     });
   } catch (error) {
     console.error("Error checking user location:", error);
-    res.status(500).json({ message: "Error checking location", error: error.message });
+    res
+      .status(500)
+      .json({ message: "Error checking location", error: error.message });
   }
 });
 
@@ -9079,11 +9824,16 @@ app.post("/events/:eventId/respond-suggestion", async (req, res) => {
     }
 
     if (!["accept", "decline"].includes(response)) {
-      return res.status(400).json({ message: "Response must be 'accept' or 'decline'" });
+      return res
+        .status(400)
+        .json({ message: "Response must be 'accept' or 'decline'" });
     }
 
     // Find the event
-    const event = await Event.findById(eventId).populate("hostId", "name profileImages pushToken");
+    const event = await Event.findById(eventId).populate(
+      "hostId",
+      "name profileImages pushToken",
+    );
 
     if (!event) {
       return res.status(404).json({ message: "Activity not found" });
@@ -9091,18 +9841,27 @@ app.post("/events/:eventId/respond-suggestion", async (req, res) => {
 
     // Verify the event is a suggestion and this user is a recipient
     if (event.status !== "suggested") {
-      return res.status(400).json({ message: "This activity is not a suggestion" });
+      return res
+        .status(400)
+        .json({ message: "This activity is not a suggestion" });
     }
 
     // Check if user is authorized (single suggestion or group invite)
     const isSingleRecipient = event.suggestedToUserId?.toString() === userId;
-    const isGroupRecipient = event.suggestedToUserIds?.some(id => id.toString() === userId);
-    
+    const isGroupRecipient = event.suggestedToUserIds?.some(
+      (id) => id.toString() === userId,
+    );
+
     if (!isSingleRecipient && !isGroupRecipient) {
-      return res.status(403).json({ message: "You are not authorized to respond to this suggestion" });
+      return res
+        .status(403)
+        .json({
+          message: "You are not authorized to respond to this suggestion",
+        });
     }
 
-    const isGroupInvite = event.suggestedToUserIds && event.suggestedToUserIds.length > 0;
+    const isGroupInvite =
+      event.suggestedToUserIds && event.suggestedToUserIds.length > 0;
 
     // Check if suggestion has expired
     if (event.expiresAt && new Date(event.expiresAt) < new Date()) {
@@ -9112,14 +9871,18 @@ app.post("/events/:eventId/respond-suggestion", async (req, res) => {
 
     if (response === "accept") {
       // Check if user already joined (prevent duplicate joins for group invites)
-      const alreadyJoined = event.participants.some(p => p.userId?.toString() === userId);
+      const alreadyJoined = event.participants.some(
+        (p) => p.userId?.toString() === userId,
+      );
       if (alreadyJoined) {
-        return res.status(400).json({ message: "You have already accepted this activity" });
+        return res
+          .status(400)
+          .json({ message: "You have already accepted this activity" });
       }
 
       // Build the update
       const participantsToAdd = [];
-      
+
       // For first acceptance, add the host as participant too
       const isFirstAcceptance = event.participants.length === 0;
       if (isFirstAcceptance) {
@@ -9129,7 +9892,7 @@ app.post("/events/:eventId/respond-suggestion", async (req, res) => {
           joinedAt: new Date(),
         });
       }
-      
+
       // Add the responding user
       participantsToAdd.push({
         userId: userId,
@@ -9145,13 +9908,14 @@ app.post("/events/:eventId/respond-suggestion", async (req, res) => {
       });
 
       // Notify the suggester that their suggestion was accepted
-      const respondingUser = await User.findById(userId).select("name profileImages");
-      
+      const respondingUser =
+        await User.findById(userId).select("name profileImages");
+
       await createNotificationWithCaps({
         userId: event.hostId._id,
         type: "suggestion_accepted",
         title: "Suggestion Accepted!",
-        message: isGroupInvite 
+        message: isGroupInvite
           ? `${respondingUser.name} joined your group activity: ${event.title}`
           : `${respondingUser.name} accepted your activity suggestion: ${event.title}`,
         eventId: event._id,
@@ -9163,7 +9927,10 @@ app.post("/events/:eventId/respond-suggestion", async (req, res) => {
 
       res.status(200).json({
         message: "Suggestion accepted! Activity is now live.",
-        event: await Event.findById(eventId).populate("hostId", "name profileImages"),
+        event: await Event.findById(eventId).populate(
+          "hostId",
+          "name profileImages",
+        ),
       });
     } else {
       // Decline: For group invites, just remove this user from the invite list
@@ -9173,14 +9940,17 @@ app.post("/events/:eventId/respond-suggestion", async (req, res) => {
         await Event.findByIdAndUpdate(eventId, {
           $pull: { suggestedToUserIds: new mongoose.Types.ObjectId(userId) },
         });
-        
+
         // Check if all users have declined (no one left in the list)
         const updatedEvent = await Event.findById(eventId);
-        if (updatedEvent.suggestedToUserIds.length === 0 && updatedEvent.participants.length === 0) {
+        if (
+          updatedEvent.suggestedToUserIds.length === 0 &&
+          updatedEvent.participants.length === 0
+        ) {
           // No one accepted and everyone declined - cancel the event
           await Event.findByIdAndUpdate(eventId, { status: "cancelled" });
         }
-        
+
         res.status(200).json({
           message: "Invitation declined",
         });
@@ -9208,7 +9978,9 @@ app.post("/ratings", async (req, res) => {
     const { eventId, raterId, hostId, stars, tags } = req.body;
 
     if (!eventId || !raterId || !hostId || !stars) {
-      return res.status(400).json({ message: "eventId, raterId, hostId, and stars are required" });
+      return res
+        .status(400)
+        .json({ message: "eventId, raterId, hostId, and stars are required" });
     }
 
     if (stars < 1 || stars > 5) {
@@ -9221,18 +9993,24 @@ app.post("/ratings", async (req, res) => {
     }
 
     if (event.status !== "ended") {
-      return res.status(400).json({ message: "Can only rate after the event has ended" });
+      return res
+        .status(400)
+        .json({ message: "Can only rate after the event has ended" });
     }
 
     if (event.hostId.toString() !== hostId) {
-      return res.status(400).json({ message: "hostId does not match the event host" });
+      return res
+        .status(400)
+        .json({ message: "hostId does not match the event host" });
     }
 
     const wasParticipant = event.participants.some(
-      (p) => p.userId.toString() === raterId
+      (p) => p.userId.toString() === raterId,
     );
     if (!wasParticipant) {
-      return res.status(403).json({ message: "Only participants can rate the host" });
+      return res
+        .status(403)
+        .json({ message: "Only participants can rate the host" });
     }
 
     if (raterId === hostId) {
@@ -9252,9 +10030,14 @@ app.post("/ratings", async (req, res) => {
     // Positive rating: send "Glad you had fun" to guest (plan G12)
     if (stars >= 4) {
       try {
-        const rater = await User.findById(raterId).select("preferredLanguage").lean();
+        const rater = await User.findById(raterId)
+          .select("preferredLanguage")
+          .lean();
         const lang = rater?.preferredLanguage;
-        const str = (lang && getStrings(lang).afterRating) ? getStrings(lang).afterRating : getStrings("en").afterRating;
+        const str =
+          lang && getStrings(lang).afterRating
+            ? getStrings(lang).afterRating
+            : getStrings("en").afterRating;
         await createNotificationWithCaps({
           userId: raterId,
           type: "after_rating",
@@ -9264,7 +10047,10 @@ app.post("/ratings", async (req, res) => {
           eventName: event.title,
         });
       } catch (notifErr) {
-        console.error("[Rating] after_rating notification failed:", notifErr?.message);
+        console.error(
+          "[Rating] after_rating notification failed:",
+          notifErr?.message,
+        );
       }
     }
 
@@ -9272,9 +10058,14 @@ app.post("/ratings", async (req, res) => {
     const hostRatingCount = await Rating.countDocuments({ hostId });
     if (hostRatingCount === 3) {
       try {
-        const hostUser = await User.findById(hostId).select("preferredLanguage").lean();
+        const hostUser = await User.findById(hostId)
+          .select("preferredLanguage")
+          .lean();
         const lang = hostUser?.preferredLanguage;
-        const str = (lang && getStrings(lang).hostThirdRating) ? getStrings(lang).hostThirdRating : getStrings("en").hostThirdRating;
+        const str =
+          lang && getStrings(lang).hostThirdRating
+            ? getStrings(lang).hostThirdRating
+            : getStrings("en").hostThirdRating;
         const title = interpolate(str.title, {});
         const message = interpolate(str.body, { x: "3" });
         await createNotificationWithCaps({
@@ -9286,17 +10077,24 @@ app.post("/ratings", async (req, res) => {
           eventName: event.title,
         });
       } catch (notifErr) {
-        console.error("[Rating] host_third_rating notification failed:", notifErr?.message);
+        console.error(
+          "[Rating] host_third_rating notification failed:",
+          notifErr?.message,
+        );
       }
     }
 
     res.status(201).json({ message: "Rating submitted", rating });
   } catch (error) {
     if (error.code === 11000) {
-      return res.status(400).json({ message: "You have already rated the host for this event" });
+      return res
+        .status(400)
+        .json({ message: "You have already rated the host for this event" });
     }
     console.error("Error submitting rating:", error);
-    res.status(500).json({ message: "Error submitting rating", error: error.message });
+    res
+      .status(500)
+      .json({ message: "Error submitting rating", error: error.message });
   }
 });
 
@@ -9322,7 +10120,9 @@ app.get("/ratings/user/:userId", async (req, res) => {
     ]);
 
     if (!result.length) {
-      return res.status(200).json({ averageRating: 0, totalRatings: 0, tagCounts: {} });
+      return res
+        .status(200)
+        .json({ averageRating: 0, totalRatings: 0, tagCounts: {} });
     }
 
     const flatTags = result[0].allTags.flat();
@@ -9338,7 +10138,9 @@ app.get("/ratings/user/:userId", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching ratings:", error);
-    res.status(500).json({ message: "Error fetching ratings", error: error.message });
+    res
+      .status(500)
+      .json({ message: "Error fetching ratings", error: error.message });
   }
 });
 
@@ -9347,7 +10149,10 @@ app.get("/ratings/check/:eventId/:userId", async (req, res) => {
   try {
     const { eventId, userId } = req.params;
 
-    if (!mongoose.Types.ObjectId.isValid(eventId) || !mongoose.Types.ObjectId.isValid(userId)) {
+    if (
+      !mongoose.Types.ObjectId.isValid(eventId) ||
+      !mongoose.Types.ObjectId.isValid(userId)
+    ) {
       return res.status(400).json({ message: "Invalid ID format" });
     }
 
@@ -9355,7 +10160,9 @@ app.get("/ratings/check/:eventId/:userId", async (req, res) => {
     res.status(200).json({ hasRated: !!existing });
   } catch (error) {
     console.error("Error checking rating:", error);
-    res.status(500).json({ message: "Error checking rating", error: error.message });
+    res
+      .status(500)
+      .json({ message: "Error checking rating", error: error.message });
   }
 });
 
@@ -9368,7 +10175,9 @@ app.get("/users/:userId/stats", async (req, res) => {
       return res.status(400).json({ message: "Invalid user ID" });
     }
 
-    const user = await User.findById(userId).select("eventsHosted eventsAttended");
+    const user = await User.findById(userId).select(
+      "eventsHosted eventsAttended",
+    );
     if (!user) {
       return res.status(404).json({ message: "User not found" });
     }
@@ -9379,7 +10188,9 @@ app.get("/users/:userId/stats", async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching user stats:", error);
-    res.status(500).json({ message: "Error fetching user stats", error: error.message });
+    res
+      .status(500)
+      .json({ message: "Error fetching user stats", error: error.message });
   }
 });
 
@@ -9389,7 +10200,9 @@ app.post("/unblockUser", async (req, res) => {
     const { currentUserId, selectedUserId } = req.body;
 
     if (!currentUserId || !selectedUserId) {
-      return res.status(400).json({ message: "currentUserId and selectedUserId are required" });
+      return res
+        .status(400)
+        .json({ message: "currentUserId and selectedUserId are required" });
     }
 
     await User.findByIdAndUpdate(selectedUserId, {
@@ -9399,7 +10212,9 @@ app.post("/unblockUser", async (req, res) => {
     res.status(200).json({ message: "User unblocked successfully" });
   } catch (error) {
     console.error("Error unblocking user:", error);
-    res.status(500).json({ message: "Error unblocking user", error: error.message });
+    res
+      .status(500)
+      .json({ message: "Error unblocking user", error: error.message });
   }
 });
 
@@ -9419,7 +10234,9 @@ app.get("/users/:userId/blocked", async (req, res) => {
     res.status(200).json({ blockedUsers });
   } catch (error) {
     console.error("Error fetching blocked users:", error);
-    res.status(500).json({ message: "Error fetching blocked users", error: error.message });
+    res
+      .status(500)
+      .json({ message: "Error fetching blocked users", error: error.message });
   }
 });
 

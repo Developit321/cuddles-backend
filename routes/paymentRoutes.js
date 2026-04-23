@@ -5,6 +5,10 @@ const {
   verifyPayment,
   createRefund,
   getPaymentStatus,
+  getHostPayoutLedgerSummary,
+  listHostPayoutLedgerEntries,
+  getHostPayoutLedgerGlobalSummary,
+  settleEligibleHostPayouts,
   applyForHostPayout,
   getHostPayoutStatus,
   approveHostPayout,
@@ -100,6 +104,85 @@ router.get("/host/payouts/status", async (req, res) => {
   }
 });
 
+router.get("/host/payouts/ledger/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const result = await getHostPayoutLedgerSummary({ userId });
+    return res.status(200).json(result);
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      message: error.message || "Failed to fetch host payout ledger",
+    });
+  }
+});
+
+router.get("/admin/host-payouts/ledger", requireAuth, async (req, res) => {
+  try {
+    const {
+      status = "",
+      hostId = "",
+      eventId = "",
+      fromDate = "",
+      toDate = "",
+      payoutReference = "",
+      page = 1,
+      limit = 20,
+      sortBy = "createdAt",
+      sortOrder = -1,
+    } = req.query || {};
+    const result = await listHostPayoutLedgerEntries({
+      status,
+      hostId,
+      eventId,
+      fromDate,
+      toDate,
+      payoutReference,
+      page,
+      limit,
+      sortBy,
+      sortOrder,
+    });
+    return res.status(200).json(result);
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      message: error.message || "Failed to fetch host payout ledger entries",
+    });
+  }
+});
+
+router.get("/admin/host-payouts/ledger/summary", requireAuth, async (req, res) => {
+  try {
+    const { hostId = "", fromDate = "", toDate = "", payoutReference = "" } = req.query || {};
+    const result = await getHostPayoutLedgerGlobalSummary({
+      hostId,
+      fromDate,
+      toDate,
+      payoutReference,
+    });
+    return res.status(200).json(result);
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      message: error.message || "Failed to fetch host payout ledger summary",
+    });
+  }
+});
+
+router.post("/admin/host-payouts/:userId/settle", requireAuth, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { payoutReference = "", eventId = "" } = req.body || {};
+    const result = await settleEligibleHostPayouts({ userId, payoutReference, eventId });
+    return res.status(200).json({
+      message: "Eligible host payouts settled",
+      ...result,
+    });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      message: error.message || "Failed to settle host payouts",
+    });
+  }
+});
+
 router.post("/admin/host-payouts/:userId/approve", async (req, res) => {
   try {
     const { userId } = req.params;
@@ -164,14 +247,35 @@ router.post("/events/:eventId/payments/initialize", async (req, res) => {
   try {
     const { eventId } = req.params;
     const { userId, quoteId, callbackUrl = "" } = req.body;
+    console.log("[payments/initialize] incoming", {
+      eventId,
+      userId,
+      quoteId,
+      hasCallbackUrl: Boolean(callbackUrl),
+    });
     const result = await initializePayment({
       eventId,
       userId,
       quoteId,
       callbackUrl,
     });
+    console.log("[payments/initialize] success", {
+      eventId,
+      userId,
+      provider: result?.provider,
+      reference: result?.reference,
+      hasAuthorizationUrl: Boolean(result?.authorizationUrl),
+    });
     return res.status(200).json(result);
   } catch (error) {
+    console.error("[payments/initialize] failed", {
+      eventId: req.params?.eventId,
+      userId: req.body?.userId,
+      quoteId: req.body?.quoteId,
+      message: error?.message,
+      status: error?.status || error?.response?.status || 500,
+      responseData: error?.response?.data || null,
+    });
     return res.status(error.status || 500).json({
       message: error.message || "Failed to initialize payment",
     });
@@ -233,8 +337,10 @@ router.post("/webhooks/payments/:provider", async (req, res) => {
       (typeof req.body === "string" ? req.body : JSON.stringify(req.body || {}));
     const signature =
       req.headers["svix-signature"] ||
+      req.headers["webhook-signature"] ||
       req.headers["x-stitch-signature"] ||
       req.headers["x-paystack-signature"] ||
+      req.headers["x-yoco-signature"] ||
       "";
     const result = await handleProviderWebhook({
       providerName,
