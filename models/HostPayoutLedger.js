@@ -29,7 +29,7 @@ const hostPayoutLedgerSchema = new mongoose.Schema(
     },
     provider: {
       type: String,
-      enum: ["mock", "paystack", "stitch", "yoco"],
+      enum: ["mock", "paystack", "stitch", "yoco", "ozow"],
       default: "mock",
       index: true,
     },

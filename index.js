@@ -8974,7 +8974,6 @@ app.delete("/events/:eventId/leave", async (req, res) => {
       event.status === "ended" ||
       (msUntilStart != null && msUntilStart <= 0);
     const guestRefundWindowMs = 48 * 60 * 60 * 1000;
-    const guestLeavePlatformFeeCents = 1500;
     const eligibleEarlyWindow =
       msUntilStart != null && msUntilStart > guestRefundWindowMs;
 
@@ -9012,69 +9011,39 @@ app.delete("/events/:eventId/leave", async (req, res) => {
         });
       } else {
         refundReference = payment.providerReference || "";
-        const ticketCents = Math.max(
-          0,
-          Math.round(
-            Number.isFinite(Number(payment.baseAmount))
-              ? Number(payment.baseAmount)
-              : Number(payment.amount),
-          ),
-        );
-        const refundCents = Math.max(
-          0,
-          ticketCents - guestLeavePlatformFeeCents,
-        );
-        console.log(
-          "[EventLeave][Refund] Attempting guest refund (ticket less platform fee)",
-          {
+        console.log("[EventLeave][Refund] Attempting ticket-only refund (ticket price)", {
+          eventId: event._id?.toString(),
+          userId,
+          reference: refundReference,
+          amountPaid: payment.amount,
+          baseAmount: payment.baseAmount,
+          appFeeAmount: payment.appFeeAmount,
+        });
+        try {
+          const refundResult = await createRefund({
+            eventId: event._id.toString(),
+            reference: payment.providerReference,
+            requesterUserId: userId,
+            refundType: "ticket_only",
+            reason: "Attendee left event more than 48 hours before start",
+          });
+          refundProcessed = true;
+          refundAmount = Number(refundResult?.amount) || 0;
+          refundReason = "ticket_only_refund_processed";
+          console.log("[EventLeave][Refund] Refund success", {
             eventId: event._id?.toString(),
             userId,
             reference: refundReference,
-            amountPaid: payment.amount,
-            baseAmount: payment.baseAmount,
-            ticketCents,
-            refundCents,
-          },
-        );
-        if (refundCents <= 0) {
-          refundReason = "ticket_below_platform_fee_threshold";
-          console.log(
-            "[EventLeave][Refund] Skipping provider refund (amount after fee is zero)",
-            {
-              eventId: event._id?.toString(),
-              userId,
-              ticketCents,
-            },
-          );
-        } else {
-          try {
-            const refundResult = await createRefund({
-              eventId: event._id.toString(),
-              reference: payment.providerReference,
-              requesterUserId: userId,
-              refundType: "ticket_only",
-              amount: refundCents,
-              reason:
-                "Attendee left event more than 48 hours before start (ticket less platform fee)",
-            });
-            refundProcessed = true;
-            refundAmount = Number(refundResult?.amount) || 0;
-            refundReason = "ticket_only_refund_processed";
-            console.log("[EventLeave][Refund] Refund success", {
-              eventId: event._id?.toString(),
-              userId,
-              reference: refundReference,
-              refundedAmount: refundAmount,
-            });
-          } catch (refundError) {
-            refundReason = String(refundError?.message || "refund_failed");
-            console.error("[EventLeave][Refund] Refund failed", {
-              eventId: event._id?.toString(),
-              userId,
-              reference: refundReference,
-              reason: refundReason,
-            });
-          }
+            refundedAmount: refundAmount,
+          });
+        } catch (refundError) {
+          refundReason = String(refundError?.message || "refund_failed");
+          console.error("[EventLeave][Refund] Refund failed", {
+            eventId: event._id?.toString(),
+            userId,
+            reference: refundReference,
+            reason: refundReason,
+          });
         }
       }
     }

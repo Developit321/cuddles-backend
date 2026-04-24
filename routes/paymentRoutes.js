@@ -341,6 +341,8 @@ router.post("/webhooks/payments/:provider", async (req, res) => {
       req.headers["x-stitch-signature"] ||
       req.headers["x-paystack-signature"] ||
       req.headers["x-yoco-signature"] ||
+      req.headers["x-ozow-signature"] ||
+      req.headers["x-ozow-hash"] ||
       "";
     const result = await handleProviderWebhook({
       providerName,

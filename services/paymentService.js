@@ -829,6 +829,8 @@ const handleProviderWebhook = async ({
         ? process.env.STITCH_WEBHOOK_SECRET
         : provider.getName() === "yoco"
           ? process.env.YOCO_WEBHOOK_SECRET
+        : provider.getName() === "ozow"
+          ? process.env.OZOW_WEBHOOK_SECRET
         : "mock";
   const isValid = provider.verifyWebhookSignature(
     rawBody,
@@ -875,6 +877,33 @@ const handleProviderWebhook = async ({
       });
     }
   }
+  if (!resolvedPayment && provider.getName() === "ozow") {
+    const webhookPayload = event.payload?.payload || event.payload?.data || event.payload || {};
+    const ozowPaymentId =
+      webhookPayload?.id ||
+      webhookPayload?.paymentId ||
+      webhookPayload?.payment?.id ||
+      webhookPayload?.transactionId ||
+      "";
+    const ozowMerchantReference =
+      webhookPayload?.merchantReference || webhookPayload?.transactionReference || "";
+    if (ozowMerchantReference) {
+      resolvedPayment = await EventPayment.findOne({
+        provider: provider.getName(),
+        "providerPayload.merchantReference": ozowMerchantReference,
+      });
+    }
+    if (!resolvedPayment && ozowPaymentId) {
+      resolvedPayment = await EventPayment.findOne({
+        provider: provider.getName(),
+        $or: [
+          { "providerPayload.paymentId": ozowPaymentId },
+          { "providerPayload.id": ozowPaymentId },
+          { providerReference: ozowPaymentId },
+        ],
+      });
+    }
+  }
   if (!resolvedPayment) {
     return { processed: false, reason: "payment_not_found", reference: event.reference };
   }
@@ -886,7 +915,20 @@ const handleProviderWebhook = async ({
     return { processed: false, reason: "duplicate", reference: event.reference };
   }
 
-  const normalizedStatus = normalizePaymentStatus(event.status);
+  let verificationResult = null;
+  if (provider.getName() === "ozow") {
+    try {
+      verificationResult = await provider.verifyTransaction(resolvedPayment.providerReference);
+    } catch (verifyError) {
+      console.warn("[paymentService.handleProviderWebhook] ozow_verify_failed", {
+        reference: resolvedPayment.providerReference,
+        message: verifyError?.message || "verification_failed",
+      });
+    }
+  }
+  const normalizedStatus = normalizePaymentStatus(
+    verificationResult?.status || event.status
+  );
   const wasPaymentHold = resolvedPayment.admissionStatus === "pending_payment";
 
   if (normalizedStatus === "paid") {
@@ -895,9 +937,12 @@ const handleProviderWebhook = async ({
     resolvedPayment.providerPayload = {
       ...(resolvedPayment.providerPayload || {}),
       ...(event.payload || {}),
+      ...(verificationResult?.payload || {}),
       paymentId:
         event.payload?.payload?.id ||
         event.payload?.data?.id ||
+        verificationResult?.payload?.paymentId ||
+        verificationResult?.payload?.id ||
         resolvedPayment.providerPayload?.paymentId ||
         "",
     };
@@ -920,9 +965,12 @@ const handleProviderWebhook = async ({
   resolvedPayment.providerPayload = {
     ...(resolvedPayment.providerPayload || {}),
     ...(event.payload || {}),
+    ...(verificationResult?.payload || {}),
     paymentId:
       event.payload?.payload?.id ||
       event.payload?.data?.id ||
+      verificationResult?.payload?.paymentId ||
+      verificationResult?.payload?.id ||
       resolvedPayment.providerPayload?.paymentId ||
       "",
   };

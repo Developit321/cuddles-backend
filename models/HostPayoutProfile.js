@@ -11,7 +11,7 @@ const hostPayoutProfileSchema = new mongoose.Schema(
     },
     provider: {
       type: String,
-      enum: ["mock", "paystack", "yoco", "stitch"],
+      enum: ["mock", "paystack", "yoco", "stitch", "ozow"],
       default: "mock",
       index: true,
     },
