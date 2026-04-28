@@ -34,6 +34,18 @@ const hostPayoutProfileSchema = new mongoose.Schema(
     contactEmail: { type: String, default: "" },
     contactName: { type: String, default: "" },
     contactPhone: { type: String, default: "" },
+    /** individual | company — used for FICA-style onboarding and Paystack metadata */
+    payoutEntityType: {
+      type: String,
+      enum: ["individual", "company"],
+      default: "individual",
+    },
+    /** South African ID (13 digits) for natural persons; stored for compliance after internal review */
+    taxOrNationalId: { type: String, default: "" },
+    /** CIPC / company registration when payoutEntityType is company */
+    companyRegistrationNumber: { type: String, default: "" },
+    ficaDeclarationAcceptedAt: { type: Date, default: null },
+    ficaDeclarationVersion: { type: String, default: "" },
     providerAccountCode: { type: String, default: "" },
     providerPayload: { type: mongoose.Schema.Types.Mixed, default: null },
     rejectionReason: { type: String, default: "" },

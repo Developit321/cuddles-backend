@@ -140,10 +140,22 @@ class OzowProvider extends PaymentProvider {
   async getAccessToken(forceRefresh = false) {
     const now = Date.now();
     if (!forceRefresh && this.cachedToken && now < this.cachedTokenExpiresAtMs) {
+      console.log("[OzowProvider] token cache hit", {
+        baseUrl: this.getOneApiBaseUrl(),
+        scope: this.getOneApiScope(),
+        forceRefresh,
+      });
       return this.cachedToken;
     }
 
     const tokenUrl = `${this.getOneApiBaseUrl()}${this.getOneApiTokenPath()}`;
+    console.log("[OzowProvider] requesting token", {
+      tokenUrl,
+      scope: this.getOneApiScope(),
+      hasClientId: Boolean(process.env.OZOW_CLIENT_ID),
+      hasClientSecret: Boolean(process.env.OZOW_CLIENT_SECRET),
+      forceRefresh,
+    });
     const body = new URLSearchParams({
       client_id: ensureConfig(process.env.OZOW_CLIENT_ID, "OZOW_CLIENT_ID"),
       client_secret: ensureConfig(process.env.OZOW_CLIENT_SECRET, "OZOW_CLIENT_SECRET"),
@@ -160,6 +172,13 @@ class OzowProvider extends PaymentProvider {
         },
       });
       data = response?.data || {};
+      console.log("[OzowProvider] token response", {
+        tokenUrl,
+        hasAccessToken: Boolean(data?.access_token),
+        tokenType: data?.token_type || "",
+        expiresIn: data?.expires_in || "",
+        scope: data?.scope || this.getOneApiScope(),
+      });
     } catch (error) {
       const detail =
         error?.response?.data?.detail ||
@@ -169,6 +188,12 @@ class OzowProvider extends PaymentProvider {
         "Ozow token request failed";
       const providerError = new Error(detail);
       providerError.status = error?.response?.status || 502;
+      console.error("[OzowProvider] token request failed", {
+        tokenUrl,
+        status: error?.response?.status || null,
+        detail,
+        responseData: error?.response?.data || null,
+      });
       throw providerError;
     }
 
@@ -188,6 +213,20 @@ class OzowProvider extends PaymentProvider {
 
   async ozowRequest({ method = "GET", path = "", body, params, retryOnUnauthorized = true } = {}) {
     const url = `${this.getOneApiBaseUrl()}${path}`;
+    const redactedBody = body
+      ? {
+          ...body,
+          // Avoid leaking sensitive values into logs.
+          ...(body?.client_secret ? { client_secret: "***redacted***" } : {}),
+        }
+      : null;
+    console.log("[OzowProvider] request start", {
+      method,
+      url,
+      retryOnUnauthorized,
+      params: params || null,
+      body: redactedBody,
+    });
     let token = await this.getAccessToken(false);
 
     const execute = async (accessToken) =>
@@ -205,12 +244,26 @@ class OzowProvider extends PaymentProvider {
 
     try {
       const response = await execute(token);
+      console.log("[OzowProvider] request success", {
+        method,
+        url,
+        status: response?.status || null,
+      });
       return response?.data || {};
     } catch (error) {
       if (retryOnUnauthorized && error?.response?.status === 401) {
+        console.warn("[OzowProvider] request unauthorized, refreshing token", {
+          method,
+          url,
+        });
         token = await this.getAccessToken(true);
         try {
           const retried = await execute(token);
+          console.log("[OzowProvider] request success after refresh", {
+            method,
+            url,
+            status: retried?.status || null,
+          });
           return retried?.data || {};
         } catch (retryError) {
           const detail =
@@ -221,6 +274,13 @@ class OzowProvider extends PaymentProvider {
             "Ozow request failed";
           const providerError = new Error(detail);
           providerError.status = retryError?.response?.status || 502;
+          console.error("[OzowProvider] request failed after token refresh", {
+            method,
+            url,
+            status: retryError?.response?.status || null,
+            detail,
+            responseData: retryError?.response?.data || null,
+          });
           throw providerError;
         }
       }
@@ -233,6 +293,13 @@ class OzowProvider extends PaymentProvider {
         "Ozow request failed";
       const providerError = new Error(detail);
       providerError.status = error?.response?.status || 502;
+      console.error("[OzowProvider] request failed", {
+        method,
+        url,
+        status: error?.response?.status || null,
+        detail,
+        responseData: error?.response?.data || null,
+      });
       throw providerError;
     }
   }
@@ -322,6 +389,15 @@ class OzowProvider extends PaymentProvider {
       expireAt: payload.expiresAt || new Date(Date.now() + 15 * 60 * 1000).toISOString(),
       returnUrl: payload.callbackUrl || undefined,
     };
+    console.log("[OzowProvider] initialize transaction payload", {
+      siteCode: requestBody.siteCode,
+      amount: requestBody.amount,
+      merchantReference,
+      expireAt: requestBody.expireAt,
+      hasReturnUrl: Boolean(requestBody.returnUrl),
+      eventId: payload?.eventId || "",
+      userId: payload?.userId || "",
+    });
 
     const data = await this.ozowRequest({
       method: "POST",
@@ -331,6 +407,12 @@ class OzowProvider extends PaymentProvider {
 
     const paymentId = this.extractPaymentId(data) || merchantReference;
     const redirectUrl = firstNonEmpty([data?.redirectUrl, data?.links?.pay, data?.links?.redirect]);
+    console.log("[OzowProvider] initialize transaction result", {
+      paymentId,
+      mappedStatus: mapOzowStatus(this.extractPaymentStatus(data)),
+      hasRedirectUrl: Boolean(redirectUrl),
+      rawStatus: this.extractPaymentStatus(data),
+    });
     return {
       provider: this.getName(),
       reference: paymentId,
@@ -371,6 +453,13 @@ class OzowProvider extends PaymentProvider {
       data?.paidAt,
       data?.completedAt,
     ]);
+    console.log("[OzowProvider] verify transaction result", {
+      paymentId,
+      rawStatus,
+      mappedStatus: mapOzowStatus(rawStatus),
+      paidAt: paidAt || null,
+      hasTransactionsLink: Boolean(data?.links?.transactions || data?.data?.links?.transactions),
+    });
 
     return {
       provider: this.getName(),
