@@ -8,6 +8,11 @@ const HostPayoutProfile = require("../models/HostPayoutProfile");
 const HostPayoutLedger = require("../models/HostPayoutLedger");
 const { getActiveProviderName, getPaymentProvider } = require("../payments/providerRegistry");
 const { attachOpenPaidCheckoutSeatHold, removeInterestedHoldForPayment } = require("./eventSeatHold");
+const { isValidSouthAfricanIdNumber } = require("../utils/southAfricanId");
+const { encryptText, decryptText } = require("../utils/fieldEncryption");
+
+/** Bump when host FICA / accuracy copy changes (stored on profile for audit). */
+const FICA_HOST_DECLARATION_VERSION = "2026-04-28";
 
 const HOST_PAYOUT_STATUSES = new Set([
   "not_applied",
@@ -46,6 +51,24 @@ const normalizeLedgerStatus = (value) => {
 };
 
 const normalizeSortOrder = (value) => (Number(value) === 1 ? 1 : -1);
+
+const encryptHostPayoutFields = (input = {}) => ({
+  ...input,
+  accountNumber: encryptText(input.accountNumber || ""),
+  contactEmail: encryptText(input.contactEmail || ""),
+  contactPhone: encryptText(input.contactPhone || ""),
+  taxOrNationalId: encryptText(input.taxOrNationalId || ""),
+  companyRegistrationNumber: encryptText(input.companyRegistrationNumber || ""),
+});
+
+const decryptHostPayoutFields = (input = {}) => ({
+  ...input,
+  accountNumber: decryptText(input.accountNumber || ""),
+  contactEmail: decryptText(input.contactEmail || ""),
+  contactPhone: decryptText(input.contactPhone || ""),
+  taxOrNationalId: decryptText(input.taxOrNationalId || ""),
+  companyRegistrationNumber: decryptText(input.companyRegistrationNumber || ""),
+});
 
 const normalizeDateInput = (value, { endOfDay = false } = {}) => {
   if (!value) return null;
@@ -571,12 +594,22 @@ const createRefund = async ({
   }
 
   const provider = getPaymentProvider(payment.provider);
+  const pp = payment.providerPayload || {};
+  const providerTransactionId =
+    pp.id ??
+    pp.transaction_id ??
+    (typeof pp.data === "object" && pp.data ? pp.data.id : undefined) ??
+    undefined;
+
   const refundResult = await provider.refundTransaction({
     reference: payment.providerReference,
     amount: refundAmount,
     reason,
     eventId: String(payment.eventId),
     userId: String(payment.userId),
+    ...(providerTransactionId != null && providerTransactionId !== ""
+      ? { providerTransactionId }
+      : {}),
   });
 
   payment.status = "refunded";
@@ -666,6 +699,68 @@ const applyForHostPayout = async ({ userId, payload }) => {
   }
 
   const provider = getActiveProviderName();
+  const entityType =
+    payload.payoutEntityType === "company" || payload.entityType === "company"
+      ? "company"
+      : "individual";
+  const nationalNormalized = String(
+    payload.taxOrNationalId || payload.nationalIdNumber || ""
+  ).replace(/\D/g, "");
+  const companyReg = String(payload.companyRegistrationNumber || "").trim();
+  const ficaAccuracyAccepted =
+    payload.ficaAccuracyAccepted === true ||
+    payload.ficaAccuracyAccepted === "true" ||
+    payload.ficaDeclarationAccepted === true ||
+    payload.ficaDeclarationAccepted === "true";
+
+  if (provider === "paystack") {
+    if (!ficaAccuracyAccepted) {
+      const err = new Error(
+        "You must confirm that your payout and identity details are true and complete (FICA-style declaration)."
+      );
+      err.status = 400;
+      throw err;
+    }
+    if (entityType === "individual") {
+      if (!isValidSouthAfricanIdNumber(nationalNormalized)) {
+        const err = new Error(
+          "Enter a valid 13-digit South African ID number for the natural person receiving payouts."
+        );
+        err.status = 400;
+        throw err;
+      }
+    } else if (companyReg.length < 4) {
+      const err = new Error(
+        "Enter your company registration number (CIPC or equivalent) for a company payout profile."
+      );
+      err.status = 400;
+      throw err;
+    }
+  }
+
+  let taxOrNationalIdStored = "";
+  if (entityType === "individual") {
+    taxOrNationalIdStored =
+      provider === "paystack" ? nationalNormalized : nationalNormalized.slice(0, 13);
+  } else if (
+    nationalNormalized.length === 13 &&
+    isValidSouthAfricanIdNumber(nationalNormalized)
+  ) {
+    taxOrNationalIdStored = nationalNormalized;
+  }
+
+  const ficaAt =
+    provider === "paystack" && ficaAccuracyAccepted ? new Date() : null;
+  const ficaVer =
+    provider === "paystack" && ficaAccuracyAccepted ? FICA_HOST_DECLARATION_VERSION : "";
+  const encryptedFields = encryptHostPayoutFields({
+    accountNumber: payload.accountNumber || "",
+    contactEmail: payload.contactEmail || "",
+    contactPhone: payload.contactPhone || "",
+    taxOrNationalId: taxOrNationalIdStored,
+    companyRegistrationNumber: companyReg,
+  });
+
   const profile = await HostPayoutProfile.findOneAndUpdate(
     { userId },
     {
@@ -674,11 +769,16 @@ const applyForHostPayout = async ({ userId, payload }) => {
         status: "pending_review",
         businessName: payload.businessName || "",
         settlementBankCode: payload.settlementBankCode || "",
-        accountNumber: payload.accountNumber || "",
-        contactEmail: payload.contactEmail || "",
+        accountNumber: encryptedFields.accountNumber,
+        contactEmail: encryptedFields.contactEmail,
         contactName: payload.contactName || "",
-        contactPhone: payload.contactPhone || "",
+        contactPhone: encryptedFields.contactPhone,
         metadata: payload.metadata || null,
+        payoutEntityType: entityType,
+        taxOrNationalId: encryptedFields.taxOrNationalId,
+        companyRegistrationNumber: encryptedFields.companyRegistrationNumber,
+        ficaDeclarationAcceptedAt: ficaAt,
+        ficaDeclarationVersion: ficaVer,
         rejectionReason: "",
       },
     },
@@ -690,7 +790,8 @@ const applyForHostPayout = async ({ userId, payload }) => {
     status: profile?.status,
     provider: profile?.provider,
   });
-  return profile;
+  const plainProfile = profile?.toObject ? profile.toObject() : profile;
+  return decryptHostPayoutFields(plainProfile || {});
 };
 
 const getHostPayoutStatus = async ({ userId }) => {
@@ -707,14 +808,49 @@ const getHostPayoutStatus = async ({ userId }) => {
       provider: getActiveProviderName(),
     };
   }
+  const profileDecrypted = decryptHostPayoutFields(profile);
   return {
     userId,
     status: normalizeHostPayoutStatus(profile.status),
-    provider: profile.provider,
+    /** Active server gateway (env); use for UI (Paystack bank list, FICA). */
+    provider: getActiveProviderName(),
+    /** Value last stored on the profile document (may lag after switching PAYMENT_PROVIDER). */
+    profileProvider: profile.provider || "",
     providerAccountCode: profile.providerAccountCode || "",
     reviewedAt: profile.reviewedAt,
     rejectionReason: profile.rejectionReason || "",
+    application: {
+      businessName: profile.businessName || "",
+      settlementBankCode: profile.settlementBankCode || "",
+      accountNumber: profileDecrypted.accountNumber || "",
+      contactEmail: profileDecrypted.contactEmail || "",
+      contactName: profileDecrypted.contactName || "",
+      contactPhone: profileDecrypted.contactPhone || "",
+      payoutEntityType: profileDecrypted.payoutEntityType || "individual",
+      taxOrNationalId: profileDecrypted.taxOrNationalId || "",
+      companyRegistrationNumber: profileDecrypted.companyRegistrationNumber || "",
+      ficaDeclarationVersion: profileDecrypted.ficaDeclarationVersion || "",
+      hasFicaDeclaration: Boolean(profileDecrypted.ficaDeclarationAcceptedAt),
+    },
   };
+};
+
+const listPaystackBanksForHost = async ({ country } = {}) => {
+  if (getActiveProviderName() !== "paystack") {
+    const err = new Error("Bank list is only available when PAYMENT_PROVIDER=paystack");
+    err.status = 400;
+    throw err;
+  }
+  const paystack = getPaymentProvider("paystack");
+  if (typeof paystack.listBanks !== "function") {
+    const err = new Error("Paystack bank list is not available");
+    err.status = 501;
+    throw err;
+  }
+  const resolved =
+    String(country || "").trim() ||
+    String(process.env.PAYSTACK_BANK_COUNTRY || "south africa").trim();
+  return paystack.listBanks(resolved);
 };
 
 const approveHostPayout = async ({ userId, reviewerId }) => {
@@ -729,16 +865,23 @@ const approveHostPayout = async ({ userId, reviewerId }) => {
     err.status = 404;
     throw err;
   }
+  const profileDecrypted = decryptHostPayoutFields(
+    profile?.toObject ? profile.toObject() : profile
+  );
 
-  const provider = getPaymentProvider(profile.provider || getActiveProviderName());
+  const provider = getPaymentProvider(profileDecrypted.provider || getActiveProviderName());
   const providerAccount = await provider.createSubaccount({
-    businessName: profile.businessName,
-    settlementBankCode: profile.settlementBankCode,
-    accountNumber: profile.accountNumber,
-    contactEmail: profile.contactEmail,
-    contactName: profile.contactName,
-    contactPhone: profile.contactPhone,
-    metadata: profile.metadata,
+    businessName: profileDecrypted.businessName,
+    settlementBankCode: profileDecrypted.settlementBankCode,
+    accountNumber: profileDecrypted.accountNumber,
+    contactEmail: profileDecrypted.contactEmail,
+    contactName: profileDecrypted.contactName,
+    contactPhone: profileDecrypted.contactPhone,
+    metadata: profileDecrypted.metadata,
+    userId: profileDecrypted.userId?.toString?.() || String(userId),
+    entityType: profileDecrypted.payoutEntityType || "individual",
+    payoutEntityType: profileDecrypted.payoutEntityType || "individual",
+    companyRegistrationNumber: profileDecrypted.companyRegistrationNumber || "",
   });
 
   profile.status = providerAccount.status === "active" ? "active" : "action_required";
@@ -752,7 +895,8 @@ const approveHostPayout = async ({ userId, reviewerId }) => {
       : null;
   await profile.save();
 
-  return profile;
+  const approvedProfile = profile?.toObject ? profile.toObject() : profile;
+  return decryptHostPayoutFields(approvedProfile || {});
 };
 
 const rejectHostPayout = async ({ userId, reviewerId, reason }) => {
@@ -777,7 +921,8 @@ const rejectHostPayout = async ({ userId, reviewerId, reason }) => {
       : null;
   await profile.save();
 
-  return profile;
+  const rejectedProfile = profile?.toObject ? profile.toObject() : profile;
+  return decryptHostPayoutFields(rejectedProfile || {});
 };
 
 const listHostPayoutApplications = async ({
@@ -804,7 +949,7 @@ const listHostPayoutApplications = async ({
   ]);
 
   return {
-    items,
+    items: items.map((item) => decryptHostPayoutFields(item)),
     pagination: {
       page: normalizedPage,
       limit: normalizedLimit,
@@ -822,6 +967,12 @@ const handleProviderWebhook = async ({
   webhookHeaders = {},
 }) => {
   const provider = getPaymentProvider(providerName || getActiveProviderName());
+  console.log("[paymentService.handleProviderWebhook] incoming", {
+    provider: provider.getName(),
+    hasRawBody: Boolean(rawBody),
+    hasParsedBody: Boolean(parsedBody),
+    hasSignature: Boolean(signature),
+  });
   const secret =
     provider.getName() === "paystack"
       ? process.env.PAYSTACK_SECRET_KEY
@@ -838,6 +989,10 @@ const handleProviderWebhook = async ({
     secret,
     webhookHeaders
   );
+  console.log("[paymentService.handleProviderWebhook] signature check", {
+    provider: provider.getName(),
+    isValid,
+  });
   if (!isValid) {
     const err = new Error("Invalid webhook signature");
     err.status = 401;
@@ -845,6 +1000,12 @@ const handleProviderWebhook = async ({
   }
 
   const event = provider.parseWebhookEvent(rawBody || parsedBody);
+  console.log("[paymentService.handleProviderWebhook] parsed event", {
+    provider: provider.getName(),
+    eventType: event?.eventType || "",
+    reference: event?.reference || "",
+    status: event?.status || "",
+  });
   if (!event.reference) {
     return { processed: false, reason: "no_reference" };
   }
@@ -905,6 +1066,10 @@ const handleProviderWebhook = async ({
     }
   }
   if (!resolvedPayment) {
+    console.warn("[paymentService.handleProviderWebhook] payment not found", {
+      provider: provider.getName(),
+      reference: event.reference,
+    });
     return { processed: false, reason: "payment_not_found", reference: event.reference };
   }
 
@@ -916,11 +1081,17 @@ const handleProviderWebhook = async ({
   }
 
   let verificationResult = null;
-  if (provider.getName() === "ozow") {
+  if (provider.getName() === "ozow" || provider.getName() === "paystack") {
     try {
       verificationResult = await provider.verifyTransaction(resolvedPayment.providerReference);
+      console.log("[paymentService.handleProviderWebhook] provider_verify_ok", {
+        provider: provider.getName(),
+        providerReference: resolvedPayment.providerReference,
+        status: verificationResult?.status || "",
+      });
     } catch (verifyError) {
-      console.warn("[paymentService.handleProviderWebhook] ozow_verify_failed", {
+      console.warn("[paymentService.handleProviderWebhook] provider_verify_failed", {
+        provider: provider.getName(),
         reference: resolvedPayment.providerReference,
         message: verifyError?.message || "verification_failed",
       });
@@ -929,6 +1100,12 @@ const handleProviderWebhook = async ({
   const normalizedStatus = normalizePaymentStatus(
     verificationResult?.status || event.status
   );
+  console.log("[paymentService.handleProviderWebhook] normalized status", {
+    provider: provider.getName(),
+    reference: resolvedPayment.providerReference,
+    rawStatus: verificationResult?.status || event.status || "",
+    normalizedStatus,
+  });
   const wasPaymentHold = resolvedPayment.admissionStatus === "pending_payment";
 
   if (normalizedStatus === "paid") {
@@ -1333,6 +1510,7 @@ module.exports = {
   settleEligibleHostPayouts,
   applyForHostPayout,
   getHostPayoutStatus,
+  listPaystackBanksForHost,
   approveHostPayout,
   rejectHostPayout,
   listHostPayoutApplications,

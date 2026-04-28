@@ -11,45 +11,20 @@ const {
   settleEligibleHostPayouts,
   applyForHostPayout,
   getHostPayoutStatus,
+  listPaystackBanksForHost,
   approveHostPayout,
   rejectHostPayout,
   listHostPayoutApplications,
   handleProviderWebhook,
 } = require("../services/paymentService");
 
-const ensureAuthAndUserMatch = ({ source = "body", userKey = "userId" } = {}) => {
-  return (req, res, next) => {
-    if (!req.authUserId) {
-      return res.status(401).json({ message: "Authentication required" });
-    }
-    const requestUserId =
-      source === "params"
-        ? req.params?.[userKey]
-        : source === "query"
-        ? req.query?.[userKey]
-        : req.body?.[userKey];
-
-    if (!requestUserId) {
-      return res.status(400).json({ message: `${userKey} is required` });
-    }
-    if (String(requestUserId) !== String(req.authUserId)) {
-      return res.status(403).json({ message: "Forbidden for this user context" });
-    }
-    return next();
-  };
-};
-
 module.exports = (requireAuth) => {
   const router = express.Router();
-  const requireOwnBodyUser = [requireAuth, ensureAuthAndUserMatch({ source: "body" })];
-  const requireOwnParamUser = [requireAuth, ensureAuthAndUserMatch({ source: "params" })];
-  const requireOwnQueryUser = [requireAuth, ensureAuthAndUserMatch({ source: "query" })];
 
 router.post("/host/payouts/apply", async (req, res) => {
   try {
     const { userId, ...payload } = req.body;
     console.log("[host/payouts/apply] incoming", {
-      authUserId: req.authUserId,
       userId,
       payloadKeys: Object.keys(payload || {}),
       contactEmail: payload?.contactEmail || "",
@@ -68,7 +43,6 @@ router.post("/host/payouts/apply", async (req, res) => {
     });
   } catch (error) {
     console.error("[host/payouts/apply] failed", {
-      authUserId: req.authUserId,
       userId: req.body?.userId,
       message: error?.message,
       status: error?.status || 500,
@@ -88,6 +62,21 @@ router.get("/host/payouts/status/:userId", async (req, res) => {
   } catch (error) {
     return res.status(error.status || 500).json({
       message: error.message || "Failed to fetch payout status",
+    });
+  }
+});
+
+/** Public proxy: Paystack bank directory only (no user PII). Avoids JWT mismatch when app talks to a different API host than login. */
+router.get("/host/payouts/paystack/banks", async (req, res) => {
+  try {
+    const country = String(req.query.country || "south africa")
+      .trim()
+      .slice(0, 40);
+    const banks = await listPaystackBanksForHost({ country });
+    return res.status(200).json({ banks });
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      message: error.message || "Failed to list Paystack banks",
     });
   }
 });
