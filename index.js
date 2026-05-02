@@ -51,6 +51,7 @@ const notificationStrings = require("./notifications/notificationStrings");
 const {
   uploadImageBufferToR2,
   buildUserImageKey,
+  buildEventImageKey,
   deleteObjectFromR2,
   keyFromPublicUrl,
 } = require("./storage/r2");
@@ -1967,6 +1968,50 @@ app.post("/users/:userId/upload", imageUploadSingle, async (req, res) => {
     res.status(500).json({ error: "File upload failed" });
   }
 });
+
+/** Event cover image (R2) — upload before POST /events so create payload can include coverImage URL. */
+app.post("/events/upload-image", imageUploadSingle, async (req, res) => {
+  const userId = req.body?.userId;
+
+  if (!userId) {
+    return res.status(400).json({ error: "userId required" });
+  }
+
+  if (!req.file) {
+    return res.status(400).json({ error: "No file uploaded" });
+  }
+
+  try {
+    let normalized;
+    try {
+      normalized = await normalizeProfileImageToJpeg(
+        req.file.buffer,
+        req.file.mimetype,
+      );
+    } catch (e) {
+      return res.status(400).json({ error: e?.message || "Invalid image" });
+    }
+
+    const key = buildEventImageKey({
+      userId,
+      mimetype: normalized.contentType,
+      originalname: req.file.originalname,
+      extOverride: normalized.extension,
+    });
+
+    const { url: imageUrl } = await uploadImageBufferToR2({
+      buffer: normalized.buffer,
+      contentType: normalized.contentType,
+      key,
+    });
+
+    return res.status(200).json({ imageUrl });
+  } catch (error) {
+    console.error("[events/upload-image] failed:", error);
+    res.status(500).json({ error: "Upload failed" });
+  }
+});
+
 // endpoint to fetch users
 
 app.get("/profiles", async (req, res) => {
@@ -6266,6 +6311,18 @@ const syncEventStatusesBatch = async () => {
   );
 };
 
+/** Best-effort remove event cover from R2 when the event document is removed. */
+async function deleteEventCoverImageFromR2(coverImageUrl) {
+  if (!coverImageUrl) return;
+  const key = keyFromPublicUrl(coverImageUrl);
+  if (!key) return;
+  try {
+    await deleteObjectFromR2(key);
+  } catch (e) {
+    console.warn("[Event R2] Cover image delete failed:", e?.message);
+  }
+}
+
 const cleanupExpiredEvents = async () => {
   try {
     const cutoffDate = new Date(Date.now() - 6 * 60 * 60 * 1000); // 6 hours ago
@@ -6278,7 +6335,7 @@ const cleanupExpiredEvents = async () => {
 
     const eventsToDelete = await Event.find({
       startTime: { $lte: cutoffDate },
-    }).select("_id participants missionStatsCounted");
+    }).select("_id participants missionStatsCounted coverImage");
     for (const event of eventsToDelete) {
       if (event.missionStatsCounted) {
         continue;
@@ -6339,6 +6396,10 @@ const cleanupExpiredEvents = async () => {
     const result = await Event.deleteMany({
       startTime: { $lte: cutoffDate },
     });
+
+    for (const ev of eventsToDelete) {
+      await deleteEventCoverImageFromR2(ev.coverImage);
+    }
 
     console.log(
       `[Event Cleanup] Cleanup completed. Removed ${result.deletedCount} event(s)`,
@@ -6855,6 +6916,7 @@ app.post("/events", async (req, res) => {
       description,
       location,
       coverImage,
+      link,
       startTime,
       endTime,
       capacity,
@@ -6870,6 +6932,16 @@ app.post("/events", async (req, res) => {
       currency,
       paymentPolicy,
     } = req.body;
+
+    const normalizedLink =
+      link != null && String(link).trim()
+        ? String(link).trim()
+        : null;
+    if (normalizedLink && !/^https?:\/\//i.test(normalizedLink)) {
+      return res.status(400).json({
+        message: "link must be a valid http(s) URL",
+      });
+    }
 
     // Validate required fields
     if (!hostId || !title || !location || !startTime) {
@@ -7006,6 +7078,7 @@ app.post("/events", async (req, res) => {
         address: location.address,
       },
       coverImage,
+      link: normalizedLink,
       startTime: new Date(startTime),
       endTime: endTime ? new Date(endTime) : null,
       capacity: capacity || 6,
@@ -7248,6 +7321,7 @@ app.put("/events/:eventId", async (req, res) => {
       capacity,
       tags,
       coverImage,
+      link,
       audience,
       requiresApproval,
       isPaid,
@@ -7316,7 +7390,33 @@ app.put("/events/:eventId", async (req, res) => {
     if (endTime) event.endTime = new Date(endTime);
     if (capacity && capacity >= 1 && capacity <= 10) event.capacity = capacity;
     if (tags) event.tags = tags;
-    if (coverImage !== undefined) event.coverImage = coverImage;
+    if (coverImage !== undefined) {
+      const prevCover = event.coverImage;
+      if (prevCover && prevCover !== coverImage) {
+        const oldKey = keyFromPublicUrl(prevCover);
+        if (oldKey) {
+          try {
+            await deleteObjectFromR2(oldKey);
+          } catch (e) {
+            console.warn(
+              "[Event Update] R2 delete old cover failed:",
+              e?.message,
+            );
+          }
+        }
+      }
+      event.coverImage = coverImage || null;
+    }
+    if (link !== undefined) {
+      const trimmed =
+        link != null && String(link).trim() ? String(link).trim() : null;
+      if (trimmed && !/^https?:\/\//i.test(trimmed)) {
+        return res.status(400).json({
+          message: "link must be a valid http(s) URL",
+        });
+      }
+      event.link = trimmed;
+    }
     if (audience && ["everyone", "women_only", "men_only"].includes(audience)) {
       event.audience = audience;
     }
@@ -7574,8 +7674,12 @@ app.delete("/events/:eventId", async (req, res) => {
       console.error("Error deleting event messages:", messageError);
     }
 
+    const coverUrlForR2 = event.coverImage;
+
     // Delete the event itself
     await Event.findByIdAndDelete(eventId);
+
+    await deleteEventCoverImageFromR2(coverUrlForR2);
 
     console.log(`[Event Delete] Successfully deleted event ${eventId}`);
 
@@ -7681,11 +7785,12 @@ app.get("/events/nearby", async (req, res) => {
       {
         $limit: 50,
       },
-      // Map / home tab only needs a small slice of each event (see ios-events EventMapMarker, EventPreviewCard compact, list fallback)
+      // Map / home tab only needs a small slice of each event (see ios-events EventMapMarker, EventPreviewCard compact, list fallback). Near You tab also consumes this payload (cover image, tags, paid flag, createdAt for "Just posted").
       {
         $project: {
           _id: 1,
           title: 1,
+          description: 1,
           startTime: 1,
           endTime: 1,
           capacity: 1,
@@ -7693,6 +7798,12 @@ app.get("/events/nearby", async (req, res) => {
           audience: 1,
           distance: 1,
           participantCount: 1,
+          tags: 1,
+          coverImage: 1,
+          isPaid: 1,
+          priceAmount: 1,
+          currency: 1,
+          createdAt: 1,
           location: {
             type: "$location.type",
             coordinates: "$location.coordinates",

@@ -116,10 +116,17 @@ function buildUserImageKey({ userId, mimetype, originalname, extOverride }) {
   return `users/${userId}/${ts}-${randomHex(8)}.${ext}`;
 }
 
+function buildEventImageKey({ userId, mimetype, originalname, extOverride }) {
+  const ext = extOverride || guessExtension({ mimetype, originalname });
+  const ts = Date.now();
+  return `events/${userId}/${ts}-${randomHex(8)}.${ext}`;
+}
+
 module.exports = {
   uploadImageBufferToR2,
   deleteObjectFromR2,
   keyFromPublicUrl,
   buildUserImageKey,
+  buildEventImageKey,
 };
 
