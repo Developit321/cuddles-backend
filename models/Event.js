@@ -35,7 +35,15 @@ const eventSchema = new mongoose.Schema(
       },
     },
     coverImage: {
-      type: String, // Cloudinary URL
+      type: String, // R2 public URL
+    },
+    link: {
+      type: String,
+      default: null,
+      validate: {
+        validator: (v) => v == null || /^https?:\/\/.+/i.test(v),
+        message: "link must be a valid http(s) URL",
+      },
     },
     startTime: {
       type: Date,
