@@ -342,17 +342,48 @@ const initializePayment = async ({ eventId, userId, quoteId, callbackUrl }) => {
       activeCheckout.admissionStatus = "pending_payment";
       await activeCheckout.save();
     }
+    const pp = activeCheckout.providerPayload || {};
+    let authorizationUrl =
+      pp.link ||
+      pp.checkoutUrl ||
+      pp.authorizationUrl ||
+      pp.redirectUrl ||
+      pp.url ||
+      "";
+
+    if (!authorizationUrl) {
+      const user = await User.findById(userId).select("email name").lean();
+      if (!user) {
+        const err = new Error("User not found");
+        err.status = 404;
+        throw err;
+      }
+      const provider = getPaymentProvider(
+        activeCheckout.provider || getActiveProviderName()
+      );
+      const providerResult = await provider.initializeTransaction({
+        eventId: event._id.toString(),
+        userId: userId.toString(),
+        amount: quote.totalAmount,
+        currency: quote.currency,
+        email: user.email,
+        name: user.name || "",
+        callbackUrl: callbackUrl || "",
+        subaccountCode: hostPayoutProfile.providerAccountCode || "",
+      });
+      activeCheckout.providerReference = providerResult.reference;
+      activeCheckout.providerPayload = providerResult.payload || null;
+      activeCheckout.status = "initialized";
+      authorizationUrl = providerResult.authorizationUrl || "";
+      await activeCheckout.save();
+    }
+
     return {
       paymentId: activeCheckout._id,
       provider: activeCheckout.provider,
       reference: activeCheckout.providerReference,
-      authorizationUrl:
-        activeCheckout.providerPayload?.link ||
-        activeCheckout.providerPayload?.checkoutUrl ||
-        activeCheckout.providerPayload?.authorizationUrl ||
-        activeCheckout.providerPayload?.url ||
-        "",
-      accessCode: activeCheckout.providerPayload?.accessCode || "",
+      authorizationUrl,
+      accessCode: (activeCheckout.providerPayload || {}).accessCode || "",
       status: activeCheckout.status,
       reused: true,
     };
