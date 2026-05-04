@@ -51,7 +51,23 @@ class YocoProvider extends PaymentProvider {
   }
 
   getSecretKey() {
-    return ensureConfig(process.env.YOCO_SECRET_KEY, "YOCO_SECRET_KEY");
+    const key = ensureConfig(process.env.YOCO_SECRET_KEY, "YOCO_SECRET_KEY");
+    const mode = String(process.env.YOCO_API_MODE || "").trim().toLowerCase();
+    if (mode === "test" && !key.startsWith("sk_test_")) {
+      const err = new Error(
+        "YOCO_API_MODE=test requires a Test secret key (sk_test_…). See https://developer.yoco.com/docs/checkout-api/authentication"
+      );
+      err.status = 500;
+      throw err;
+    }
+    if (mode === "live" && !key.startsWith("sk_live_")) {
+      const err = new Error(
+        "YOCO_API_MODE=live requires a Live secret key (sk_live_…). See https://developer.yoco.com/docs/checkout-api/authentication"
+      );
+      err.status = 500;
+      throw err;
+    }
+    return key;
   }
 
   getCheckoutPath() {
@@ -72,7 +88,8 @@ class YocoProvider extends PaymentProvider {
 
   mapPaymentStatus(raw) {
     const value = String(raw || "").toUpperCase();
-    if (["SUCCESSFUL", "SUCCEEDED", "PAID", "SETTLED", "COMPLETED"].includes(value)) return "paid";
+    if (["SUCCESSFUL", "SUCCEEDED", "PAID", "SETTLED", "COMPLETED"].includes(value))
+      return "paid";
     if (["FAILED", "CANCELLED", "EXPIRED"].includes(value)) return "failed";
     return "pending";
   }
@@ -104,6 +121,8 @@ class YocoProvider extends PaymentProvider {
     const path = this.getCheckoutPath();
     const merchantReference = this.buildReference(payload);
 
+    // CreateCheckoutRequestBody: amount + currency required; processingMode is *response-only* and
+    // follows the secret key (sk_test_ vs sk_live_), not anything in this payload.
     const body = {
       amount: Math.round(Number(payload.amount) || 0),
       currency: String(payload.currency || "ZAR").toUpperCase(),
@@ -133,6 +152,21 @@ class YocoProvider extends PaymentProvider {
         },
       });
       data = response?.data || {};
+      const processingMode = data?.processingMode;
+      console.log("[YocoProvider] checkout created", {
+        checkoutId: data?.id,
+        processingMode,
+      });
+      const envMode = String(process.env.YOCO_API_MODE || "").trim().toLowerCase();
+      if (envMode === "live" && processingMode === "test") {
+        console.warn(
+          "[YocoProvider] Yoco returned processingMode=test while YOCO_API_MODE=live. " +
+            "Live vs test is controlled only by the Checkout API secret (sk_live_ vs sk_test_); " +
+            "it cannot be set in the JSON body. Restart the API after changing .env and confirm " +
+            "the process loads YOCO_SECRET_KEY starting with sk_live_. " +
+            "See https://developer.yoco.com/docs/checkout-api/authentication"
+        );
+      }
     } catch (error) {
       const detail =
         formatYocoAxiosError(error) ||
@@ -257,10 +291,60 @@ class YocoProvider extends PaymentProvider {
     };
   }
 
-  verifyWebhookSignature(rawBody, signature, secretKey) {
+  /**
+   * Yoco Checkout API webhook signing:
+   * https://developer.yoco.com/guides/online-payments/webhooks/verifying-the-events
+   * Signed content: `${webhook-id}.${webhook-timestamp}.${rawBody}` with HMAC-SHA256 and base64 digest;
+   * secret format `whsec_<base64>`; header `webhook-signature` entries look like `v1,<base64>`.
+   */
+  verifyWebhookSignature(rawBody, signature, secretKey, metadata = {}) {
     if (!rawBody || !signature || !secretKey) return false;
-    const computed = crypto.createHmac("sha256", secretKey).update(rawBody).digest("hex");
-    return computed === String(signature).trim();
+    const sig = String(signature).trim();
+    const secret = String(secretKey).trim();
+
+    const webhookId = String(metadata.webhookId || metadata["webhook-id"] || "").trim();
+    const webhookTimestamp = String(
+      metadata.webhookTimestamp || metadata["webhook-timestamp"] || ""
+    ).trim();
+
+    if (secret.startsWith("whsec_") && webhookId && webhookTimestamp) {
+      const ts = Number(webhookTimestamp);
+      if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > 180) {
+        return false;
+      }
+      let secretBytes;
+      try {
+        secretBytes = Buffer.from(secret.slice("whsec_".length), "base64");
+      } catch {
+        return false;
+      }
+      const signedContent = `${webhookId}.${webhookTimestamp}.${rawBody}`;
+      let expected;
+      try {
+        expected = crypto.createHmac("sha256", secretBytes).update(signedContent).digest("base64");
+      } catch {
+        return false;
+      }
+      const candidates = [];
+      const regex = /v1,([A-Za-z0-9+/=]+)/g;
+      let match = regex.exec(sig);
+      while (match) {
+        candidates.push(match[1]);
+        match = regex.exec(sig);
+      }
+      return candidates.some((candidate) => {
+        try {
+          const a = Buffer.from(candidate);
+          const b = Buffer.from(expected);
+          return a.length === b.length && crypto.timingSafeEqual(a, b);
+        } catch {
+          return false;
+        }
+      });
+    }
+
+    const computed = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+    return computed === sig;
   }
 
   parseWebhookEvent(rawBody) {

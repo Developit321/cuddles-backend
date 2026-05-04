@@ -58,8 +58,13 @@ function computeNextEventStatus(event) {
 
 /**
  * Remove expired payment-hold participants (interested + pending_payment checkout expired).
+ * Always loads by id (never save a populated Event — Mongoose will 500 on embedded refs).
  */
-async function expirePendingPaidAdmissions(event) {
+async function expirePendingPaidAdmissions(eventId) {
+  const id = eventId && (eventId._id || eventId);
+  if (!id) return { removedCount: 0 };
+
+  const event = await Event.findById(id);
   if (!event?.isPaid || !Array.isArray(event.participants)) {
     return { removedCount: 0 };
   }
@@ -115,12 +120,11 @@ async function expirePendingPaidAdmissions(event) {
  * No-op if the user is already on the participant list.
  */
 async function attachOpenPaidCheckoutSeatHold({ eventId, userId }) {
+  await expirePendingPaidAdmissions(eventId);
   const event = await Event.findById(eventId);
   if (!event || !event.isPaid || event.requiresApproval) {
     return { attached: false, alreadyPresent: false };
   }
-
-  await expirePendingPaidAdmissions(event);
 
   const capacity = event.capacity != null ? event.capacity : 6;
   const uid = userId.toString();
