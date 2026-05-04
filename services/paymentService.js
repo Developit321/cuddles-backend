@@ -32,7 +32,13 @@ function normalizeHostPayoutStatus(value) {
 const QUOTE_TTL_MS = 10 * 60 * 1000;
 const quoteStore = new Map();
 const ACTIVE_CHECKOUT_STATUSES = new Set(["initialized", "pending"]);
-const SUCCESS_STATES = new Set(["paid", "success", "completed"]);
+
+/** Paystack and Yoco both target ZA; host applications share FICA-style rules and bank picker. */
+function usesSouthAfricaHostCompliance(provider) {
+  const p = String(provider || "").toLowerCase().trim();
+  return p === "paystack" || p === "yoco";
+}
+const SUCCESS_STATES = new Set(["paid", "success", "completed", "succeeded"]);
 
 const toMoney = (value) => Math.max(0, Math.round(Number(value) || 0));
 const LEDGER_STATUSES = new Set(["accrued", "on_hold", "eligible", "paid_out", "reversed"]);
@@ -713,7 +719,7 @@ const applyForHostPayout = async ({ userId, payload }) => {
     payload.ficaDeclarationAccepted === true ||
     payload.ficaDeclarationAccepted === "true";
 
-  if (provider === "paystack") {
+  if (usesSouthAfricaHostCompliance(provider)) {
     if (!ficaAccuracyAccepted) {
       const err = new Error(
         "You must confirm that your payout and identity details are true and complete (FICA-style declaration)."
@@ -740,8 +746,9 @@ const applyForHostPayout = async ({ userId, payload }) => {
 
   let taxOrNationalIdStored = "";
   if (entityType === "individual") {
-    taxOrNationalIdStored =
-      provider === "paystack" ? nationalNormalized : nationalNormalized.slice(0, 13);
+    taxOrNationalIdStored = usesSouthAfricaHostCompliance(provider)
+      ? nationalNormalized
+      : nationalNormalized.slice(0, 13);
   } else if (
     nationalNormalized.length === 13 &&
     isValidSouthAfricanIdNumber(nationalNormalized)
@@ -750,9 +757,11 @@ const applyForHostPayout = async ({ userId, payload }) => {
   }
 
   const ficaAt =
-    provider === "paystack" && ficaAccuracyAccepted ? new Date() : null;
+    usesSouthAfricaHostCompliance(provider) && ficaAccuracyAccepted ? new Date() : null;
   const ficaVer =
-    provider === "paystack" && ficaAccuracyAccepted ? FICA_HOST_DECLARATION_VERSION : "";
+    usesSouthAfricaHostCompliance(provider) && ficaAccuracyAccepted
+      ? FICA_HOST_DECLARATION_VERSION
+      : "";
   const encryptedFields = encryptHostPayoutFields({
     accountNumber: payload.accountNumber || "",
     contactEmail: payload.contactEmail || "",
@@ -812,7 +821,7 @@ const getHostPayoutStatus = async ({ userId }) => {
   return {
     userId,
     status: normalizeHostPayoutStatus(profile.status),
-    /** Active server gateway (env); use for UI (Paystack bank list, FICA). */
+    /** Active server gateway (env); use for UI (ZA bank list, FICA when paystack/yoco). */
     provider: getActiveProviderName(),
     /** Value last stored on the profile document (may lag after switching PAYMENT_PROVIDER). */
     profileProvider: profile.provider || "",
@@ -836,8 +845,10 @@ const getHostPayoutStatus = async ({ userId }) => {
 };
 
 const listPaystackBanksForHost = async ({ country } = {}) => {
-  if (getActiveProviderName() !== "paystack") {
-    const err = new Error("Bank list is only available when PAYMENT_PROVIDER=paystack");
+  if (!usesSouthAfricaHostCompliance(getActiveProviderName())) {
+    const err = new Error(
+      "Bank list is only available when PAYMENT_PROVIDER is paystack or yoco"
+    );
     err.status = 400;
     throw err;
   }
@@ -869,7 +880,8 @@ const approveHostPayout = async ({ userId, reviewerId }) => {
     profile?.toObject ? profile.toObject() : profile
   );
 
-  const provider = getPaymentProvider(profileDecrypted.provider || getActiveProviderName());
+  const activeProviderName = getActiveProviderName();
+  const provider = getPaymentProvider(activeProviderName);
   const providerAccount = await provider.createSubaccount({
     businessName: profileDecrypted.businessName,
     settlementBankCode: profileDecrypted.settlementBankCode,
@@ -885,6 +897,7 @@ const approveHostPayout = async ({ userId, reviewerId }) => {
   });
 
   profile.status = providerAccount.status === "active" ? "active" : "action_required";
+  profile.provider = activeProviderName;
   profile.providerAccountCode = providerAccount.accountCode || "";
   profile.providerPayload = providerAccount.payload || null;
   profile.rejectionReason = "";
@@ -983,12 +996,12 @@ const handleProviderWebhook = async ({
         : provider.getName() === "ozow"
           ? process.env.OZOW_WEBHOOK_SECRET
         : "mock";
-  const isValid = provider.verifyWebhookSignature(
-    rawBody,
-    signature,
-    secret,
-    webhookHeaders
-  );
+  const isValid = provider.verifyWebhookSignature(rawBody, signature, secret, {
+    svixId: webhookHeaders.svixId,
+    svixTimestamp: webhookHeaders.svixTimestamp,
+    webhookId: webhookHeaders.webhookId || webhookHeaders["webhook-id"],
+    webhookTimestamp: webhookHeaders.webhookTimestamp || webhookHeaders["webhook-timestamp"],
+  });
   console.log("[paymentService.handleProviderWebhook] signature check", {
     provider: provider.getName(),
     isValid,

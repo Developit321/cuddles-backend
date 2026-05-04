@@ -341,6 +341,8 @@ router.post("/webhooks/payments/:provider", async (req, res) => {
       webhookHeaders: {
         svixId: req.headers["svix-id"] || "",
         svixTimestamp: req.headers["svix-timestamp"] || "",
+        webhookId: req.headers["webhook-id"] || "",
+        webhookTimestamp: req.headers["webhook-timestamp"] || "",
       },
     });
     return res.status(200).json(result);

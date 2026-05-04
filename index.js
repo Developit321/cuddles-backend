@@ -6244,8 +6244,8 @@ const updateEventStatus = async (event) => {
   const newStatus = computeNextEventStatus(event);
 
   if (newStatus !== event.status) {
+    await Event.updateOne({ _id: event._id }, { $set: { status: newStatus } });
     event.status = newStatus;
-    await event.save();
     if (previousStatus !== "ended" && newStatus === "ended") {
       try {
         const payoutUpdate = await markEventPayoutsEligible({
@@ -8145,7 +8145,7 @@ app.post("/events/:eventId/join", async (req, res) => {
       });
     }
 
-    const event = await Event.findById(eventId);
+    let event = await Event.findById(eventId);
     if (!event) {
       return res.status(404).json({ message: "Event not found" });
     }
@@ -8178,7 +8178,20 @@ app.post("/events/:eventId/join", async (req, res) => {
     if (!Array.isArray(event.waitlist)) {
       event.waitlist = [];
     }
-    await expirePendingPaidAdmissions(event);
+    await expirePendingPaidAdmissions(eventId);
+    event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+    if (!Array.isArray(event.participants)) {
+      event.participants = [];
+    }
+    if (!Array.isArray(event.joinRequests)) {
+      event.joinRequests = [];
+    }
+    if (!Array.isArray(event.waitlist)) {
+      event.waitlist = [];
+    }
 
     const existingParticipant = event.participants.find((p) =>
       hasUserInList([p], userId),
@@ -8873,7 +8886,13 @@ app.post("/events/:eventId/join-requests/:userId/approve", async (req, res) => {
       return res.status(400).json({ message: "Invalid ID format" });
     }
 
-    const event = await Event.findById(eventId);
+    let event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    await expirePendingPaidAdmissions(eventId);
+    event = await Event.findById(eventId);
     if (!event) {
       return res.status(404).json({ message: "Event not found" });
     }
@@ -8893,8 +8912,6 @@ app.post("/events/:eventId/join-requests/:userId/approve", async (req, res) => {
 
     // Remove from pending requests
     event.joinRequests.splice(requestIndex, 1);
-
-    await expirePendingPaidAdmissions(event);
 
     const alreadyParticipant = hasUserInList(event.participants, userId);
     const capacityApprove = event.capacity != null ? event.capacity : 6;
@@ -9445,6 +9462,8 @@ app.get("/events/:eventId", async (req, res) => {
       return res.status(400).json({ message: "Invalid event ID format" });
     }
 
+    await expirePendingPaidAdmissions(eventId);
+
     let event = await Event.findById(eventId)
       .populate("hostId", "name profileImages gender")
       .populate("participants.userId", "name profileImages gender")
@@ -9454,8 +9473,6 @@ app.get("/events/:eventId", async (req, res) => {
     if (!event) {
       return res.status(404).json({ message: "Event not found" });
     }
-
-    await expirePendingPaidAdmissions(event);
 
     // Update status if needed
     event = await updateEventStatus(event);
