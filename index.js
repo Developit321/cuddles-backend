@@ -614,6 +614,56 @@ app.get("/public/mission-stats", async (req, res) => {
   }
 });
 
+app.get("/public/events/invitable-upcoming", async (req, res) => {
+  try {
+    const parsedLimit = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(parsedLimit)
+      ? Math.min(Math.max(parsedLimit, 1), 50)
+      : 12;
+    const now = new Date();
+
+    const events = await Event.find({
+      websiteVisible: true,
+      status: { $in: ["upcoming", "live", "full"] },
+      startTime: { $gte: now },
+    })
+      .sort({ startTime: 1 })
+      .limit(limit)
+      .select(
+        "_id title description startTime endTime status location coverImage isPaid priceAmount currency link organizerType websiteVisible",
+      )
+      .lean();
+
+    const upcomingEvents = events
+      .map((event) => ({
+        ...event,
+        status: computeNextEventStatus(event),
+      }))
+      .filter((event) => event.status !== "ended" && event.status !== "cancelled");
+
+    const paidEvents = upcomingEvents.filter(
+      (event) => event.organizerType === "invitable" && event.isPaid === true,
+    );
+    const freeCommunityEvents = upcomingEvents.filter(
+      (event) => event.isPaid === false,
+    );
+
+    return res.status(200).json({
+      events: paidEvents,
+      paidEvents,
+      freeCommunityEvents,
+      count: paidEvents.length,
+      totalCount: upcomingEvents.length,
+    });
+  } catch (error) {
+    console.error("Error fetching Invitable upcoming events:", error);
+    return res.status(500).json({
+      message: "Error fetching Invitable upcoming events",
+      error: error.message,
+    });
+  }
+});
+
 // controllers
 const { getUnreadCounts } = require("./Controllers/conversationController");
 const { profile } = require("console");
@@ -6931,6 +6981,7 @@ app.post("/events", async (req, res) => {
       priceAmount,
       currency,
       paymentPolicy,
+      websiteVisible,
     } = req.body;
 
     const normalizedLink =
@@ -7475,6 +7526,9 @@ app.put("/events/:eventId", async (req, res) => {
             ? "pay_after_approval"
             : "pay_before_join";
       }
+    if (typeof websiteVisible === "boolean") {
+      event.websiteVisible = websiteVisible;
+    }
     }
 
     await event.save();
@@ -9448,6 +9502,47 @@ app.get("/admin/events", async (req, res) => {
     console.error("Error fetching all events:", error);
     res.status(500).json({
       message: "Error fetching events",
+      error: error.message,
+    });
+  }
+});
+
+// Admin endpoint to toggle website visibility without host-only constraints
+app.patch("/admin/events/:eventId/website-visibility", async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { websiteVisible } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(eventId)) {
+      return res.status(400).json({ message: "Invalid event ID format" });
+    }
+
+    if (typeof websiteVisible !== "boolean") {
+      return res
+        .status(400)
+        .json({ message: "websiteVisible must be a boolean" });
+    }
+
+    const updatedEvent = await Event.findByIdAndUpdate(
+      eventId,
+      { $set: { websiteVisible } },
+      { new: true },
+    )
+      .populate("hostId", "name profileImages")
+      .lean();
+
+    if (!updatedEvent) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    return res.status(200).json({
+      message: "Website visibility updated",
+      event: updatedEvent,
+    });
+  } catch (error) {
+    console.error("Error updating event website visibility:", error);
+    return res.status(500).json({
+      message: "Error updating event website visibility",
       error: error.message,
     });
   }
