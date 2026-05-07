@@ -65,6 +65,16 @@ const eventSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    organizerType: {
+      type: String,
+      enum: ["user", "invitable"],
+      default: "user",
+      index: true,
+    },
+    websiteVisible: {
+      type: Boolean,
+      default: false,
+    },
     priceAmount: {
       type: Number,
       min: 0,
@@ -178,6 +188,14 @@ eventSchema.index({ status: 1, startTime: 1 });
 eventSchema.index({ tags: 1 });
 eventSchema.index({ hostId: 1 });
 eventSchema.index({ "participants.userId": 1 });
+eventSchema.index({ organizerType: 1, isPaid: 1, status: 1, startTime: 1 });
+eventSchema.index({
+  websiteVisible: 1,
+  organizerType: 1,
+  isPaid: 1,
+  status: 1,
+  startTime: 1,
+});
 
 const Event = mongoose.model("Event", eventSchema);
 module.exports = Event;
