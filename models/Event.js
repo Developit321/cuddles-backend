@@ -55,7 +55,7 @@ const eventSchema = new mongoose.Schema(
     capacity: {
       type: Number,
       default: 6,
-      max: 10,
+      max: 50,
     },
     requiresApproval: {
       type: Boolean,

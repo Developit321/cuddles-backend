@@ -60,6 +60,11 @@ const {
   ALLOWED_INPUT_MIME_TYPES,
 } = require("./utils/normalizeProfileImage");
 const {
+  validateCapacity,
+  getCapacityLimits,
+  FREE_EVENT_MAX_CAPACITY,
+} = require("./utils/eventCapacity");
+const {
   shouldSendNotification,
   getCategoryForType,
   getRecentlyNotifiedUserIds,
@@ -6958,6 +6963,10 @@ cron.schedule("*/5 * * * *", async () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Create new event
+app.get("/events/capacity-limits", (req, res) => {
+  res.status(200).json(getCapacityLimits());
+});
+
 app.post("/events", async (req, res) => {
   try {
     const {
@@ -7015,13 +7024,6 @@ app.post("/events", async (req, res) => {
       });
     }
 
-    // Validate capacity
-    if (capacity && (capacity < 1 || capacity > 10)) {
-      return res.status(400).json({
-        message: "Capacity must be between 1 and 10",
-      });
-    }
-
     // Check if host exists
     const host = await User.findById(hostId);
     if (!host) {
@@ -7074,6 +7076,15 @@ app.post("/events", async (req, res) => {
         });
       }
     }
+
+    const capacityCheck = validateCapacity({
+      capacity: capacity ?? 6,
+      isPaid: normalizedIsPaid,
+    });
+    if (!capacityCheck.ok) {
+      return res.status(400).json({ message: capacityCheck.message });
+    }
+    const normalizedCapacity = capacityCheck.value;
 
     // Check if this is a suggestion (single or group)
     const isGroupSuggestion =
@@ -7132,7 +7143,7 @@ app.post("/events", async (req, res) => {
       link: normalizedLink,
       startTime: new Date(startTime),
       endTime: endTime ? new Date(endTime) : null,
-      capacity: capacity || 6,
+      capacity: normalizedCapacity,
       tags: tags || [],
       audience: audience || "everyone",
       requiresApproval: !!requiresApproval,
@@ -7434,12 +7445,42 @@ app.put("/events/:eventId", async (req, res) => {
       }
     }
 
+    const nextIsPaid =
+      typeof isPaid === "boolean" ? isPaid : event.isPaid;
+
+    if (
+      typeof isPaid === "boolean" &&
+      !isPaid &&
+      event.capacity > FREE_EVENT_MAX_CAPACITY
+    ) {
+      return res.status(400).json({
+        message: `Reduce capacity to ${FREE_EVENT_MAX_CAPACITY} or fewer before making this a free event`,
+      });
+    }
+
+    if (capacity !== undefined && capacity !== null) {
+      const capacityCheck = validateCapacity({
+        capacity,
+        isPaid: nextIsPaid,
+      });
+      if (!capacityCheck.ok) {
+        return res.status(400).json({ message: capacityCheck.message });
+      }
+      const occupied = countOccupiedSeats(event);
+      if (capacityCheck.value < occupied) {
+        return res.status(400).json({
+          message: `Capacity cannot be less than current attendees (${occupied})`,
+        });
+      }
+      event.capacity = capacityCheck.value;
+      event.status = computeNextEventStatus(event);
+    }
+
     // Update allowed fields
     if (title) event.title = title;
     if (description !== undefined) event.description = description;
     if (startTime) event.startTime = new Date(startTime);
     if (endTime) event.endTime = new Date(endTime);
-    if (capacity && capacity >= 1 && capacity <= 10) event.capacity = capacity;
     if (tags) event.tags = tags;
     if (coverImage !== undefined) {
       const prevCover = event.coverImage;
