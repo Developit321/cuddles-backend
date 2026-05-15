@@ -7059,6 +7059,11 @@ app.post("/events", async (req, res) => {
         : "pay_before_join";
 
     if (normalizedIsPaid) {
+      if (requiresApproval) {
+        return res.status(400).json({
+          message: "Paid events cannot require host approval",
+        });
+      }
       if (
         !Number.isFinite(normalizedPriceAmount) ||
         normalizedPriceAmount <= 0
@@ -7147,23 +7152,22 @@ app.post("/events", async (req, res) => {
       capacity: normalizedCapacity,
       tags: tags || [],
       audience: audience || "everyone",
-      requiresApproval: !!requiresApproval,
+      requiresApproval: normalizedIsPaid ? false : !!requiresApproval,
       isPaid: normalizedIsPaid,
       priceAmount: normalizedIsPaid ? Math.round(normalizedPriceAmount) : 0,
       currency: normalizedCurrency,
-      paymentPolicy: normalizedPaymentPolicy,
-      // For paid events, keep host out initially so they can run full pay-and-join testing.
-      // For free events, preserve existing behavior and auto-join host.
-      participants:
-        isSuggestion || normalizedIsPaid
-          ? []
-          : [
-              {
-                userId: hostId,
-                status: "going",
-                joinedAt: new Date(),
-              },
-            ],
+      paymentPolicy: normalizedIsPaid
+        ? "pay_before_join"
+        : normalizedPaymentPolicy,
+      participants: isSuggestion
+        ? []
+        : [
+            {
+              userId: hostId,
+              status: "going",
+              joinedAt: new Date(),
+            },
+          ],
       status: isSuggestion ? "suggested" : "upcoming",
       suggestedToUserId: isSingleSuggestion ? suggestedToUserId : undefined,
       suggestedToUserIds: isGroupSuggestion ? suggestedToUserIds : undefined,
@@ -7513,7 +7517,12 @@ app.put("/events/:eventId", async (req, res) => {
     if (audience && ["everyone", "women_only", "men_only"].includes(audience)) {
       event.audience = audience;
     }
-    if (typeof requiresApproval === "boolean") {
+    if (nextIsPaid && requiresApproval === true) {
+      return res.status(400).json({
+        message: "Paid events cannot require host approval",
+      });
+    }
+    if (typeof requiresApproval === "boolean" && !nextIsPaid) {
       event.requiresApproval = requiresApproval;
     }
     if (typeof isPaid === "boolean") {
@@ -7538,10 +7547,8 @@ app.put("/events/:eventId", async (req, res) => {
         event.isPaid = true;
         event.priceAmount = Math.round(normalizedPriceAmount);
         event.currency = (currency || event.currency || "ZAR").toUpperCase();
-        event.paymentPolicy =
-          paymentPolicy === "pay_after_approval"
-            ? "pay_after_approval"
-            : "pay_before_join";
+        event.requiresApproval = false;
+        event.paymentPolicy = "pay_before_join";
       } else {
         event.isPaid = false;
         event.priceAmount = 0;
@@ -7562,15 +7569,13 @@ app.put("/events/:eventId", async (req, res) => {
       if (currency && event.isPaid) {
         event.currency = String(currency).toUpperCase();
       }
-      if (paymentPolicy && event.isPaid) {
-        event.paymentPolicy =
-          paymentPolicy === "pay_after_approval"
-            ? "pay_after_approval"
-            : "pay_before_join";
-      }
+    }
     if (typeof websiteVisible === "boolean") {
       event.websiteVisible = websiteVisible;
     }
+    if (event.isPaid) {
+      event.requiresApproval = false;
+      event.paymentPolicy = "pay_before_join";
     }
 
     await event.save();
@@ -8351,8 +8356,10 @@ app.post("/events/:eventId/join", async (req, res) => {
       });
     }
 
-    // Paid events without host approval require payment before join.
-    if (event.isPaid && !event.requiresApproval) {
+    const isHostSelfJoin = event.hostId.toString() === userId;
+
+    // Paid events without host approval require payment before join (not for host).
+    if (event.isPaid && !event.requiresApproval && !isHostSelfJoin) {
       const settledPayment = await EventPayment.findOne({
         eventId: event._id,
         userId,
@@ -8368,8 +8375,6 @@ app.post("/events/:eventId/join", async (req, res) => {
         });
       }
     }
-
-    const isHostSelfJoin = event.hostId.toString() === userId;
 
     // Check if user is blocked by host
     const host = await User.findById(event.hostId).select(
