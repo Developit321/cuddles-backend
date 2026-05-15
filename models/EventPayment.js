@@ -66,8 +66,36 @@ const eventPaymentSchema = new mongoose.Schema(
       default: "none",
       index: true,
     },
+    ticketCode: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    ticketStatus: {
+      type: String,
+      enum: ["none", "active", "scanned", "void"],
+      default: "none",
+      index: true,
+    },
+    ticketIssuedAt: { type: Date, default: null },
+    ticketScannedAt: { type: Date, default: null },
+    ticketScannedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
   },
   { timestamps: true }
+);
+
+eventPaymentSchema.index(
+  { ticketCode: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      ticketCode: { $type: "string", $ne: "" },
+    },
+  }
 );
 
 eventPaymentSchema.index({ eventId: 1, userId: 1, createdAt: -1 });
