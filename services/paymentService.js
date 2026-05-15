@@ -8,6 +8,10 @@ const HostPayoutProfile = require("../models/HostPayoutProfile");
 const HostPayoutLedger = require("../models/HostPayoutLedger");
 const { getActiveProviderName, getPaymentProvider } = require("../payments/providerRegistry");
 const { attachOpenPaidCheckoutSeatHold, removeInterestedHoldForPayment } = require("./eventSeatHold");
+const {
+  issueTicketForPayment,
+  voidTicketForPayment,
+} = require("./ticketService");
 const { isValidSouthAfricanIdNumber } = require("../utils/southAfricanId");
 const { encryptText, decryptText } = require("../utils/fieldEncryption");
 
@@ -170,6 +174,8 @@ const grantAdmissionForPaidPayment = async (payment) => {
 
   await event.save();
   payment.admissionStatus = "admitted";
+  await payment.save();
+  await issueTicketForPayment(payment);
 };
 
 const ensureFeePolicy = async () => {
@@ -675,6 +681,7 @@ const createRefund = async ({
     }
   }
 
+  await voidTicketForPayment(payment);
   await payment.save();
 
   await HostPayoutLedger.findOneAndUpdate(
@@ -1224,8 +1231,15 @@ const getPaymentStatus = async ({ eventId, userId }) => {
       expiresAt: null,
       paidAt: null,
       reference: "",
+      ticketStatus: "none",
+      hasTicket: false,
     };
   }
+
+  const hasTicket =
+    payment.status === "paid" &&
+    payment.admissionStatus === "admitted" &&
+    ["active", "scanned"].includes(payment.ticketStatus || "none");
 
   return {
     hasPayment: true,
@@ -1234,6 +1248,8 @@ const getPaymentStatus = async ({ eventId, userId }) => {
     expiresAt: payment.expiresAt,
     paidAt: payment.paidAt,
     reference: payment.providerReference,
+    ticketStatus: payment.ticketStatus || "none",
+    hasTicket,
   };
 };
 

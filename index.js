@@ -94,6 +94,7 @@ const userSockets = new Map();
 
 const userRoutes = require("./routes/userRoutes");
 const createPaymentRoutes = require("./routes/paymentRoutes");
+const ticketRoutes = require("./routes/ticketRoutes");
 const {
   createRefund,
   markEventPayoutsEligible,
@@ -9588,6 +9589,8 @@ app.patch("/admin/events/:eventId/website-visibility", async (req, res) => {
     });
   }
 });
+
+app.use("/", ticketRoutes);
 
 // Get event by ID (MUST be after specific routes like /events/nearby, /events/search, etc.)
 app.get("/events/:eventId", async (req, res) => {
