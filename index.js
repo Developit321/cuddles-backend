@@ -9202,7 +9202,7 @@ app.delete("/events/:eventId/leave", async (req, res) => {
       event.status === "live" ||
       event.status === "ended" ||
       (msUntilStart != null && msUntilStart <= 0);
-    const guestRefundWindowMs = 48 * 60 * 60 * 1000;
+    const guestRefundWindowMs = 24 * 60 * 60 * 1000;
     const eligibleEarlyWindow =
       msUntilStart != null && msUntilStart > guestRefundWindowMs;
 
@@ -9217,9 +9217,9 @@ app.delete("/events/:eventId/leave", async (req, res) => {
         refundReason = "live_no_refund";
       } else if (eligibleEarlyWindow) {
         refundEligible = true;
-        refundReason = "outside_48h_refund_window";
+        refundReason = "outside_24h_refund_window";
       } else {
-        refundReason = "within_48h_no_refund";
+        refundReason = "within_24h_no_refund";
       }
     }
 
@@ -9254,7 +9254,7 @@ app.delete("/events/:eventId/leave", async (req, res) => {
             reference: payment.providerReference,
             requesterUserId: userId,
             refundType: "ticket_only",
-            reason: "Attendee left event more than 48 hours before start",
+            reason: "Attendee left event more than 24 hours before start",
           });
           refundProcessed = true;
           refundAmount = Number(refundResult?.amount) || 0;
@@ -9799,6 +9799,8 @@ const formatActiveStatus = (lastActiveAt) => {
 app.get("/users/nearby/open", async (req, res) => {
   try {
     const {
+      latitude,
+      longitude,
       radius = 50000,
       userId,
       limit = 10,
@@ -9806,17 +9808,26 @@ app.get("/users/nearby/open", async (req, res) => {
       search = "",
     } = req.query;
 
-    // Require userId to get user's location from database
+    if (!latitude || !longitude) {
+      return res.status(400).json({
+        message: "Latitude and longitude are required",
+      });
+    }
+
     if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
       return res.status(400).json({
         message: "User ID is required",
       });
     }
 
-    // Fetch user's location from database (IGNORE any client-sent lat/lng)
-    const currentUser = await User.findById(userId).select(
-      "location blockedBy name",
-    );
+    const parsedLat = parseFloat(latitude);
+    const parsedLng = parseFloat(longitude);
+
+    if (isNaN(parsedLat) || isNaN(parsedLng)) {
+      return res.status(400).json({ message: "Invalid coordinates format" });
+    }
+
+    const currentUser = await User.findById(userId).select("blockedBy name");
 
     if (!currentUser) {
       console.log(`❌ [NEARBY/OPEN] User not found: ${userId}`);
@@ -9825,31 +9836,8 @@ app.get("/users/nearby/open", async (req, res) => {
       });
     }
 
-    // Check if user has valid location coordinates
-    const userCoords = currentUser?.location?.coordinates;
-    if (
-      !userCoords ||
-      !Array.isArray(userCoords) ||
-      userCoords.length !== 2 ||
-      (userCoords[0] === 0 && userCoords[1] === 0) ||
-      !userCoords[0] ||
-      !userCoords[1]
-    ) {
-      console.log(
-        `❌ [NEARBY/OPEN] Invalid location for user ${currentUser.name}: ${JSON.stringify(userCoords)}`,
-      );
-      return res.status(400).json({
-        message:
-          "User location not available. Please enable location services.",
-        users: [],
-        count: 0,
-        hasMore: false,
-      });
-    }
-
-    // MongoDB stores coordinates as [longitude, latitude]
-    const lng = userCoords[0];
-    const lat = userCoords[1];
+    const lng = parsedLng;
+    const lat = parsedLat;
 
     const maxDistance = parseInt(radius);
     const queryLimit = Math.min(parseInt(limit) || 10, 50); // Cap at 50
