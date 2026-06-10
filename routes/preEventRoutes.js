@@ -3,10 +3,15 @@
  * Host endpoints require ?key= matching PRE_EVENT_HOST_SECRET env var.
  */
 const express = require("express");
-const mongoose = require("mongoose");
 const PreEventCharacter = require("../models/PreEventCharacter");
 const PreEventSubmission = require("../models/PreEventSubmission");
-const { DIETARY_PIZZA_OPTIONS } = require("../models/PreEventSubmission");
+const {
+  DIETARY_PIZZA_OPTIONS,
+  ROOM_PRESENCE_OPTIONS,
+  ACTING_COMFORT_OPTIONS,
+  DISCOMFORT_TOPIC_OPTIONS,
+  DRINKS_PREFERENCE_OPTIONS,
+} = require("../models/PreEventSubmission");
 const PreEventSettings = require("../models/PreEventSettings");
 const { ensurePreEventCharacters } = require("../services/preEventCharacterSeed");
 
@@ -51,45 +56,33 @@ function requireHostKey(req, res, next) {
   return next();
 }
 
+function resolveDrinksPreference(submission) {
+  if (submission.drinksPreference) {
+    return submission.drinksPreference;
+  }
+  if (submission.drinksWine === false) {
+    return "none";
+  }
+  return null;
+}
+
 function formatSubmission(submission, locked) {
   return {
     id: submission._id,
     email: submission.email,
-    favouriteCharacterId: submission.favouriteCharacterId,
-    avoidCharacterId: submission.avoidCharacterId,
+    roomPresence: submission.roomPresence,
+    actingComfort: submission.actingComfort,
+    discomfortTopics: submission.discomfortTopics || [],
+    discomfortOther: submission.discomfortOther || "",
+    castingNotes: submission.castingNotes || "",
     dietaryPizza: submission.dietaryPizza || [],
     dietaryPizzaOther: submission.dietaryPizzaOther || "",
+    drinksPreference: resolveDrinksPreference(submission),
     drinksWine: submission.drinksWine,
     submittedAt: submission.submittedAt,
     updatedAt: submission.updatedAt,
     locked,
   };
-}
-
-async function validateCharacterIds(favouriteCharacterId, avoidCharacterId) {
-  if (!favouriteCharacterId || !avoidCharacterId) {
-    return "favouriteCharacterId and avoidCharacterId are required.";
-  }
-  if (String(favouriteCharacterId) === String(avoidCharacterId)) {
-    return "Favourite and avoid characters must be different.";
-  }
-  if (
-    !mongoose.Types.ObjectId.isValid(favouriteCharacterId) ||
-    !mongoose.Types.ObjectId.isValid(avoidCharacterId)
-  ) {
-    return "Invalid character id.";
-  }
-
-  const [favourite, avoid] = await Promise.all([
-    PreEventCharacter.findById(favouriteCharacterId),
-    PreEventCharacter.findById(avoidCharacterId),
-  ]);
-
-  if (!favourite || !avoid) {
-    return "One or more characters were not found.";
-  }
-
-  return null;
 }
 
 function validateDietaryPizza(dietaryPizza, dietaryPizzaOther) {
@@ -111,6 +104,31 @@ function validateDietaryPizza(dietaryPizza, dietaryPizzaOther) {
     }
     if (otherText.length > 200) {
       return "dietaryPizzaOther must be 200 characters or fewer.";
+    }
+  }
+
+  return null;
+}
+
+function validateDiscomfortTopics(discomfortTopics, discomfortOther) {
+  if (!Array.isArray(discomfortTopics)) {
+    return "discomfortTopics must be an array.";
+  }
+
+  const invalid = discomfortTopics.filter(
+    (value) => !DISCOMFORT_TOPIC_OPTIONS.includes(value),
+  );
+  if (invalid.length > 0) {
+    return `Invalid discomfort topics: ${invalid.join(", ")}`;
+  }
+
+  if (discomfortTopics.includes("other")) {
+    const otherText = String(discomfortOther || "").trim();
+    if (!otherText) {
+      return "discomfortOther is required when other is selected.";
+    }
+    if (otherText.length > 200) {
+      return "discomfortOther must be 200 characters or fewer.";
     }
   }
 
@@ -162,8 +180,6 @@ router.get("/responses", requireHostKey, async (_req, res) => {
   try {
     const settings = await getOrCreateSettings();
     const submissions = await PreEventSubmission.find()
-      .populate("favouriteCharacterId", "name role")
-      .populate("avoidCharacterId", "name role")
       .sort({ updatedAt: -1 })
       .lean();
 
@@ -172,22 +188,14 @@ router.get("/responses", requireHostKey, async (_req, res) => {
       submissions: submissions.map((submission) => ({
         id: submission._id,
         email: submission.email,
-        favouriteCharacter: submission.favouriteCharacterId
-          ? {
-              id: submission.favouriteCharacterId._id,
-              name: submission.favouriteCharacterId.name,
-              role: submission.favouriteCharacterId.role,
-            }
-          : null,
-        avoidCharacter: submission.avoidCharacterId
-          ? {
-              id: submission.avoidCharacterId._id,
-              name: submission.avoidCharacterId.name,
-              role: submission.avoidCharacterId.role,
-            }
-          : null,
+        roomPresence: submission.roomPresence,
+        actingComfort: submission.actingComfort,
+        discomfortTopics: submission.discomfortTopics || [],
+        discomfortOther: submission.discomfortOther || "",
+        castingNotes: submission.castingNotes || "",
         dietaryPizza: submission.dietaryPizza || [],
         dietaryPizzaOther: submission.dietaryPizzaOther || "",
+        drinksPreference: resolveDrinksPreference(submission),
         drinksWine: submission.drinksWine,
         submittedAt: submission.submittedAt,
         updatedAt: submission.updatedAt,
@@ -289,23 +297,45 @@ router.patch("/:email", async (req, res) => {
     const updates = {};
     const body = req.body || {};
 
-    if (
-      body.favouriteCharacterId !== undefined ||
-      body.avoidCharacterId !== undefined
-    ) {
-      const favouriteCharacterId =
-        body.favouriteCharacterId ?? submission.favouriteCharacterId;
-      const avoidCharacterId =
-        body.avoidCharacterId ?? submission.avoidCharacterId;
-      const characterError = await validateCharacterIds(
-        favouriteCharacterId,
-        avoidCharacterId,
-      );
-      if (characterError) {
-        return res.status(400).json({ message: characterError });
+    if (body.roomPresence !== undefined) {
+      if (!ROOM_PRESENCE_OPTIONS.includes(body.roomPresence)) {
+        return res.status(400).json({ message: "Invalid roomPresence value." });
       }
-      updates.favouriteCharacterId = favouriteCharacterId;
-      updates.avoidCharacterId = avoidCharacterId;
+      updates.roomPresence = body.roomPresence;
+    }
+
+    if (body.actingComfort !== undefined) {
+      if (!ACTING_COMFORT_OPTIONS.includes(body.actingComfort)) {
+        return res
+          .status(400)
+          .json({ message: "Invalid actingComfort value." });
+      }
+      updates.actingComfort = body.actingComfort;
+    }
+
+    if (body.discomfortTopics !== undefined) {
+      const discomfortError = validateDiscomfortTopics(
+        body.discomfortTopics,
+        body.discomfortOther ?? submission.discomfortOther,
+      );
+      if (discomfortError) {
+        return res.status(400).json({ message: discomfortError });
+      }
+      updates.discomfortTopics = body.discomfortTopics;
+    }
+
+    if (body.discomfortOther !== undefined) {
+      updates.discomfortOther = String(body.discomfortOther).trim();
+    }
+
+    if (body.castingNotes !== undefined) {
+      const notes = String(body.castingNotes).trim();
+      if (notes.length > 500) {
+        return res
+          .status(400)
+          .json({ message: "castingNotes must be 500 characters or fewer." });
+      }
+      updates.castingNotes = notes;
     }
 
     if (body.dietaryPizza !== undefined) {
@@ -323,17 +353,38 @@ router.patch("/:email", async (req, res) => {
       updates.dietaryPizzaOther = String(body.dietaryPizzaOther).trim();
     }
 
-    if (body.drinksWine !== undefined) {
+    if (body.drinksPreference !== undefined) {
+      if (!DRINKS_PREFERENCE_OPTIONS.includes(body.drinksPreference)) {
+        return res.status(400).json({
+          message: "drinksPreference must be none, red, or white.",
+        });
+      }
+      updates.drinksPreference = body.drinksPreference;
+      updates.drinksWine = body.drinksPreference !== "none";
+    } else if (body.drinksWine !== undefined) {
       if (typeof body.drinksWine !== "boolean") {
         return res
           .status(400)
           .json({ message: "drinksWine must be true or false." });
       }
       updates.drinksWine = body.drinksWine;
+      updates.drinksPreference = body.drinksWine ? null : "none";
     }
 
     if (Object.keys(updates).length === 0) {
       return res.status(400).json({ message: "No valid fields to update." });
+    }
+
+    const mergedDiscomfort =
+      updates.discomfortTopics ?? submission.discomfortTopics;
+    const mergedDiscomfortOther =
+      updates.discomfortOther ?? submission.discomfortOther;
+    const discomfortError = validateDiscomfortTopics(
+      mergedDiscomfort,
+      mergedDiscomfortOther,
+    );
+    if (discomfortError) {
+      return res.status(400).json({ message: discomfortError });
     }
 
     const mergedDietary = updates.dietaryPizza ?? submission.dietaryPizza;
