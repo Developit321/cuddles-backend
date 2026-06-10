@@ -95,6 +95,7 @@ const userSockets = new Map();
 const userRoutes = require("./routes/userRoutes");
 const createPaymentRoutes = require("./routes/paymentRoutes");
 const ticketRoutes = require("./routes/ticketRoutes");
+const preEventRoutes = require("./routes/preEventRoutes");
 const {
   createRefund,
   markEventPayoutsEligible,
@@ -589,6 +590,7 @@ app.use(
   }),
 );
 // Routes
+app.use("/pre-event", preEventRoutes);
 app.use("/api/users", userRoutes);
 
 app.get("/public/mission-stats", async (req, res) => {
@@ -9202,7 +9204,7 @@ app.delete("/events/:eventId/leave", async (req, res) => {
       event.status === "live" ||
       event.status === "ended" ||
       (msUntilStart != null && msUntilStart <= 0);
-    const guestRefundWindowMs = 24 * 60 * 60 * 1000;
+    const guestRefundWindowMs = 7 * 24 * 60 * 60 * 1000; // 7 days before start
     const eligibleEarlyWindow =
       msUntilStart != null && msUntilStart > guestRefundWindowMs;
 
@@ -9217,9 +9219,9 @@ app.delete("/events/:eventId/leave", async (req, res) => {
         refundReason = "live_no_refund";
       } else if (eligibleEarlyWindow) {
         refundEligible = true;
-        refundReason = "outside_24h_refund_window";
+        refundReason = "outside_7d_refund_window";
       } else {
-        refundReason = "within_24h_no_refund";
+        refundReason = "within_7d_no_refund";
       }
     }
 
@@ -9254,7 +9256,7 @@ app.delete("/events/:eventId/leave", async (req, res) => {
             reference: payment.providerReference,
             requesterUserId: userId,
             refundType: "ticket_only",
-            reason: "Attendee left event more than 24 hours before start",
+            reason: "Attendee left event more than 7 days before start",
           });
           refundProcessed = true;
           refundAmount = Number(refundResult?.amount) || 0;
