@@ -98,6 +98,7 @@ const ticketRoutes = require("./routes/ticketRoutes");
 const preEventRoutes = require("./routes/preEventRoutes");
 const {
   createRefund,
+  forfeitPaidAdmissionOnLeave,
   markEventPayoutsEligible,
 } = require("./services/paymentService");
 const MISSION_STATS_SINGLETON_KEY = "global";
@@ -9194,88 +9195,27 @@ app.delete("/events/:eventId/leave", async (req, res) => {
         .json({ message: "You are not a participant of this event" });
     }
 
-    const now = new Date();
-    const startTime =
-      event.startTime && !Number.isNaN(new Date(event.startTime).getTime())
-        ? new Date(event.startTime)
-        : null;
-    const msUntilStart = startTime ? startTime.getTime() - now.getTime() : null;
-    const eventAlreadyLive =
-      event.status === "live" ||
-      event.status === "ended" ||
-      (msUntilStart != null && msUntilStart <= 0);
-    const guestRefundWindowMs = 7 * 24 * 60 * 60 * 1000; // 7 days before start
-    const eligibleEarlyWindow =
-      msUntilStart != null && msUntilStart > guestRefundWindowMs;
-
     let refundEligible = false;
     let refundProcessed = false;
     let refundAmount = 0;
     let refundReason = "not_paid_event";
     let refundReference = "";
+    let ticketForfeited = false;
 
     if (event.isPaid) {
-      if (eventAlreadyLive) {
-        refundReason = "live_no_refund";
-      } else if (eligibleEarlyWindow) {
-        refundEligible = true;
-        refundReason = "outside_7d_refund_window";
-      } else {
-        refundReason = "within_7d_no_refund";
-      }
-    }
-
-    if (refundEligible) {
-      const payment = await EventPayment.findOne({
+      refundReason = "final_sale_no_refund";
+      const forfeitResult = await forfeitPaidAdmissionOnLeave({
         eventId: event._id,
         userId,
-        status: "paid",
-      })
-        .sort({ paidAt: -1, createdAt: -1 })
-        .lean();
-
-      if (!payment) {
-        refundReason = "no_paid_record";
-        console.log("[EventLeave][Refund] Eligible but no paid record found", {
-          eventId: event._id?.toString(),
-          userId,
-        });
-      } else {
-        refundReference = payment.providerReference || "";
-        console.log("[EventLeave][Refund] Attempting ticket-only refund (ticket price)", {
+      });
+      ticketForfeited = forfeitResult.forfeited;
+      refundReference = forfeitResult.reference || "";
+      if (ticketForfeited) {
+        console.log("[EventLeave][Forfeit] Voided ticket for guest leave (final sale)", {
           eventId: event._id?.toString(),
           userId,
           reference: refundReference,
-          amountPaid: payment.amount,
-          baseAmount: payment.baseAmount,
-          appFeeAmount: payment.appFeeAmount,
         });
-        try {
-          const refundResult = await createRefund({
-            eventId: event._id.toString(),
-            reference: payment.providerReference,
-            requesterUserId: userId,
-            refundType: "ticket_only",
-            reason: "Attendee left event more than 7 days before start",
-          });
-          refundProcessed = true;
-          refundAmount = Number(refundResult?.amount) || 0;
-          refundReason = "ticket_only_refund_processed";
-          console.log("[EventLeave][Refund] Refund success", {
-            eventId: event._id?.toString(),
-            userId,
-            reference: refundReference,
-            refundedAmount: refundAmount,
-          });
-        } catch (refundError) {
-          refundReason = String(refundError?.message || "refund_failed");
-          console.error("[EventLeave][Refund] Refund failed", {
-            eventId: event._id?.toString(),
-            userId,
-            reference: refundReference,
-            reason: refundReason,
-          });
-        }
       }
     }
 
@@ -9327,6 +9267,7 @@ app.delete("/events/:eventId/leave", async (req, res) => {
       refundAmount,
       refundReference,
       refundReason,
+      ticketForfeited,
       waitlistPromotion: waitlistResult.promoted
         ? { userId: waitlistResult.promotedUser?.userId }
         : null,
@@ -9339,6 +9280,7 @@ app.delete("/events/:eventId/leave", async (req, res) => {
       refundAmount,
       refundReference,
       refundReason,
+      ticketForfeited,
     });
   } catch (error) {
     console.error("Error leaving event:", error);

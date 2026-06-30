@@ -531,6 +531,36 @@ const verifyPayment = async ({ eventId, reference }) => {
   };
 };
 
+/** Void ticket and release seat when a guest leaves without a refund (final sale). */
+const forfeitPaidAdmissionOnLeave = async ({ eventId, userId }) => {
+  if (
+    !mongoose.Types.ObjectId.isValid(eventId) ||
+    !mongoose.Types.ObjectId.isValid(userId)
+  ) {
+    return { forfeited: false, reference: "" };
+  }
+
+  const payment = await EventPayment.findOne({
+    eventId,
+    userId,
+    status: "paid",
+    admissionStatus: "admitted",
+  }).sort({ paidAt: -1, createdAt: -1 });
+
+  if (!payment) {
+    return { forfeited: false, reference: "" };
+  }
+
+  await voidTicketForPayment(payment);
+  payment.admissionStatus = "expired";
+  await payment.save();
+
+  return {
+    forfeited: true,
+    reference: payment.providerReference || "",
+  };
+};
+
 const createRefund = async ({
   eventId,
   reference,
@@ -611,18 +641,13 @@ const createRefund = async ({
     throw err;
   }
 
-  // Margin-safe policy: attendee-initiated refunds are capped at ticket-only.
+  // Final-sale policy: only hosts (or platform on host cancel) may issue refunds.
   if (isPayer && !isHost) {
-    if (normalizedRefundType === "full" || normalizedRefundType === "custom") {
-      const err = new Error("Only hosts can request full or custom refunds");
-      err.status = 403;
-      throw err;
-    }
-    if (refundAmount > ticketAmount) {
-      const err = new Error("Attendee refunds cannot exceed ticket amount");
-      err.status = 403;
-      throw err;
-    }
+    const err = new Error(
+      "Tickets are final sale. Guest cancellations are not refundable. Contact your host to transfer your spot."
+    );
+    err.status = 403;
+    throw err;
   }
 
   if (refundAmount <= 0) {
@@ -1561,6 +1586,7 @@ module.exports = {
   createQuote,
   initializePayment,
   verifyPayment,
+  forfeitPaidAdmissionOnLeave,
   createRefund,
   getPaymentStatus,
   markEventPayoutsEligible,
