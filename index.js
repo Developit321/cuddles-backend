@@ -96,6 +96,7 @@ const userRoutes = require("./routes/userRoutes");
 const createPaymentRoutes = require("./routes/paymentRoutes");
 const ticketRoutes = require("./routes/ticketRoutes");
 const preEventRoutes = require("./routes/preEventRoutes");
+const pitchVoteRoutes = require("./routes/pitchVoteRoutes");
 const {
   createRefund,
   forfeitPaidAdmissionOnLeave,
@@ -592,6 +593,7 @@ app.use(
 );
 // Routes
 app.use("/pre-event", preEventRoutes);
+app.use("/pitch-vote", pitchVoteRoutes);
 app.use("/api/users", userRoutes);
 
 app.get("/public/mission-stats", async (req, res) => {
