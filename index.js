@@ -675,6 +675,82 @@ app.get("/public/events/invitable-upcoming", async (req, res) => {
   }
 });
 
+/** Content / design-tool feed: upcoming tables with cover + host + seats (no participant PII). */
+app.get("/public/events/content-upcoming", async (req, res) => {
+  try {
+    const parsedLimit = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(parsedLimit)
+      ? Math.min(Math.max(parsedLimit, 1), 50)
+      : 40;
+    const now = new Date();
+
+    const events = await Event.find({
+      status: { $in: ["upcoming", "live", "full"] },
+      startTime: { $gte: now },
+    })
+      .sort({ startTime: 1 })
+      .limit(limit)
+      .populate("hostId", "name")
+      .select(
+        "_id title description startTime endTime status location coverImage isPaid priceAmount currency capacity participants joinRequests organizerType websiteVisible",
+      )
+      .lean();
+
+    const normalized = events
+      .map((event) => {
+        const status = computeNextEventStatus(event);
+        const capacity = Number(event.capacity) || 0;
+        const participantCount = Array.isArray(event.participants)
+          ? event.participants.length
+          : 0;
+        const pendingCount = Array.isArray(event.joinRequests)
+          ? event.joinRequests.length
+          : 0;
+        const location = event.location || {};
+        const locationLabel =
+          location.name ||
+          location.address ||
+          [location.city, location.country].filter(Boolean).join(", ") ||
+          "Cape Town";
+
+        return {
+          id: String(event._id),
+          title: event.title || "Untitled table",
+          description: event.description || "",
+          startTime: event.startTime,
+          endTime: event.endTime || null,
+          status,
+          coverImage: event.coverImage || null,
+          hostName:
+            (event.hostId && event.hostId.name) ||
+            "Hosted on Invitable",
+          locationName: locationLabel,
+          capacity,
+          participantCount,
+          pendingCount,
+          seatsLeft: Math.max(capacity - participantCount, 0),
+          isPaid: Boolean(event.isPaid),
+          priceAmount: event.priceAmount ?? null,
+          currency: event.currency || "ZAR",
+          websiteVisible: Boolean(event.websiteVisible),
+          organizerType: event.organizerType || null,
+        };
+      })
+      .filter((event) => event.status !== "ended" && event.status !== "cancelled");
+
+    return res.status(200).json({
+      events: normalized,
+      count: normalized.length,
+    });
+  } catch (error) {
+    console.error("Error fetching content upcoming events:", error);
+    return res.status(500).json({
+      message: "Error fetching content upcoming events",
+      error: error.message,
+    });
+  }
+});
+
 // controllers
 const { getUnreadCounts } = require("./Controllers/conversationController");
 const { profile } = require("console");
