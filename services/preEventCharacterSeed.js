@@ -20,7 +20,7 @@ const PRE_EVENT_CHARACTERS = [
     name: "Dylan Smit",
     role: "Corporate Attorney",
     teaser:
-      "He wrote the contracts. He knows exactly what's in them — including the part no one else has read closely enough. Yet.",
+      "He wrote the contracts. He knows exactly what's in them, including the part no one else has read closely enough. Yet.",
   },
   {
     slug: "jess-hartley",
@@ -34,14 +34,14 @@ const PRE_EVENT_CHARACTERS = [
     name: "Owen Dreyer",
     role: "Financial Journalist",
     teaser:
-      "He wasn't on the guest list. Nobody's quite sure how he got in. He's been very interested in the canapés — and everyone's conversations.",
+      "He wasn't on the guest list. Nobody's quite sure how he got in. He's been very interested in the canapés, and everyone's conversations.",
   },
   {
     slug: "candice-louw",
     name: "Candice Louw",
     role: "Events Director",
     teaser:
-      "She made tonight happen — the venue, the florals, the champagne. She also knows where every body is buried. Figuratively. Probably.",
+      "She made tonight happen: the venue, the florals, the champagne. She also knows where every body is buried. Figuratively. Probably.",
   },
   {
     slug: "tashan-govender",
@@ -62,7 +62,7 @@ const PRE_EVENT_CHARACTERS = [
     name: "Luca van der Berg",
     role: "Brand Strategist",
     teaser:
-      "Marcus's oldest friend. He helped build the Aurum brand — and has been avoiding eye contact with Marcus all evening for reasons entirely unrelated to branding.",
+      "Marcus's oldest friend. He helped build the Aurum brand, and has been avoiding eye contact with Marcus all evening for reasons entirely unrelated to branding.",
   },
   {
     slug: "simone-fick",
